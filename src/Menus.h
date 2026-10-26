@@ -103,5 +103,11 @@ void MenuOptionsScreen_AddNum(struct MenuOptionsScreen* s, const char* name,
 								float minValue, float maxValue, float defaultValue,
 								Button_GetNum getValue, Button_SetNum setValue, const char* desc);
 
+typedef void (*InitMenuOptions)(struct MenuOptionsScreen* s);
+/* Adds a button which opens another options screen when clicked */
+/*  The Done button of that options screen then returns back to this options screen */
+void MenuOptionsScreen_AddSubmenu(struct MenuOptionsScreen* s, const char* name,
+								InitMenuOptions init, const char* desc);
+
 CC_END_HEADER
 #endif

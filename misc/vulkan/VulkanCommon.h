@@ -753,6 +753,12 @@ typedef struct VkDescriptorImageInfo {
 	VkImageLayout imageLayout;
 } VkDescriptorImageInfo;
 
+typedef struct VkDescriptorBufferInfo {
+	VkBuffer     buffer;
+	VkDeviceSize offset;
+	VkDeviceSize range;
+} VkDescriptorBufferInfo;
+
 typedef struct VkWriteDescriptorSet {
 	VkStructureType sType;
 	const void*     pNext;
@@ -923,3 +929,226 @@ typedef struct VkImageMemoryBarrier {
 	VkImage         image;
 	VkImageSubresourceRange subresourceRange;
 } VkImageMemoryBarrier;
+
+
+/* Ray tracing (VK_KHR_acceleration_structure + VK_KHR_ray_query, and their dependencies) */
+/*  https://registry.khronos.org/vulkan/specs/latest/man/html/VK_KHR_acceleration_structure.html */
+typedef cc_uint64 VkAccelerationStructureKHR;
+typedef cc_uint64 VkDeviceAddress;
+
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2                      1000059000
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2                    1000059001
+#define VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO                      1000060000
+#define VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO                      1000244001
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES  1000257000
+#define VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR  1000150000
+#define VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR  1000150002
+#define VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR 1000150004
+#define VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR 1000150005
+#define VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR             1000150006
+#define VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR 1000150007
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR   1000150013
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR 1000150014
+#define VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR          1000150017
+#define VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR     1000150020
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR          1000348013
+
+#define VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT                                     0x00000010
+#define VK_BUFFER_USAGE_STORAGE_BUFFER_BIT                                     0x00000020
+#define VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT                              0x00020000
+#define VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR   0x00080000
+#define VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR                 0x00100000
+#define VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT                                  0x00000002
+
+#define VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR 0x02000000
+#define VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR          0x00200000
+#define VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR         0x00400000
+
+#define VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR 1000150000
+#define VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER 6
+#define VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR    0
+#define VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR 1
+#define VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR 1
+#define VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR  0
+#define VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR 0x00000004
+#define VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR 0x00000008
+#define VK_GEOMETRY_TYPE_TRIANGLES_KHR 0
+#define VK_GEOMETRY_TYPE_INSTANCES_KHR 2
+#define VK_GEOMETRY_OPAQUE_BIT_KHR     0x00000001
+#define VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR 0x00000001
+#define VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR                 0x00000004
+
+/* NOTE: Only the 55 VkBool32 fields of VkPhysicalDeviceFeatures are needed (none are actually read) */
+typedef struct VkPhysicalDeviceFeatures2 {
+	VkStructureType sType;
+	void*    pNext;
+	VkBool32 features[55];
+} VkPhysicalDeviceFeatures2;
+
+typedef struct VkPhysicalDeviceProperties2 {
+	VkStructureType sType;
+	void* pNext;
+	VkPhysicalDeviceProperties properties;
+} VkPhysicalDeviceProperties2;
+
+typedef struct VkPhysicalDeviceBufferDeviceAddressFeatures {
+	VkStructureType sType;
+	void*    pNext;
+	VkBool32 bufferDeviceAddress;
+	VkBool32 bufferDeviceAddressCaptureReplay;
+	VkBool32 bufferDeviceAddressMultiDevice;
+} VkPhysicalDeviceBufferDeviceAddressFeatures;
+
+typedef struct VkPhysicalDeviceAccelerationStructureFeaturesKHR {
+	VkStructureType sType;
+	void*    pNext;
+	VkBool32 accelerationStructure;
+	VkBool32 accelerationStructureCaptureReplay;
+	VkBool32 accelerationStructureIndirectBuild;
+	VkBool32 accelerationStructureHostCommands;
+	VkBool32 descriptorBindingAccelerationStructureUpdateAfterBind;
+} VkPhysicalDeviceAccelerationStructureFeaturesKHR;
+
+typedef struct VkPhysicalDeviceRayQueryFeaturesKHR {
+	VkStructureType sType;
+	void*    pNext;
+	VkBool32 rayQuery;
+} VkPhysicalDeviceRayQueryFeaturesKHR;
+
+typedef struct VkPhysicalDeviceAccelerationStructurePropertiesKHR {
+	VkStructureType sType;
+	void*     pNext;
+	cc_uint64 maxGeometryCount;
+	cc_uint64 maxInstanceCount;
+	cc_uint64 maxPrimitiveCount;
+	cc_uint32 maxPerStageDescriptorAccelerationStructures;
+	cc_uint32 maxPerStageDescriptorUpdateAfterBindAccelerationStructures;
+	cc_uint32 maxDescriptorSetAccelerationStructures;
+	cc_uint32 maxDescriptorSetUpdateAfterBindAccelerationStructures;
+	cc_uint32 minAccelerationStructureScratchOffsetAlignment;
+} VkPhysicalDeviceAccelerationStructurePropertiesKHR;
+
+typedef struct VkMemoryAllocateFlagsInfo {
+	VkStructureType sType;
+	const void* pNext;
+	VkFlags     flags;
+	cc_uint32   deviceMask;
+} VkMemoryAllocateFlagsInfo;
+
+typedef struct VkBufferDeviceAddressInfo {
+	VkStructureType sType;
+	const void* pNext;
+	VkBuffer    buffer;
+} VkBufferDeviceAddressInfo;
+
+typedef union VkDeviceOrHostAddressConstKHR {
+	VkDeviceAddress deviceAddress;
+	const void*     hostAddress;
+} VkDeviceOrHostAddressConstKHR;
+
+typedef union VkDeviceOrHostAddressKHR {
+	VkDeviceAddress deviceAddress;
+	void*           hostAddress;
+} VkDeviceOrHostAddressKHR;
+
+typedef struct VkAccelerationStructureGeometryTrianglesDataKHR {
+	VkStructureType sType;
+	const void*   pNext;
+	VkFormat      vertexFormat;
+	VkDeviceOrHostAddressConstKHR vertexData;
+	VkDeviceSize  vertexStride;
+	cc_uint32     maxVertex;
+	VkIndexType   indexType;
+	VkDeviceOrHostAddressConstKHR indexData;
+	VkDeviceOrHostAddressConstKHR transformData;
+} VkAccelerationStructureGeometryTrianglesDataKHR;
+
+typedef struct VkAccelerationStructureGeometryAabbsDataKHR {
+	VkStructureType sType;
+	const void*  pNext;
+	VkDeviceOrHostAddressConstKHR data;
+	VkDeviceSize stride;
+} VkAccelerationStructureGeometryAabbsDataKHR;
+
+typedef struct VkAccelerationStructureGeometryInstancesDataKHR {
+	VkStructureType sType;
+	const void* pNext;
+	VkBool32    arrayOfPointers;
+	VkDeviceOrHostAddressConstKHR data;
+} VkAccelerationStructureGeometryInstancesDataKHR;
+
+typedef union VkAccelerationStructureGeometryDataKHR {
+	VkAccelerationStructureGeometryTrianglesDataKHR triangles;
+	VkAccelerationStructureGeometryAabbsDataKHR     aabbs;
+	VkAccelerationStructureGeometryInstancesDataKHR instances;
+} VkAccelerationStructureGeometryDataKHR;
+
+typedef struct VkAccelerationStructureGeometryKHR {
+	VkStructureType sType;
+	const void* pNext;
+	int         geometryType;
+	VkAccelerationStructureGeometryDataKHR geometry;
+	VkFlags     flags;
+} VkAccelerationStructureGeometryKHR;
+
+typedef struct VkAccelerationStructureBuildGeometryInfoKHR {
+	VkStructureType sType;
+	const void* pNext;
+	int         type;
+	VkFlags     flags;
+	int         mode;
+	VkAccelerationStructureKHR srcAccelerationStructure;
+	VkAccelerationStructureKHR dstAccelerationStructure;
+	cc_uint32   geometryCount;
+	const VkAccelerationStructureGeometryKHR* pGeometries;
+	const VkAccelerationStructureGeometryKHR* const* ppGeometries;
+	VkDeviceOrHostAddressKHR scratchData;
+} VkAccelerationStructureBuildGeometryInfoKHR;
+
+typedef struct VkAccelerationStructureBuildRangeInfoKHR {
+	cc_uint32 primitiveCount;
+	cc_uint32 primitiveOffset;
+	cc_uint32 firstVertex;
+	cc_uint32 transformOffset;
+} VkAccelerationStructureBuildRangeInfoKHR;
+
+typedef struct VkAccelerationStructureBuildSizesInfoKHR {
+	VkStructureType sType;
+	const void*  pNext;
+	VkDeviceSize accelerationStructureSize;
+	VkDeviceSize updateScratchSize;
+	VkDeviceSize buildScratchSize;
+} VkAccelerationStructureBuildSizesInfoKHR;
+
+typedef struct VkAccelerationStructureCreateInfoKHR {
+	VkStructureType sType;
+	const void*     pNext;
+	VkFlags         createFlags;
+	VkBuffer        buffer;
+	VkDeviceSize    offset;
+	VkDeviceSize    size;
+	int             type;
+	VkDeviceAddress deviceAddress;
+} VkAccelerationStructureCreateInfoKHR;
+
+typedef struct VkAccelerationStructureDeviceAddressInfoKHR {
+	VkStructureType sType;
+	const void* pNext;
+	VkAccelerationStructureKHR accelerationStructure;
+} VkAccelerationStructureDeviceAddressInfoKHR;
+
+/* NOTE: The real struct uses 24:8 bitfields, which are packed manually here instead */
+/*  customIndexAndMask = index | (mask << 24), sbtOffsetAndFlags = offset | (flags << 24) */
+typedef struct VkAccelerationStructureInstanceKHR {
+	float     matrix[3][4];
+	cc_uint32 customIndexAndMask;
+	cc_uint32 sbtOffsetAndFlags;
+	cc_uint64 accelerationStructureReference;
+} VkAccelerationStructureInstanceKHR;
+
+typedef struct VkWriteDescriptorSetAccelerationStructureKHR {
+	VkStructureType sType;
+	const void* pNext;
+	cc_uint32   accelerationStructureCount;
+	const VkAccelerationStructureKHR* pAccelerationStructures;
+} VkWriteDescriptorSetAccelerationStructureKHR;

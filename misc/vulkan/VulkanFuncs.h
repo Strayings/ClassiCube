@@ -9,6 +9,8 @@ VK_FUNC(void,     vkGetPhysicalDeviceProperties,            (VkPhysicalDevice ph
 VK_FUNC(void,     vkGetPhysicalDeviceMemoryProperties,      (VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties* pProperties))
 VK_FUNC(void,     vkGetPhysicalDeviceQueueFamilyProperties, (VkPhysicalDevice physicalDevice, cc_uint32* pCount, VkQueueFamilyProperties* pProperties))
 VK_FUNC(void,     vkGetPhysicalDeviceFormatProperties,      (VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties* pProperties))
+VK_FUNC(void,     vkGetPhysicalDeviceFeatures2,             (VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2* pFeatures))
+VK_FUNC(void,     vkGetPhysicalDeviceProperties2,           (VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties))
 
 /* Device functions */
 VK_FUNC(VkResult, vkCreateDevice,   (VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const void* pAllocator, VkDevice* pDevice))

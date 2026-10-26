@@ -400,6 +400,15 @@ void ClassicLighting_AllocState(void) {
 	}
 }
 
+/* When the graphics backend calculates sun shadows, every block has to be meshed as if */
+/*  it was in sunlight, otherwise blocks in shadow would end up being darkened twice */
+cc_bool Lighting_GfxSunShadows;
+static cc_bool   SunLighting_IsLit_Fast(int x, int y, int z)        { return true; }
+static PackedCol SunLighting_Color_Fast(int x, int y, int z)        { return Env.SunCol; }
+static PackedCol SunLighting_Color_YMin_Fast(int x, int y, int z)   { return Env.SunYMin; }
+static PackedCol SunLighting_Color_XSide_Fast(int x, int y, int z)  { return Env.SunXSide; }
+static PackedCol SunLighting_Color_ZSide_Fast(int x, int y, int z)  { return Env.SunZSide; }
+
 static void ClassicLighting_SetActive(void) {
 	cc_bool smoothLighting = false;
 	if (!Game_ClassicMode) smoothLighting = Options_GetBool(OPT_SMOOTH_LIGHTING, false);
@@ -420,6 +429,15 @@ static void ClassicLighting_SetActive(void) {
 	Lighting.FreeState  = ClassicLighting_FreeState;
 	Lighting.AllocState = ClassicLighting_AllocState;
 	Lighting.LightHint  = ClassicLighting_LightHint;
+
+	/* Only chunk meshing is affected, entities/particles still use the heightmap */
+	if (!Lighting_GfxSunShadows) return;
+	Lighting.IsLit_Fast        = SunLighting_IsLit_Fast;
+	Lighting.Color_Sprite_Fast = SunLighting_Color_Fast;
+	Lighting.Color_YMax_Fast   = SunLighting_Color_Fast;
+	Lighting.Color_YMin_Fast   = SunLighting_Color_YMin_Fast;
+	Lighting.Color_XSide_Fast  = SunLighting_Color_XSide_Fast;
+	Lighting.Color_ZSide_Fast  = SunLighting_Color_ZSide_Fast;
 }
 
 
@@ -427,7 +445,8 @@ static void ClassicLighting_SetActive(void) {
 *---------------------------------------------------Lighting component----------------------------------------------------*
 *#########################################################################################################################*/
 static void Lighting_ApplyActive(void) {
-	if (Lighting_Mode != LIGHTING_MODE_CLASSIC) {
+	/* Sun shadows from the graphics backend replace both lighting modes */
+	if (Lighting_Mode != LIGHTING_MODE_CLASSIC && !Lighting_GfxSunShadows) {
 		FancyLighting_SetActive();
 	} else {
 		ClassicLighting_SetActive();
@@ -438,6 +457,19 @@ static void Lighting_SwitchActive(void) {
 	Lighting.FreeState();
 	Lighting_ApplyActive();
 	Lighting.AllocState();
+}
+
+void Lighting_SetGfxSunShadows(cc_bool enabled) {
+	if (Lighting_GfxSunShadows == enabled) return;
+	Lighting_GfxSunShadows = enabled;
+	Builder_ApplyActive();
+
+	if (World.Loaded) {
+		Lighting_SwitchActive();
+		MapRenderer_Refresh();
+	} else {
+		Lighting_ApplyActive();
+	}
 }
 
 static void Lighting_HandleModeChanged(void* obj, cc_uint8 oldMode, cc_bool fromServer) {

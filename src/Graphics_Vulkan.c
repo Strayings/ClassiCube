@@ -4,6 +4,10 @@
 #include "_GraphicsBase.h"
 #include "Errors.h"
 #include "Window.h"
+#include "Menus.h"
+#include "Lighting.h"
+#include "World.h"
+#include "Camera.h"
 
 /* Vulkan 1.1 backend (Windows only for now) */
 
@@ -41,11 +45,12 @@ static const struct DynamicLibSym vk_funcs[] = {
 #define RING_MAX_KEEP    (32 * 1024 * 1024)
 #define RING_MAX_CHUNKS  32
 #define DESC_POOL_SETS   512
-#define PIPELINE_KEYS    8192
+#define PIPELINE_KEYS    16384
 #define WAIT_FOREVER     ((cc_uint64)-1)
 
 #define GARBAGE_BUFFER  0
 #define GARBAGE_TEXTURE 1
+#define GARBAGE_SCRATCH 2
 
 struct ShaderDesc { const unsigned int* data; int len; };
 
@@ -58,11 +63,12 @@ struct MemBlock {
 	VkBuffer buffer;
 	VkDeviceSize size;
 	cc_uint32 type;
+	VkDeviceAddress address;
 };
 struct MemPool  { struct MemBlock* blocks; VkFlags usage; };
-struct MemAlloc { struct MemBlock* block; VkDeviceSize offset, size; };
+struct MemAlloc { struct MemBlock* block; VkDeviceSize offset, size; struct ChunkRT* rt; };
 
-struct RingChunk { VkBuffer buffer; VkDeviceMemory memory; cc_uint8* data; VkDeviceSize size, used; };
+struct RingChunk { VkBuffer buffer; VkDeviceMemory memory; cc_uint8* data; VkDeviceSize size, used; VkDeviceAddress address; };
 struct Garbage   { int type; void* obj; };
 
 /* Resources are only reused once the GPU has finished rendering the frame they were used in */
@@ -75,6 +81,23 @@ struct Frame {
 	int numChunks;
 	struct Garbage* garbage;
 	int numGarbage, maxGarbage;
+	/* Top level acceleration structure of all the chunks, for ray traced shadows */
+	VkAccelerationStructureKHR tlas;
+	struct MemAlloc tlasAlloc, tlasScratch;
+	cc_uint32 tlasCapacity;
+	VkDescriptorSet rtSet;
+};
+
+/* Bottom level acceleration structure of the shadow casting faces of a chunk */
+struct ChunkRT {
+	VkAccelerationStructureKHR blas;
+	struct MemAlloc blasAlloc;
+	VkDeviceAddress address;
+	struct MemAlloc* vb;
+	/* Ranges of cutout vertices (e.g. leaves) come first, then ranges of opaque vertices */
+	int* ranges;
+	int numRanges, numCutout, numCutoutGeoms, listIndex;
+	cc_bool built;
 };
 
 struct VulkanTexture {
@@ -97,11 +120,13 @@ struct DynamicVb {
 };
 
 /* NOTE: Layout must match the push constant blocks in misc/vulkan/VulkanShaderGen.c */
+/*  (128 bytes is the maximum size that is guaranteed to be supported by all GPUs) */
 static struct PushConstants {
 	struct Matrix mvp;
-	float texX, texY, _pad1, _pad2;
+	float texX, texY, camX, camY;
 	float fogR, fogG, fogB, fogEnd;
-	float fogDensity, _pad3, _pad4, _pad5;
+	float fogDensity, shadowRatio, camZ, _pad1;
+	float sunX, sunY, sunZ, shadowDist;
 } pc;
 
 static VkInstance instance;
@@ -166,8 +191,46 @@ static struct Matrix _view, _proj;
 static cc_bool dynamicCull;
 static void (VKAPI_PTR *vkCmdSetCullModeEXT)(VkCommandBuffer cmd, VkFlags cullMode);
 
+/* Ray traced shadows (using VK_KHR_ray_query, so only on GPUs with ray tracing support) */
+static cc_bool rtSupported, rtEnabled, rtActive, dirtyRtSet;
+static int rtSunAngle, rtSunDir, rtShadowDist;
+static VkDeviceSize rtScratchAlign;
+static struct MemPool asPool, scratchPool;
+static VkDescriptorSetLayout rtSetLayout;
+static VkDescriptorPool rtDescPool;
+/* Contains the address of each frame's table of cutout geometry vertices */
+/*  (256 is the largest minUniformBufferOffsetAlignment allowed by the Vulkan spec) */
+static struct RingChunk rtParams;
+#define RT_PARAMS_STRIDE 256
+static VkShaderModule vsRtModule, fsRtModules[6];
+/* Chunks waiting for their BLAS to be built, and chunks which have a BLAS */
+static struct ChunkRT** rtPending;
+static struct ChunkRT** rtChunks;
+static int numRtPending, maxRtPending, numRtChunks, maxRtChunks;
+
+static VkDeviceAddress (VKAPI_PTR *vkGetBufferDeviceAddressKHR)(VkDevice device, const VkBufferDeviceAddressInfo* pInfo);
+static VkResult (VKAPI_PTR *vkCreateAccelerationStructureKHR)(VkDevice device, const VkAccelerationStructureCreateInfoKHR* pCreateInfo, const void* pAllocator, VkAccelerationStructureKHR* pStructure);
+static void     (VKAPI_PTR *vkDestroyAccelerationStructureKHR)(VkDevice device, VkAccelerationStructureKHR structure, const void* pAllocator);
+static void     (VKAPI_PTR *vkGetAccelerationStructureBuildSizesKHR)(VkDevice device, int buildType, const VkAccelerationStructureBuildGeometryInfoKHR* pBuildInfo, const cc_uint32* pMaxPrimitiveCounts, VkAccelerationStructureBuildSizesInfoKHR* pSizeInfo);
+static void     (VKAPI_PTR *vkCmdBuildAccelerationStructuresKHR)(VkCommandBuffer cmd, cc_uint32 infoCount, const VkAccelerationStructureBuildGeometryInfoKHR* pInfos, const VkAccelerationStructureBuildRangeInfoKHR* const* ppRangeInfos);
+static VkDeviceAddress (VKAPI_PTR *vkGetAccelerationStructureDeviceAddressKHR)(VkDevice device, const VkAccelerationStructureDeviceAddressInfoKHR* pInfo);
+
+static const struct DynamicLibSym rt_funcs[] = {
+	{ "vkGetBufferDeviceAddressKHR",                (void**)&vkGetBufferDeviceAddressKHR,                true },
+	{ "vkCreateAccelerationStructureKHR",           (void**)&vkCreateAccelerationStructureKHR,           true },
+	{ "vkDestroyAccelerationStructureKHR",          (void**)&vkDestroyAccelerationStructureKHR,          true },
+	{ "vkGetAccelerationStructureBuildSizesKHR",    (void**)&vkGetAccelerationStructureBuildSizesKHR,    true },
+	{ "vkCmdBuildAccelerationStructuresKHR",        (void**)&vkCmdBuildAccelerationStructuresKHR,        true },
+	{ "vkGetAccelerationStructureDeviceAddressKHR", (void**)&vkGetAccelerationStructureDeviceAddressKHR, true },
+};
+
 static void RecreateSwapchain(void);
 static void Garbage_Collect(struct Frame* f);
+static void RT_FreeChunk(struct ChunkRT* rt);
+static void RT_FreeTLAS(struct Frame* f);
+static void RT_Init(void);
+static void RT_FreeAll(void);
+static void RT_Unlink(struct ChunkRT* rt);
 
 
 static void HandleError(VkResult res, const char* place) {
@@ -202,10 +265,38 @@ static int FindMemoryType(cc_uint32 typeBits, VkFlags required, VkFlags preferre
 	return -1;
 }
 
+/* Buffers whose address is used by shaders or acceleration structure builds */
+/*  must have their memory allocated with the device address flag */
+static VkResult AllocateMemory(const VkMemoryRequirements* reqs, int type, VkFlags usage, VkDeviceMemory* memory) {
+	VkMemoryAllocateFlagsInfo flags = { 0 };
+	VkMemoryAllocateInfo alloc      = { 0 };
+
+	alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+	alloc.allocationSize  = reqs->size;
+	alloc.memoryTypeIndex = type;
+
+	if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
+		flags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+		flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+		alloc.pNext = &flags;
+	}
+	return vkAllocateMemory(device, &alloc, NULL, memory);
+}
+
+static VkDeviceAddress GetBufferAddress(VkBuffer buffer, VkFlags usage) {
+	VkBufferDeviceAddressInfo info = { 0 };
+	if (!(usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)) return 0;
+
+	info.sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+	info.buffer = buffer;
+	return vkGetBufferDeviceAddressKHR(device, &info);
+}
+
+#define MemAlloc_Address(alloc) ((alloc)->block->address + (alloc)->offset)
+
 
 static struct MemBlock* MemBlock_Create(struct MemPool* pool, VkDeviceSize size, cc_uint32 typeBits) {
-	VkBufferCreateInfo info   = { 0 };
-	VkMemoryAllocateInfo alloc = { 0 };
+	VkBufferCreateInfo info = { 0 };
 	VkMemoryRequirements reqs;
 	VkDeviceMemory memory = 0;
 	VkBuffer buffer = 0;
@@ -225,11 +316,7 @@ static struct MemBlock* MemBlock_Create(struct MemPool* pool, VkDeviceSize size,
 	}
 
 	type = FindMemoryType(reqs.memoryTypeBits, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-	alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-	alloc.allocationSize  = reqs.size;
-	alloc.memoryTypeIndex = type;
-
-	if (type < 0 || vkAllocateMemory(device, &alloc, NULL, &memory)) {
+	if (type < 0 || AllocateMemory(&reqs, type, pool->usage, &memory)) {
 		if (buffer) vkDestroyBuffer(device, buffer, NULL);
 		return NULL;
 	}
@@ -241,12 +328,13 @@ static struct MemBlock* MemBlock_Create(struct MemPool* pool, VkDeviceSize size,
 	block->free->offset = 0;
 	block->free->size   = size;
 
-	block->memory = memory;
-	block->buffer = buffer;
-	block->size   = size;
-	block->type   = type;
-	block->next   = pool->blocks;
-	pool->blocks  = block;
+	block->memory  = memory;
+	block->buffer  = buffer;
+	block->size    = size;
+	block->type    = type;
+	block->address = buffer ? GetBufferAddress(buffer, pool->usage) : 0;
+	block->next    = pool->blocks;
+	pool->blocks   = block;
 	return block;
 }
 
@@ -388,8 +476,7 @@ static cc_bool AllocMemory(struct MemPool* pool, const VkMemoryRequirements* req
 *----------------------------------------------------Frame ring buffers---------------------------------------------------*
 *#########################################################################################################################*/
 static cc_bool RingChunk_Create(struct RingChunk* chunk, VkDeviceSize size) {
-	VkBufferCreateInfo info    = { 0 };
-	VkMemoryAllocateInfo alloc = { 0 };
+	VkBufferCreateInfo info = { 0 };
 	VkMemoryRequirements reqs;
 	void* data;
 	int type;
@@ -398,19 +485,20 @@ static cc_bool RingChunk_Create(struct RingChunk* chunk, VkDeviceSize size) {
 	info.size        = size;
 	info.usage       = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	/* Instances for the top level acceleration structure are also written into the ring buffer */
+	if (rtSupported) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+								| VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
 	if (vkCreateBuffer(device, &info, NULL, &chunk->buffer)) return false;
 
 	vkGetBufferMemoryRequirements(device, chunk->buffer, &reqs);
 	type = FindMemoryType(reqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
-	alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-	alloc.allocationSize  = reqs.size;
-	alloc.memoryTypeIndex = type;
 
-	if (type < 0 || vkAllocateMemory(device, &alloc, NULL, &chunk->memory)) {
+	if (type < 0 || AllocateMemory(&reqs, type, info.usage, &chunk->memory)) {
 		vkDestroyBuffer(device, chunk->buffer, NULL);
 		return false;
 	}
 	vkBindBufferMemory(device, chunk->buffer, chunk->memory, 0);
+	chunk->address = GetBufferAddress(chunk->buffer, info.usage);
 
 	if (vkMapMemory(device, chunk->memory, 0, size, 0, &data)) {
 		vkDestroyBuffer(device, chunk->buffer, NULL);
@@ -451,6 +539,17 @@ static void* Ring_Alloc(VkDeviceSize size, VkBuffer* buffer, VkDeviceSize* offse
 	*buffer     = chunk->buffer;
 	*offset     = start;
 	return chunk->data + start;
+}
+
+/* Same as Ring_Alloc, but outputs the device address of the allocated memory instead */
+static void* Ring_AllocAddress(VkDeviceSize size, VkDeviceAddress* address) {
+	VkBuffer buffer;
+	VkDeviceSize offset;
+	void* data = Ring_Alloc(size, &buffer, &offset);
+
+	/* Ring_Alloc always allocates from the most recently created chunk */
+	if (data) *address = frame->chunks[frame->numChunks - 1].address + offset;
+	return data;
 }
 
 /* Replaces multiple chunks with one bigger chunk, to avoid allocating new chunks every frame */
@@ -510,8 +609,13 @@ static void Garbage_Collect(struct Frame* f) {
 	{
 		if (f->garbage[i].type == GARBAGE_TEXTURE) {
 			FreeTexture((struct VulkanTexture*)f->garbage[i].obj);
+		} else if (f->garbage[i].type == GARBAGE_SCRATCH) {
+			alloc = (struct MemAlloc*)f->garbage[i].obj;
+			MemAlloc_Free(&scratchPool, alloc);
+			Mem_Free(alloc);
 		} else {
 			alloc = (struct MemAlloc*)f->garbage[i].obj;
+			if (alloc->rt) RT_FreeChunk(alloc->rt);
 			MemAlloc_Free(&bufferPool, alloc);
 			Mem_Free(alloc);
 		}
@@ -698,40 +802,114 @@ static cc_bool HasDeviceExtension(const char* name) {
 	return found;
 }
 
+/* Ray queries need all of these extensions. Since the instance only uses Vulkan 1.1, */
+/*  the extensions which were later promoted to Vulkan 1.2 have to be enabled too */
+static const char* const rtExtensions[] = {
+	"VK_KHR_acceleration_structure", "VK_KHR_ray_query", "VK_KHR_deferred_host_operations",
+	"VK_KHR_buffer_device_address",  "VK_EXT_descriptor_indexing",
+	"VK_KHR_spirv_1_4",              "VK_KHR_shader_float_controls"
+};
+
+static cc_bool CheckRTSupport(void) {
+	VkPhysicalDeviceFeatures2 features                  = { 0 };
+	VkPhysicalDeviceBufferDeviceAddressFeatures address = { 0 };
+	VkPhysicalDeviceAccelerationStructureFeaturesKHR as = { 0 };
+	VkPhysicalDeviceRayQueryFeaturesKHR rayQuery        = { 0 };
+	int i;
+
+	for (i = 0; i < Array_Elems(rtExtensions); i++)
+	{
+		if (!HasDeviceExtension(rtExtensions[i])) return false;
+	}
+
+	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	features.pNext = &address;
+	address.sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+	address.pNext  = &as;
+	as.sType       = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+	as.pNext       = &rayQuery;
+	rayQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+
+	vkGetPhysicalDeviceFeatures2(physDevice, &features);
+	return address.bufferDeviceAddress && as.accelerationStructure && rayQuery.rayQuery;
+}
+
+static void LoadRTFunctions(void) {
+	VkPhysicalDeviceProperties2 properties2                   = { 0 };
+	VkPhysicalDeviceAccelerationStructurePropertiesKHR asProps = { 0 };
+	int i;
+
+	for (i = 0; i < Array_Elems(rt_funcs); i++)
+	{
+		*rt_funcs[i].symAddr = (void*)vkGetDeviceProcAddr(device, rt_funcs[i].name);
+		if (!(*rt_funcs[i].symAddr)) rtSupported = false;
+	}
+
+	properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+	properties2.pNext = &asProps;
+	asProps.sType     = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
+
+	vkGetPhysicalDeviceProperties2(physDevice, &properties2);
+	rtScratchAlign = max(asProps.minAccelerationStructureScratchOffsetAlignment, 256);
+}
+
 static void CreateDevice(void) {
-	static const char* const extensions[] = { "VK_KHR_swapchain", "VK_EXT_extended_dynamic_state" };
 	static const float priority = 1.0f;
+	const char* extensions[2 + Array_Elems(rtExtensions)];
 	VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamicState = { 0 };
+	VkPhysicalDeviceBufferDeviceAddressFeatures address = { 0 };
+	VkPhysicalDeviceAccelerationStructureFeaturesKHR as = { 0 };
+	VkPhysicalDeviceRayQueryFeaturesKHR rayQuery        = { 0 };
 	VkDeviceQueueCreateInfo queueInfo = { 0 };
 	VkDeviceCreateInfo info = { 0 };
+	cc_uint32 i, count = 0;
 	VkResult res;
 
 	queueInfo.sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
 	queueInfo.queueFamilyIndex = queueFamily;
 	queueInfo.queueCount       = 1;
 	queueInfo.pQueuePriorities = &priority;
+	extensions[count++]        = "VK_KHR_swapchain";
 
-	info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-	info.queueCreateInfoCount    = 1;
-	info.pQueueCreateInfos       = &queueInfo;
-	info.enabledExtensionCount   = 1;
-	info.ppEnabledExtensionNames = extensions;
+	/* Ray tracing features are always enabled when supported, so that turning */
+	/*  on ray traced shadows doesn't require recreating the Vulkan device */
+	rtSupported = CheckRTSupport();
+	if (rtSupported) {
+		for (i = 0; i < Array_Elems(rtExtensions); i++) { extensions[count++] = rtExtensions[i]; }
+
+		address.sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+		address.pNext  = &as;
+		address.bufferDeviceAddress = true;
+		as.sType       = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+		as.pNext       = &rayQuery;
+		as.accelerationStructure = true;
+		rayQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+		rayQuery.rayQuery = true;
+		info.pNext     = &address;
+	}
 
 	/* Implementations supporting this extension must also support the extendedDynamicState feature */
 	dynamicCull = HasDeviceExtension("VK_EXT_extended_dynamic_state");
 	if (dynamicCull) {
-		dynamicState.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
+		extensions[count++] = "VK_EXT_extended_dynamic_state";
+		dynamicState.sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
+		dynamicState.pNext  = (void*)info.pNext;
 		dynamicState.extendedDynamicState = true;
-
 		info.pNext = &dynamicState;
-		info.enabledExtensionCount = 2;
 	}
+
+	info.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+	info.queueCreateInfoCount    = 1;
+	info.pQueueCreateInfos       = &queueInfo;
+	info.enabledExtensionCount   = count;
+	info.ppEnabledExtensionNames = extensions;
 
 	res = vkCreateDevice(physDevice, &info, NULL, &device);
 	if (res) Process_Abort2(res, "Failed to create Vulkan device");
 	vkGetDeviceQueue(device, queueFamily, 0, &queue);
 
 	/* Extension functions aren't exported by vulkan-1.dll, so have to be loaded separately */
+	if (rtSupported) LoadRTFunctions();
 	if (!dynamicCull) return;
 	vkCmdSetCullModeEXT = (void (VKAPI_PTR *)(VkCommandBuffer, VkFlags))vkGetDeviceProcAddr(device, "vkCmdSetCullModeEXT");
 	dynamicCull         = vkCmdSetCullModeEXT != NULL;
@@ -896,6 +1074,7 @@ static void CreateFrames(void) {
 static void DestroyFrame(struct Frame* f) {
 	int i;
 	Garbage_Collect(f);
+	RT_FreeTLAS(f);
 	for (i = 0; i < f->numChunks; i++) RingChunk_Destroy(&f->chunks[i]);
 
 	vkDestroyCommandPool(device, f->pool, NULL);
@@ -1111,6 +1290,16 @@ static const struct ShaderDesc fs_descs[] = {
 	{ fs_colored_test_density,  sizeof(fs_colored_test_density)  },
 	{ fs_textured_test_density, sizeof(fs_textured_test_density) },
 };
+/* Indexed by alpha test + fog mode * 2 */
+static const struct ShaderDesc fs_rt_descs[] = {
+	{ fs_textured_rt,              sizeof(fs_textured_rt)              },
+	{ fs_textured_test_rt,         sizeof(fs_textured_test_rt)         },
+	{ fs_textured_linear_rt,       sizeof(fs_textured_linear_rt)       },
+	{ fs_textured_test_linear_rt,  sizeof(fs_textured_test_linear_rt)  },
+	{ fs_textured_density_rt,      sizeof(fs_textured_density_rt)      },
+	{ fs_textured_test_density_rt, sizeof(fs_textured_test_density_rt) },
+};
+static const struct ShaderDesc vs_rt_desc = { vs_textured_rt, sizeof(vs_textured_rt) };
 
 static VkShaderModule CreateShader(const struct ShaderDesc* desc) {
 	VkShaderModuleCreateInfo info = { 0 };
@@ -1126,11 +1315,85 @@ static VkShaderModule CreateShader(const struct ShaderDesc* desc) {
 	return module;
 }
 
+/* Set 1 contains the top level acceleration structure for ray traced shadows (binding 0), */
+/*  and the address of the table of cutout geometry vertices (binding 1) */
+static void CreateRTDescriptors(void) {
+	VkDescriptorSetLayoutBinding bindings[2] = { { 0 } };
+	VkDescriptorSetLayoutCreateInfo setInfo  = { 0 };
+	VkDescriptorPoolCreateInfo poolInfo      = { 0 };
+	VkDescriptorSetAllocateInfo allocInfo    = { 0 };
+	VkDescriptorBufferInfo bufferInfo;
+	VkWriteDescriptorSet write = { 0 };
+	VkDescriptorPoolSize sizes[2];
+	VkResult res;
+	int i;
+
+	bindings[0].binding         = 0;
+	bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	bindings[0].descriptorCount = 1;
+	bindings[0].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+	bindings[1].binding         = 1;
+	bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	bindings[1].descriptorCount = 1;
+	bindings[1].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+	setInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	setInfo.bindingCount = 2;
+	setInfo.pBindings    = bindings;
+
+	res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &rtSetLayout);
+	if (res) Process_Abort2(res, "Failed to create Vulkan ray tracing descriptor set layout");
+
+	sizes[0].type            = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	sizes[0].descriptorCount = FRAMES_IN_FLIGHT;
+	sizes[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	sizes[1].descriptorCount = FRAMES_IN_FLIGHT;
+
+	poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets       = FRAMES_IN_FLIGHT;
+	poolInfo.poolSizeCount = 2;
+	poolInfo.pPoolSizes    = sizes;
+
+	res = vkCreateDescriptorPool(device, &poolInfo, NULL, &rtDescPool);
+	if (res) Process_Abort2(res, "Failed to create Vulkan ray tracing descriptor pool");
+
+	allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocInfo.descriptorPool     = rtDescPool;
+	allocInfo.descriptorSetCount = 1;
+	allocInfo.pSetLayouts        = &rtSetLayout;
+
+	if (!RingChunk_Create(&rtParams, RT_PARAMS_STRIDE * FRAMES_IN_FLIGHT))
+		Process_Abort("Failed to create Vulkan ray tracing parameters buffer");
+
+	write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	write.dstBinding      = 1;
+	write.descriptorCount = 1;
+	write.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	write.pBufferInfo     = &bufferInfo;
+
+	for (i = 0; i < FRAMES_IN_FLIGHT; i++)
+	{
+		res = vkAllocateDescriptorSets(device, &allocInfo, &frames[i].rtSet);
+		if (res) Process_Abort2(res, "Failed to allocate Vulkan ray tracing descriptor set");
+		Mem_Set(rtParams.data + i * RT_PARAMS_STRIDE, 0, RT_PARAMS_STRIDE);
+
+		bufferInfo.buffer = rtParams.buffer;
+		bufferInfo.offset = i * RT_PARAMS_STRIDE;
+		bufferInfo.range  = sizeof(VkDeviceAddress);
+		write.dstSet      = frames[i].rtSet;
+		vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+	}
+
+	vsRtModule = CreateShader(&vs_rt_desc);
+	for (i = 0; i < Array_Elems(fsRtModules); i++) fsRtModules[i] = CreateShader(&fs_rt_descs[i]);
+}
+
 static void CreatePipelineObjects(void) {
 	VkDescriptorSetLayoutBinding binding   = { 0 };
 	VkDescriptorSetLayoutCreateInfo setInfo = { 0 };
 	VkPipelineLayoutCreateInfo layoutInfo  = { 0 };
 	VkSamplerCreateInfo samplerInfo        = { 0 };
+	VkDescriptorSetLayout setLayouts[2];
 	VkPushConstantRange range;
 	VkResult res;
 	int i;
@@ -1149,14 +1412,18 @@ static void CreatePipelineObjects(void) {
 
 	res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &setLayout);
 	if (res) Process_Abort2(res, "Failed to create Vulkan descriptor set layout");
+	if (rtSupported) CreateRTDescriptors();
 
 	range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 	range.offset     = 0;
 	range.size       = sizeof(pc);
 
+	setLayouts[0] = setLayout;
+	setLayouts[1] = rtSetLayout;
+
 	layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	layoutInfo.setLayoutCount         = 1;
-	layoutInfo.pSetLayouts            = &setLayout;
+	layoutInfo.setLayoutCount         = rtSupported ? 2 : 1;
+	layoutInfo.pSetLayouts            = setLayouts;
 	layoutInfo.pushConstantRangeCount = 1;
 	layoutInfo.pPushConstantRanges    = &range;
 
@@ -1201,6 +1468,13 @@ static void DestroyPipelineObjects(void) {
 	numDescPools = 0;
 	vkDestroyPipelineLayout(device, pipelineLayout, NULL);
 	vkDestroyDescriptorSetLayout(device, setLayout, NULL);
+
+	if (!rtSupported) return;
+	vkDestroyShaderModule(device, vsRtModule, NULL);
+	for (i = 0; i < Array_Elems(fsRtModules); i++) vkDestroyShaderModule(device, fsRtModules[i], NULL);
+	vkDestroyDescriptorPool(device, rtDescPool, NULL);
+	vkDestroyDescriptorSetLayout(device, rtSetLayout, NULL);
+	RingChunk_Destroy(&rtParams);
 }
 
 /* Pipelines are created on demand for each combination of render state (see CalcPipelineKey) */
@@ -1221,15 +1495,16 @@ static VkPipeline CreatePipeline(int key) {
 	VkGraphicsPipelineCreateInfo info                    = { 0 };
 	VkPipeline pipeline;
 	VkResult res;
-	int fmt = key & 1;
+	int fmt = key & 1, rt = (key >> 13) & 1;
 
 	stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
-	stages[0].module = vsModules[fmt];
+	stages[0].module = rt ? vsRtModule : vsModules[fmt];
 	stages[0].pName  = "main";
 	stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
-	stages[1].module = fsModules[key & 0x0F];
+	/* Ray traced variants only exist for textured vertices (i.e. chunk meshes) */
+	stages[1].module = rt ? fsRtModules[((key >> 1) & 1) + ((key >> 2) & 3) * 2] : fsModules[key & 0x0F];
 	stages[1].pName  = "main";
 
 	binding.stride    = strideSizes[fmt];
@@ -1323,6 +1598,7 @@ void Gfx_Create(void) {
 
 	bufferPool.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	imagePool.usage  = 0;
+	if (rtSupported) RT_Init();
 	CreateSwapchain();
 
 	Gfx.MaxTexWidth  = props.limits.maxImageDimension2D;
@@ -1340,6 +1616,7 @@ void Gfx_Free(void) {
 
 	for (i = 0; i < FRAMES_IN_FLIGHT; i++) DestroyFrame(&frames[i]);
 	frame = NULL;
+	RT_FreeAll();
 
 	DestroySwapchainResources();
 	if (swapchain) vkDestroySwapchainKHR(device, swapchain, NULL);
@@ -1350,6 +1627,8 @@ void Gfx_Free(void) {
 	vkDestroyRenderPass(device, resumePass, NULL);
 	MemPool_Destroy(&bufferPool);
 	MemPool_Destroy(&imagePool);
+	MemPool_Destroy(&asPool);
+	MemPool_Destroy(&scratchPool);
 
 	vkDestroyDevice(device, NULL);
 	vkDestroySurfaceKHR(instance, surface, NULL);
@@ -1644,7 +1923,12 @@ static struct MemAlloc* AllocBuffer(VkDeviceSize size) {
 }
 
 static void DeleteBuffer(GfxResourceID* id) {
-	if (*id) Garbage_Add(GARBAGE_BUFFER, *id);
+	struct MemAlloc* alloc = (struct MemAlloc*)(*id);
+
+	if (alloc) {
+		if (alloc->rt) RT_Unlink(alloc->rt);
+		Garbage_Add(GARBAGE_BUFFER, alloc);
+	}
 	*id = NULL;
 }
 
@@ -1785,6 +2069,7 @@ static void InvalidateState(void) {
 	dirtyVb        = true;
 	dirtyIb        = true;
 	dirtyCull      = true;
+	dirtyRtSet     = true;
 }
 
 static void BeginRenderPass(VkRenderPass pass) {
@@ -1833,18 +2118,20 @@ static cc_bool EnsureRenderPass(void) {
 }
 
 /* Bit 0 = format, 1 = alpha test, 2-3 = fog, 4 = blending, 5-8 = colour mask, */
-/*  9 = depth test, 10 = depth write, 11 = culling (only without dynamic cull mode), 12 = lines */
-static int CalcPipelineKey(cc_bool lines) {
+/*  9 = depth test, 10 = depth write, 11 = culling (only without dynamic cull mode), */
+/*  12 = lines, 13 = ray traced shadows */
+static int CalcPipelineKey(cc_bool lines, cc_bool rt) {
 	int fog = 0, cull = dynamicCull ? 0 : cullFaces;
 	if (gfx_fogEnabled && gfx_fogMode >= 0) fog = gfx_fogMode == FOG_LINEAR ? 1 : 2;
 
 	return gfx_format | (gfx_alphaTest << 1) | (fog << 2) | (gfx_alphaBlend << 4) | (colorMask << 5) |
-		(gfx_depthTest << 9) | (gfx_depthWrite << 10) | (cull << 11) | (lines << 12);
+		(gfx_depthTest << 9) | (gfx_depthWrite << 10) | (cull << 11) | (lines << 12) | (rt << 13);
 }
 
-static cc_bool PrepareDraw(cc_bool lines) {
+static cc_bool PrepareDraw(cc_bool lines, cc_bool terrain) {
 	struct VulkanTexture* tex = curTex ? curTex : (struct VulkanTexture*)white_square;
 	cc_bool textured = gfx_format == VERTEX_FORMAT_TEXTURED;
+	cc_bool rt;
 	VkCommandBuffer cmd;
 	int key;
 
@@ -1854,11 +2141,19 @@ static cc_bool PrepareDraw(cc_bool lines) {
 	if (!EnsureRenderPass())         return false;
 	cmd = frame->drawCmd;
 
-	key = CalcPipelineKey(lines);
+	/* No point tracing rays when nothing is written to the colour buffer (e.g. depth only pass) */
+	rt  = terrain && textured && rtActive && frame->tlas && colorMask;
+	key = CalcPipelineKey(lines, rt);
 	if (key != boundPipeline) {
 		if (!pipelines[key]) pipelines[key] = CreatePipeline(key);
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[key]);
 		boundPipeline = key;
+	}
+
+	if (rt && dirtyRtSet) {
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+								1, 1, &frame->rtSet, 0, NULL);
+		dirtyRtSet = false;
 	}
 
 	if (dirtyCull && dynamicCull) {
@@ -1901,22 +2196,23 @@ void Gfx_SetVertexFormat(VertexFormat fmt) {
 }
 
 void Gfx_DrawVb_Lines(int verticesCount) {
-	if (!PrepareDraw(true)) return;
+	if (!PrepareDraw(true, false)) return;
 	vkCmdDraw(frame->drawCmd, verticesCount, 1, 0, 0);
 }
 
 void Gfx_DrawVb_IndexedTris(int verticesCount) {
-	if (!PrepareDraw(false)) return;
+	if (!PrepareDraw(false, false)) return;
 	vkCmdDrawIndexed(frame->drawCmd, ICOUNT(verticesCount), 1, 0, 0, 0);
 }
 
 void Gfx_DrawVb_IndexedTris_Range(int verticesCount, int startVertex, DrawHints hints) {
-	if (!PrepareDraw(false)) return;
+	if (!PrepareDraw(false, false)) return;
 	vkCmdDrawIndexed(frame->drawCmd, ICOUNT(verticesCount), 1, 0, startVertex, 0);
 }
 
+/* Only used by MapRenderer, so this is how chunks are drawn with ray traced shadows */
 void Gfx_DrawIndexedTris_T2fC4b(int verticesCount, int startVertex, DrawHints hints) {
-	if (!PrepareDraw(false)) return;
+	if (!PrepareDraw(false, true)) return;
 	vkCmdDrawIndexed(frame->drawCmd, ICOUNT(verticesCount), 1, 0, startVertex, 0);
 }
 
@@ -2096,6 +2392,529 @@ void Gfx_ClearBuffers(GfxBuffers buffers) {
 
 
 /*########################################################################################################################*
+*-------------------------------------------------------Ray tracing-------------------------------------------------------*
+*#########################################################################################################################*/
+#define RT_OPT_ENABLED     "gfx-raytracing"
+#define RT_OPT_SUN_ANGLE   "gfx-rt-sunangle"
+#define RT_OPT_SUN_DIR     "gfx-rt-sundir"
+#define RT_OPT_SHADOW_DIST "gfx-rt-shadowdist"
+/* Each geometry can only use up to 16384 quads, since that's all the default index buffer has */
+#define RT_MAX_GEOMETRY_VERTICES 65536
+/* Extra space in the top level acceleration structure for chunks built during the frame */
+#define RT_TLAS_SLACK 512
+#define RT_GeometryCount(vertices) (((vertices) + RT_MAX_GEOMETRY_VERTICES - 1) / RT_MAX_GEOMETRY_VERTICES)
+
+static const char* const rtSunAngle_Names[]   = { "Low", "Medium", "High", "Overhead" };
+static const char* const rtSunDir_Names[]     = { "North", "East", "South", "West" };
+static const char* const rtShadowDist_Names[] = { "64", "128", "256", "Max" };
+static const float rtSunAngle_Degrees[]  = { 20.0f, 40.0f, 60.0f, 90.0f };
+static const float rtShadowDist_Blocks[] = { 64.0f, 128.0f, 256.0f, 4096.0f };
+/* Horizontal direction towards the sun (north is -Z) */
+static const float rtSunDir_X[] = {  0.0f, 1.0f, 0.0f, -1.0f };
+static const float rtSunDir_Z[] = { -1.0f, 0.0f, 1.0f,  0.0f };
+
+static void RT_Init(void) {
+	VkFlags address = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+	/* Chunk vertices and the default index buffer are used directly when building acceleration structures */
+	bufferPool.usage |= address | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+	asPool.usage      = address | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
+	scratchPool.usage = address | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+	rtEnabled    = Options_GetBool(RT_OPT_ENABLED, false);
+	rtSunAngle   = Options_GetEnum(RT_OPT_SUN_ANGLE,   1, rtSunAngle_Names,   Array_Elems(rtSunAngle_Names));
+	rtSunDir     = Options_GetEnum(RT_OPT_SUN_DIR,     1, rtSunDir_Names,     Array_Elems(rtSunDir_Names));
+	rtShadowDist = Options_GetEnum(RT_OPT_SHADOW_DIST, 2, rtShadowDist_Names, Array_Elems(rtShadowDist_Names));
+}
+
+static void RT_ListAdd(struct ChunkRT*** list, int* count, int* max, struct ChunkRT* rt) {
+	if (*count == *max) {
+		*max  = *max ? *max * 2 : 256;
+		*list = *list ?
+			(struct ChunkRT**)Mem_Realloc(*list, *max, sizeof(struct ChunkRT*), "Vulkan RT chunks") :
+			(struct ChunkRT**)Mem_Alloc(*max, sizeof(struct ChunkRT*), "Vulkan RT chunks");
+	}
+	rt->listIndex = *count;
+	(*list)[(*count)++] = rt;
+}
+
+static void RT_ListRemove(struct ChunkRT** list, int* count, struct ChunkRT* rt) {
+	int i = rt->listIndex;
+	list[i] = list[--(*count)];
+	list[i]->listIndex = i;
+	rt->listIndex = -1;
+}
+
+/* Called when a chunk's VB is deleted. The BLAS is destroyed later in Garbage_Collect, */
+/*  since the GPU might still be using it in a frame that hasn't finished rendering yet */
+static void RT_Unlink(struct ChunkRT* rt) {
+	if (rt->listIndex < 0) return;
+
+	if (rt->built) {
+		RT_ListRemove(rtChunks,  &numRtChunks,  rt);
+	} else {
+		RT_ListRemove(rtPending, &numRtPending, rt);
+	}
+}
+
+static void RT_FreeChunk(struct ChunkRT* rt) {
+	if (rt->blas) vkDestroyAccelerationStructureKHR(device, rt->blas, NULL);
+	MemAlloc_Free(&asPool, &rt->blasAlloc);
+	rt->vb->rt = NULL;
+
+	Mem_Free(rt->ranges);
+	Mem_Free(rt);
+}
+
+static void RT_FreeAll(void) {
+	while (numRtChunks)  { RT_FreeChunk(rtChunks[--numRtChunks]);   }
+	while (numRtPending) { RT_FreeChunk(rtPending[--numRtPending]); }
+
+	Mem_Free(rtChunks);
+	Mem_Free(rtPending);
+	rtChunks  = NULL; maxRtChunks  = 0;
+	rtPending = NULL; maxRtPending = 0;
+}
+
+void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, int numCutout) {
+	struct MemAlloc* alloc = (struct MemAlloc*)vb;
+	int i, numRanges = numOpaque + numCutout;
+	struct ChunkRT* rt;
+	if (!rtActive || !alloc || !numRanges) return;
+
+	rt = (struct ChunkRT*)Mem_TryAllocCleared(1, sizeof(struct ChunkRT));
+	if (!rt) return;
+	rt->ranges = (int*)Mem_TryAlloc(numRanges * 2, sizeof(int));
+	if (!rt->ranges) { Mem_Free(rt); return; }
+
+	/* Cutout ranges go first, so their geometries are the first geometries in the BLAS */
+	Mem_Copy(rt->ranges,                 ranges + numOpaque * 2, numCutout * 2 * sizeof(int));
+	Mem_Copy(rt->ranges + numCutout * 2, ranges,                 numOpaque * 2 * sizeof(int));
+	for (i = 0; i < numCutout; i++)
+	{
+		rt->numCutoutGeoms += RT_GeometryCount(rt->ranges[i * 2 + 1]);
+	}
+
+	rt->numRanges = numRanges;
+	rt->numCutout = numCutout;
+	rt->vb        = alloc;
+	alloc->rt     = rt;
+	RT_ListAdd(&rtPending, &numRtPending, &maxRtPending, rt);
+}
+
+
+static cc_bool RT_Alloc(struct MemPool* pool, struct MemAlloc* alloc, VkDeviceSize size, VkDeviceSize align) {
+	VkMemoryRequirements reqs;
+	reqs.size           = size;
+	reqs.alignment      = align;
+	reqs.memoryTypeBits = ~0u;
+	return AllocMemory(pool, &reqs, alloc);
+}
+
+/* Scratch memory is over-allocated, so that its device address can always be aligned */
+static cc_bool RT_AllocScratch(struct MemAlloc* alloc, VkDeviceSize size) {
+	return RT_Alloc(&scratchPool, alloc, size + rtScratchAlign, rtScratchAlign);
+}
+
+static VkDeviceAddress RT_ScratchAddress(struct MemAlloc* alloc) {
+	return (MemAlloc_Address(alloc) + rtScratchAlign - 1) & ~(rtScratchAlign - 1);
+}
+
+static VkAccelerationStructureKHR RT_CreateAS(struct MemAlloc* alloc, VkDeviceSize size, int type) {
+	VkAccelerationStructureCreateInfoKHR info = { 0 };
+	VkAccelerationStructureKHR as = 0;
+
+	info.sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+	info.buffer = alloc->block->buffer;
+	info.offset = alloc->offset;
+	info.size   = size;
+	info.type   = type;
+
+	if (vkCreateAccelerationStructureKHR(device, &info, NULL, &as)) return 0;
+	return as;
+}
+
+static void RT_FreeTLAS(struct Frame* f) {
+	if (!f->tlas) return;
+	vkDestroyAccelerationStructureKHR(device, f->tlas, NULL);
+	MemAlloc_Free(&asPool,      &f->tlasAlloc);
+	MemAlloc_Free(&scratchPool, &f->tlasScratch);
+
+	f->tlas         = 0;
+	f->tlasCapacity = 0;
+}
+
+static void RT_InitTLASGeometry(VkAccelerationStructureGeometryKHR* geometry, VkAccelerationStructureBuildGeometryInfoKHR* build) {
+	geometry->sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+	geometry->geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+	geometry->geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+
+	build->sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+	build->type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+	build->flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+	build->mode          = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+	build->geometryCount = 1;
+	build->pGeometries   = geometry;
+}
+
+/* Must be called before anything is drawn, since the descriptor set can't */
+/*  be changed after it has been bound in a command buffer that is recording */
+static void RT_EnsureTLAS(struct Frame* f) {
+	VkAccelerationStructureGeometryKHR geometry       = { 0 };
+	VkAccelerationStructureBuildGeometryInfoKHR build = { 0 };
+	VkAccelerationStructureBuildSizesInfoKHR sizes    = { 0 };
+	VkWriteDescriptorSetAccelerationStructureKHR tlasWrite = { 0 };
+	VkWriteDescriptorSet write = { 0 };
+	cc_uint32 capacity = numRtChunks + RT_TLAS_SLACK;
+
+	if (f->tlas && f->tlasCapacity >= capacity) return;
+	RT_FreeTLAS(f);
+	capacity = max(capacity * 2, 4096);
+
+	RT_InitTLASGeometry(&geometry, &build);
+	sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+	vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build, &capacity, &sizes);
+
+	if (!RT_Alloc(&asPool, &f->tlasAlloc, sizes.accelerationStructureSize, 256)) return;
+	if (!RT_AllocScratch(&f->tlasScratch, sizes.buildScratchSize)) {
+		MemAlloc_Free(&asPool, &f->tlasAlloc); return;
+	}
+
+	f->tlas = RT_CreateAS(&f->tlasAlloc, sizes.accelerationStructureSize, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR);
+	if (!f->tlas) {
+		MemAlloc_Free(&asPool,      &f->tlasAlloc);
+		MemAlloc_Free(&scratchPool, &f->tlasScratch);
+		return;
+	}
+	f->tlasCapacity = capacity;
+
+	tlasWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+	tlasWrite.accelerationStructureCount = 1;
+	tlasWrite.pAccelerationStructures    = &f->tlas;
+
+	write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	write.pNext           = &tlasWrite;
+	write.dstSet          = f->rtSet;
+	write.descriptorCount = 1;
+	write.descriptorType  = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+	vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+}
+
+static int RT_CountGeometries(struct ChunkRT* rt) {
+	int i, count = 0;
+	for (i = 0; i < rt->numRanges; i++)
+	{
+		count += RT_GeometryCount(rt->ranges[i * 2 + 1]);
+	}
+	return count;
+}
+
+/* Chunk vertices are quads, so they're drawn as triangles using the default index buffer */
+static int RT_FillGeometries(struct ChunkRT* rt, VkAccelerationStructureGeometryKHR* geoms,
+							VkAccelerationStructureBuildRangeInfoKHR* ranges, cc_uint32* primCounts) {
+	struct MemAlloc* vb = rt->vb;
+	struct MemAlloc* ib = (struct MemAlloc*)Gfx.DefaultIb;
+	VkAccelerationStructureGeometryTrianglesDataKHR* tris;
+	int i, first, count, vertices, n = 0;
+
+	for (i = 0; i < rt->numRanges; i++)
+	{
+		first = rt->ranges[i * 2];
+		count = rt->ranges[i * 2 + 1];
+
+		for (; count > 0; n++, first += vertices, count -= vertices)
+		{
+			vertices = min(count, RT_MAX_GEOMETRY_VERTICES);
+			Mem_Set(&geoms[n], 0, sizeof(geoms[n]));
+
+			geoms[n].sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+			geoms[n].geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+			/* Cutout geometry isn't opaque, so the shader can check the texture alpha when it's hit */
+			geoms[n].flags        = i < rt->numCutout ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR;
+
+			tris = &geoms[n].geometry.triangles;
+			tris->sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+			tris->vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+			tris->vertexData.deviceAddress = MemAlloc_Address(vb);
+			tris->vertexStride = SIZEOF_VERTEX_TEXTURED;
+			tris->maxVertex    = (cc_uint32)(vb->size / SIZEOF_VERTEX_TEXTURED) - 1;
+			tris->indexType    = VK_INDEX_TYPE_UINT16;
+			tris->indexData.deviceAddress  = MemAlloc_Address(ib);
+
+			ranges[n].primitiveCount  = vertices / 4 * 2;
+			ranges[n].primitiveOffset = 0;
+			ranges[n].firstVertex     = first;
+			ranges[n].transformOffset = 0;
+			primCounts[n] = ranges[n].primitiveCount;
+		}
+	}
+	return n;
+}
+
+static cc_bool RT_PrepareChunk(struct ChunkRT* rt, VkAccelerationStructureBuildGeometryInfoKHR* build, cc_uint32* primCounts) {
+	VkAccelerationStructureBuildSizesInfoKHR sizes = { 0 };
+	VkAccelerationStructureDeviceAddressInfoKHR addressInfo = { 0 };
+	struct MemAlloc* scratch;
+
+	sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+	vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, build, primCounts, &sizes);
+
+	scratch = (struct MemAlloc*)Mem_TryAllocCleared(1, sizeof(struct MemAlloc));
+	if (!scratch) return false;
+
+	if (!RT_AllocScratch(scratch, sizes.buildScratchSize)) {
+		Mem_Free(scratch); return false;
+	}
+	/* Scratch memory is only needed until the build has finished on the GPU */
+	Garbage_Add(GARBAGE_SCRATCH, scratch);
+
+	if (!RT_Alloc(&asPool, &rt->blasAlloc, sizes.accelerationStructureSize, 256)) return false;
+	rt->blas = RT_CreateAS(&rt->blasAlloc, sizes.accelerationStructureSize, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+	if (!rt->blas) return false;
+
+	addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+	addressInfo.accelerationStructure = rt->blas;
+	rt->address = vkGetAccelerationStructureDeviceAddressKHR(device, &addressInfo);
+
+	build->dstAccelerationStructure = rt->blas;
+	build->scratchData.deviceAddress = RT_ScratchAddress(scratch);
+	return true;
+}
+
+static void RT_BuildChunks(VkCommandBuffer cmd) {
+	VkAccelerationStructureBuildGeometryInfoKHR* builds;
+	const VkAccelerationStructureBuildRangeInfoKHR** buildRanges;
+	VkAccelerationStructureGeometryKHR* geoms;
+	VkAccelerationStructureBuildRangeInfoKHR* ranges;
+	cc_uint32* primCounts;
+	struct ChunkRT* rt;
+	int i, n, numGeoms = 0, numBuilds = 0, maxGeoms = 0;
+
+	if (!numRtPending) return;
+	for (i = 0; i < numRtPending; i++) { maxGeoms += RT_CountGeometries(rtPending[i]); }
+
+	builds      = (VkAccelerationStructureBuildGeometryInfoKHR*)Mem_Alloc(numRtPending, sizeof(*builds), "Vulkan BLAS builds");
+	buildRanges = (const VkAccelerationStructureBuildRangeInfoKHR**)Mem_Alloc(numRtPending, sizeof(*buildRanges), "Vulkan BLAS builds");
+	geoms       = (VkAccelerationStructureGeometryKHR*)Mem_Alloc(maxGeoms, sizeof(*geoms), "Vulkan BLAS geometry");
+	ranges      = (VkAccelerationStructureBuildRangeInfoKHR*)Mem_Alloc(maxGeoms, sizeof(*ranges), "Vulkan BLAS geometry");
+	primCounts  = (cc_uint32*)Mem_Alloc(maxGeoms, sizeof(*primCounts), "Vulkan BLAS geometry");
+
+	for (i = 0; i < numRtPending; i++)
+	{
+		rt = rtPending[i];
+		rt->listIndex = -1;
+		n  = RT_FillGeometries(rt, &geoms[numGeoms], &ranges[numGeoms], &primCounts[numGeoms]);
+
+		Mem_Set(&builds[numBuilds], 0, sizeof(builds[numBuilds]));
+		builds[numBuilds].sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+		builds[numBuilds].type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+		builds[numBuilds].flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+		builds[numBuilds].mode          = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+		builds[numBuilds].geometryCount = n;
+		builds[numBuilds].pGeometries   = &geoms[numGeoms];
+
+		/* If out of memory, the chunk just won't cast shadows */
+		if (!RT_PrepareChunk(rt, &builds[numBuilds], &primCounts[numGeoms])) continue;
+
+		buildRanges[numBuilds] = &ranges[numGeoms];
+		numGeoms  += n;
+		numBuilds++;
+
+		rt->built = true;
+		RT_ListAdd(&rtChunks, &numRtChunks, &maxRtChunks, rt);
+	}
+
+	if (numBuilds) vkCmdBuildAccelerationStructuresKHR(cmd, numBuilds, builds, buildRanges);
+	numRtPending = 0;
+
+	Mem_Free(builds);
+	Mem_Free(buildRanges);
+	Mem_Free(geoms);
+	Mem_Free(ranges);
+	Mem_Free(primCounts);
+}
+
+/* Each cutout geometry's entry in the table is the address of the geometry's first vertex */
+static int RT_FillTable(struct ChunkRT* rt, VkDeviceAddress* table) {
+	VkDeviceAddress vb = MemAlloc_Address(rt->vb);
+	int i, first, count, vertices, n = 0;
+
+	for (i = 0; i < rt->numCutout; i++)
+	{
+		first = rt->ranges[i * 2];
+		count = rt->ranges[i * 2 + 1];
+
+		for (; count > 0; first += vertices, count -= vertices)
+		{
+			vertices   = min(count, RT_MAX_GEOMETRY_VERTICES);
+			table[n++] = vb + (VkDeviceAddress)first * SIZEOF_VERTEX_TEXTURED;
+		}
+	}
+	return n;
+}
+
+static void RT_BuildTLAS(VkCommandBuffer cmd) {
+	VkAccelerationStructureGeometryKHR geometry       = { 0 };
+	VkAccelerationStructureBuildGeometryInfoKHR build = { 0 };
+	VkAccelerationStructureBuildRangeInfoKHR range    = { 0 };
+	const VkAccelerationStructureBuildRangeInfoKHR* pRange = &range;
+	VkAccelerationStructureInstanceKHR* instances;
+	VkDeviceAddress* table;
+	VkDeviceAddress address, tableAddress = 0;
+	struct ChunkRT* rt;
+	cc_uint32 i, flags, base = 0, numGeoms = 0, count = min((cc_uint32)numRtChunks, frame->tlasCapacity);
+
+	for (i = 0; i < count; i++) { numGeoms += rtChunks[i]->numCutoutGeoms; }
+	table = (VkDeviceAddress*)Ring_AllocAddress(max(numGeoms, 1) * sizeof(VkDeviceAddress), &tableAddress);
+
+	instances = (VkAccelerationStructureInstanceKHR*)Ring_AllocAddress(
+					max(count, 1) * sizeof(VkAccelerationStructureInstanceKHR), &address);
+	/* Still have to build an empty TLAS, since draws using it have already been recorded */
+	if (!instances) { count = 0; address = 0; }
+
+	/* Chunk vertices are already in world space, so every instance just uses an identity transform */
+	for (i = 0; i < count; i++)
+	{
+		rt = rtChunks[i];
+		Mem_Set(&instances[i], 0, sizeof(instances[i]));
+		instances[i].matrix[0][0] = 1.0f;
+		instances[i].matrix[1][1] = 1.0f;
+		instances[i].matrix[2][2] = 1.0f;
+		flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+
+		/* The custom index is where the instance's cutout geometries start in the table */
+		/*  (if there's no room in the table, cutout geometries are just treated as opaque) */
+		if (table && rt->numCutoutGeoms && base < (1u << 24)) {
+			instances[i].customIndexAndMask = base | (0xFFu << 24);
+			base += RT_FillTable(rt, table + base);
+		} else {
+			instances[i].customIndexAndMask = 0xFFu << 24;
+			flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+		}
+		instances[i].sbtOffsetAndFlags = flags << 24;
+		instances[i].accelerationStructureReference = rt->address;
+	}
+	*(VkDeviceAddress*)(rtParams.data + frameIndex * RT_PARAMS_STRIDE) = table ? tableAddress : 0;
+
+	RT_InitTLASGeometry(&geometry, &build);
+	geometry.geometry.instances.data.deviceAddress = address;
+	build.dstAccelerationStructure = frame->tlas;
+	build.scratchData.deviceAddress = RT_ScratchAddress(&frame->tlasScratch);
+	range.primitiveCount = count;
+
+	vkCmdBuildAccelerationStructuresKHR(cmd, 1, &build, &pRange);
+}
+
+static void RT_Barrier(VkCommandBuffer cmd, VkFlags srcStage, VkFlags srcAccess, VkFlags dstStage, VkFlags dstAccess) {
+	VkMemoryBarrier barrier = { 0 };
+	barrier.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	barrier.srcAccessMask = srcAccess;
+	barrier.dstAccessMask = dstAccess;
+	vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 1, &barrier, 0, NULL, 0, NULL);
+}
+
+/* Acceleration structures are built at the end of the upload command buffer, */
+/*  which is executed before the frame's draw command buffer */
+static void RT_RecordBuilds(void) {
+	VkCommandBuffer cmd;
+	if (!rtActive || !frame->tlas) return;
+	cmd = UploadCmd();
+
+	/* Chunk vertices might have only just been copied into the VBs */
+	/*  (fragment shaders also read the UVs of cutout geometry vertices) */
+	RT_Barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+				VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+	RT_BuildChunks(cmd);
+
+	RT_Barrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+				VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+	RT_BuildTLAS(cmd);
+
+	RT_Barrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+}
+
+static void RT_UpdateConstants(void) {
+	float angle = rtSunAngle_Degrees[rtSunAngle] * MATH_DEG2RAD;
+	float horiz = Math_CosF(angle);
+	int sun     = PackedCol_R(Env.SunCol)    + PackedCol_G(Env.SunCol)    + PackedCol_B(Env.SunCol);
+	int shadow  = PackedCol_R(Env.ShadowCol) + PackedCol_G(Env.ShadowCol) + PackedCol_B(Env.ShadowCol);
+
+	pc.sunX = horiz * rtSunDir_X[rtSunDir];
+	pc.sunY = Math_SinF(angle);
+	pc.sunZ = horiz * rtSunDir_Z[rtSunDir];
+	pc.shadowDist  = rtShadowDist_Blocks[rtShadowDist];
+	pc.camX = Camera.CurrentPos.x;
+	pc.camY = Camera.CurrentPos.y;
+	pc.camZ = Camera.CurrentPos.z;
+	/* Blocks in shadow are darkened by the same amount as with classic lighting */
+	pc.shadowRatio = sun ? min((float)shadow / sun, 1.0f) : 1.0f;
+	dirtyConstants = true;
+}
+
+static void RT_BeginFrame(void) {
+	cc_bool active = rtSupported && rtEnabled;
+
+	if (active != rtActive) {
+		rtActive = active;
+		/* Chunks get rebuilt, which is when their BLASes get created */
+		Lighting_SetGfxSunShadows(active);
+	}
+
+	if (!rtActive) { if (frame->tlas) RT_FreeTLAS(frame); return; }
+	RT_UpdateConstants();
+	RT_EnsureTLAS(frame);
+}
+
+
+static cc_bool RT_GetEnabled(void) { return rtEnabled; }
+static void    RT_SetEnabled(cc_bool v) {
+	rtEnabled = v;
+	Options_SetBool(RT_OPT_ENABLED, v);
+}
+
+static void RT_SaveEnum(const char* key, const char* value) {
+	cc_string str = String_FromReadonly(value);
+	Options_Set(key, &str);
+}
+
+static int  RT_GetSunAngle(void) { return rtSunAngle; }
+static void RT_SetSunAngle(int v) {
+	rtSunAngle = v;
+	RT_SaveEnum(RT_OPT_SUN_ANGLE, rtSunAngle_Names[v]);
+}
+
+static int  RT_GetSunDir(void) { return rtSunDir; }
+static void RT_SetSunDir(int v) {
+	rtSunDir = v;
+	RT_SaveEnum(RT_OPT_SUN_DIR, rtSunDir_Names[v]);
+}
+
+static int  RT_GetShadowDist(void) { return rtShadowDist; }
+static void RT_SetShadowDist(int v) {
+	rtShadowDist = v;
+	RT_SaveEnum(RT_OPT_SHADOW_DIST, rtShadowDist_Names[v]);
+}
+
+static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
+	MenuOptionsScreen_AddBool(s, "RT shadows",
+		RT_GetEnabled,    RT_SetEnabled,
+		"&eShadows from the sun are calculated using ray tracing.\n" \
+		"&eReplaces the Lighting mode and Smooth lighting settings.");
+	MenuOptionsScreen_AddEnum(s, "Sun angle", rtSunAngle_Names, Array_Elems(rtSunAngle_Names),
+		RT_GetSunAngle,   RT_SetSunAngle,
+		"&eHow high up in the sky the sun is.\n" \
+		"&eLower angles cast longer shadows.");
+	MenuOptionsScreen_AddEnum(s, "Sun direction", rtSunDir_Names, Array_Elems(rtSunDir_Names),
+		RT_GetSunDir,     RT_SetSunDir,
+		"&eWhich direction the sun shines from.");
+	MenuOptionsScreen_AddEnum(s, "Shadow distance", rtShadowDist_Names, Array_Elems(rtShadowDist_Names),
+		RT_GetShadowDist, RT_SetShadowDist,
+		"&eHow far away blocks can still cast shadows from.\n" \
+		"&eShorter distances render faster.");
+}
+
+
+/*########################################################################################################################*
 *-----------------------------------------------------Frame management----------------------------------------------------*
 *#########################################################################################################################*/
 static VkResult SubmitFrame(cc_bool present) {
@@ -2104,6 +2923,7 @@ static VkResult SubmitFrame(cc_bool present) {
 	VkCommandBuffer cmds[2];
 	cc_uint32 count = 0;
 
+	RT_RecordBuilds();
 	if (uploadBegun) { EndUploadCmd(); cmds[count++] = frame->uploadCmd; }
 	if (drawBegun)   { vkEndCommandBuffer(frame->drawCmd); cmds[count++] = frame->drawCmd; }
 
@@ -2163,6 +2983,7 @@ static void NextFrame(void) {
 void Gfx_BeginFrame(void) {
 	if (frameOpen) Gfx_EndFrame();
 	frameOpen = true;
+	RT_BeginFrame();
 }
 
 void Gfx_EndFrame(void) {
@@ -2307,7 +3128,14 @@ cc_result Gfx_TakeScreenshot(struct Stream* output) {
 }
 
 cc_bool Gfx_WarnIfNecessary(void) { return false; }
-cc_bool Gfx_GetUIOptions(struct MenuOptionsScreen* s) { return false; }
+cc_bool Gfx_GetUIOptions(struct MenuOptionsScreen* s) {
+	if (rtSupported) {
+		MenuOptionsScreen_AddSubmenu(s, "RTX options...", RTXOptionsScreen_InitWidgets,
+			"&eOptions for ray tracing effects.\n" \
+			"&eRequires a GPU with ray tracing support.");
+	}
+	return false;
+}
 
 void Gfx_GetApiInfo(cc_string* info) {
 	int pointerSize = sizeof(void*) * 8;
@@ -2329,5 +3157,8 @@ void Gfx_GetApiInfo(cc_string* info) {
 	vram_ = vram / (1024.0f * 1024.0f);
 	String_Format1(info, "Graphics memory: %f2 MB VRAM\n", &vram_);
 	PrintMaxTextureInfo(info);
+
+	String_Format1(info, "Ray tracing: %c\n", rtActive ? "active" : (rtSupported ? "supported" : "unsupported"));
+	if (rtActive) String_Format1(info, "Ray traced chunks: %i\n", &numRtChunks);
 }
 #endif

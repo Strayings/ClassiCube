@@ -375,6 +375,13 @@ CC_API void  Gfx_UnlockScratchVb(GfxResourceID vb);
 
 /* Updates the data of a dynamic vertex buffer */
 CC_API void Gfx_SetDynamicVbData(GfxResourceID vb, void* vertices, int vCount);
+
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+/* Sets which vertices of a chunk's vertex buffer cast shadows (used for ray traced shadows) */
+/*  ranges contains pairs of first vertex and number of vertices, with the ranges of opaque vertices first, */
+/*  followed by the ranges of vertices which only cast shadows where their texture isn't transparent */
+void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, int numCutout);
+#endif
 /* Updates the data of a scratch vertex buffer */
 void Gfx_SetScratchVbData(GfxResourceID vb, void* vertices, int vCount);
 

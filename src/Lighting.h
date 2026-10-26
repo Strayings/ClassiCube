@@ -26,6 +26,13 @@ extern cc_bool Lighting_ModeSetByServer;
 extern cc_uint8 Lighting_ModeUserCached;
 void Lighting_SetMode(cc_uint8 mode, cc_bool fromServer);
 
+/* Whether shadows from the sun are calculated by the graphics backend instead (e.g. ray traced shadows) */
+/*  When true, classic lighting is always used (regardless of lighting mode), and */
+/*  treats all blocks as being in sunlight when building chunks */
+extern cc_bool Lighting_GfxSunShadows;
+/* Sets Lighting_GfxSunShadows, then rebuilds chunks if necessary */
+void Lighting_SetGfxSunShadows(cc_bool enabled);
+
 
 /* How much ambient occlusion to apply in fancy lighting where 1.0f = none and 0.0f = maximum*/
 #define FANCY_AO 0.5F

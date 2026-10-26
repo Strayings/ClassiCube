@@ -112,7 +112,6 @@ static void Menu_SwitchPause(void* a, void* b)     { Gui_ShowPauseMenu(); }
 *--------------------------------------------------MenuOptionsScreen------------------------------------------------------*
 *#########################################################################################################################*/
 struct MenuOptionsScreen;
-typedef void (*InitMenuOptions)(struct MenuOptionsScreen* s);
 #define MENUOPTS_MAX_OPTS 11
 static void MenuOptionsScreen_Layout(void* screen);
 
@@ -529,6 +528,37 @@ void MenuOptionsScreen_Show(InitMenuOptions init) {
 	s->DoRecreateExtra = NULL;
 	s->OnHacksChanged  = NULL;
 	Gui_Add((struct Screen*)s, GUI_PRIORITY_MENU);
+}
+
+static InitMenuOptions submenu_init, submenu_parent;
+static InitMenuOptions menuOpts_submenus[MENUOPTS_MAX_OPTS];
+
+static void MenuOptionsScreen_SubmenuBack(void* screen, void* widget) {
+	MenuOptionsScreen_Show(submenu_parent);
+}
+
+static void MenuOptionsScreen_SubmenuInit(struct MenuOptionsScreen* s) {
+	/* Otherwise the parent screen's callback would get used for this screen too */
+	s->OnLightingModeServerChanged = NULL;
+
+	MenuOptionsScreen_BeginButtons(s);
+	submenu_init(s);
+	MenuOptionsScreen_EndButtons(s, -1, MenuOptionsScreen_SubmenuBack);
+}
+
+static void MenuOptionsScreen_SubmenuClick(void* screen, void* widget) {
+	struct MenuOptionsScreen* s = (struct MenuOptionsScreen*)screen;
+	int i = (int)((struct ButtonWidget*)widget - s->buttons);
+
+	submenu_parent = s->DoInit;
+	submenu_init   = menuOpts_submenus[i];
+	MenuOptionsScreen_Show(MenuOptionsScreen_SubmenuInit);
+}
+
+void MenuOptionsScreen_AddSubmenu(struct MenuOptionsScreen* s, const char* name,
+									InitMenuOptions init, const char* desc) {
+	int i = MenuOptionsScreen_AddButton(s, name, MenuOptionsScreen_SubmenuClick, NULL, NULL, desc);
+	menuOpts_submenus[i] = init;
 }
 
 

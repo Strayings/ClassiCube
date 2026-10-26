@@ -37,6 +37,19 @@ static void (*Builder_RenderBlock)(int countsIndex, int x, int y, int z);
 static void (*Builder_PrePrepareChunk)(void);
 static void (*Builder_PostPrepareChunk)(void);
 
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+/* The vertices of each face are ordered by how they cast shadows, so that the */
+/*  graphics backend knows which vertices should cast shadows (ray traced shadows) */
+#define BUILDER_SHADOW_CASTERS
+#endif
+
+#ifdef BUILDER_SHADOW_CASTERS
+/* Fully bright faces are marked with an alpha of 254, so that ray traced shadows don't darken them */
+#define BUILDER_FULLBRIGHT_COL PackedCol_Make(255, 255, 255, 254)
+#else
+#define BUILDER_FULLBRIGHT_COL PACKEDCOL_WHITE
+#endif
+
 /* Contains state for vertices for a portion of a chunk mesh (vertices that are in a 1D atlas) */
 struct Builder1DPart {
 	/* Union to save on memory, since chunk building is divided into counting then building phases */
@@ -45,7 +58,29 @@ struct Builder1DPart {
 		int count[FACE_COUNT];
 	} faces;
 	int sCount, sOffset;
+#ifdef BUILDER_SHADOW_CASTERS
+	/* Total number of vertices, and number of vertices of each type of shadow caster */
+	int fCount[FACE_COUNT], typeCount[3][FACE_COUNT];
+	/* Offset of the first face vertex (sOffset can't be used, since it's moved forward when drawing sprites) */
+	int fOffset;
+	/* Where vertices for faces of each type of shadow caster are written to */
+	/*  (opaque casters are written directly to faces.vertices instead) */
+	struct VertexTextured* typeVertices[3][FACE_COUNT];
+#endif
 };
+
+#ifdef BUILDER_SHADOW_CASTERS
+/* Vertices of each face are ordered as [opaque casters][cutout casters][non casters] */
+#define CASTER_OPAQUE 0
+#define CASTER_CUTOUT 1 /* Casts shadows with gaps where the texture is transparent (e.g. leaves) */
+#define CASTER_NONE   2
+
+static int Builder_CasterType(BlockID block) {
+	cc_uint8 draw = Blocks.Draw[block];
+	if (draw == DRAW_TRANSPARENT || draw == DRAW_TRANSPARENT_THICK) return CASTER_CUTOUT;
+	return Blocks.BlocksLight[block] ? CASTER_OPAQUE : CASTER_NONE;
+}
+#endif
 
 /* Part builder data, for both normal and translucent parts.
 The first ATLAS1D_MAX_ATLASES parts are for normal parts, remainder are for translucent parts. */
@@ -69,13 +104,84 @@ static int Builder1DPart_CalcOffsets(struct Builder1DPart* part, int offset) {
 	}
 
 	offset += part->sCount;
-	for (i = 0; i < FACE_COUNT; i++) 
+#ifdef BUILDER_SHADOW_CASTERS
+	part->fOffset = offset;
+#endif
+	for (i = 0; i < FACE_COUNT; i++)
 	{
 		part->faces.vertices[i] = &Builder_Vertices[offset];
+#ifdef BUILDER_SHADOW_CASTERS
+		part->fCount[i] = counts[i];
+		part->typeVertices[CASTER_CUTOUT][i] = part->faces.vertices[i]               + part->typeCount[CASTER_OPAQUE][i];
+		part->typeVertices[CASTER_NONE][i]   = part->typeVertices[CASTER_CUTOUT][i] + part->typeCount[CASTER_CUTOUT][i];
+#endif
 		offset += counts[i];
 	}
 	return offset;
 }
+
+#ifdef BUILDER_SHADOW_CASTERS
+/* Swaps the vertex write positions between faces of opaque casters and the given type of caster */
+static void Builder_SwapCasterType(int type) {
+	struct Builder1DPart* part;
+	struct VertexTextured* tmp;
+	int i, j, face;
+
+	for (i = 0; i < MapRenderer_1DUsedCount; i++)
+	{
+		for (j = 0; j < 2; j++)
+		{
+			part = &Builder_Parts[i + j * ATLAS1D_MAX_ATLASES];
+			for (face = 0; face < FACE_COUNT; face++)
+			{
+				tmp = part->faces.vertices[face];
+				part->faces.vertices[face]       = part->typeVertices[type][face];
+				part->typeVertices[type][face] = tmp;
+			}
+		}
+	}
+}
+
+static int Builder_CasterRanges[2 * ATLAS1D_MAX_ATLASES * 2 * FACE_COUNT * 2];
+/* Tells the graphics backend which ranges of vertices in the chunk's VB cast shadows */
+/*  (ranges of opaque casters first, then ranges of cutout casters) */
+static void OutputShadowCasters(GfxResourceID vb) {
+	struct Builder1DPart* part;
+	int* ranges = Builder_CasterRanges;
+	int i, j, face, type, start, first, casters, typeStart, count = 0, numOpaque = 0;
+
+	for (type = CASTER_OPAQUE; type <= CASTER_CUTOUT; type++)
+	{
+		typeStart = count;
+		for (i = 0; i < MapRenderer_1DUsedCount; i++)
+		{
+			for (j = 0; j < 2; j++)
+			{
+				part  = &Builder_Parts[i + j * ATLAS1D_MAX_ATLASES];
+				start = part->fOffset;
+
+				for (face = 0; face < FACE_COUNT; face++)
+				{
+					first   = start + (type == CASTER_CUTOUT ? part->typeCount[CASTER_OPAQUE][face] : 0);
+					casters = part->typeCount[type][face];
+					start  += part->fCount[face];
+					if (!casters) continue;
+
+					/* Merge into previous range when this range comes directly after it */
+					if (count > typeStart && ranges[count - 2] + ranges[count - 1] == first) {
+						ranges[count - 1] += casters;
+					} else {
+						ranges[count++] = first;
+						ranges[count++] = casters;
+					}
+				}
+			}
+		}
+		if (type == CASTER_OPAQUE) numOpaque = count / 2;
+	}
+	Gfx_SetShadowCasters(vb, ranges, numOpaque, count / 2 - numOpaque);
+}
+#endif
 
 static int Builder_TotalVerticesCount(void) {
 	int i, count = 0;
@@ -100,6 +206,9 @@ static void AddVertices(BlockID block, Face face) {
 	int i = Atlas1D_Index(Block_Tex(block, face));
 	struct Builder1DPart* part = &Builder_Parts[baseOffset + i];
 	part->faces.count[face] += 4;
+#ifdef BUILDER_SHADOW_CASTERS
+	part->typeCount[Builder_CasterType(block)][face] += 4;
+#endif
 }
 
 #if CC_GFX_BACKEND == CC_GFX_BACKEND_GL11
@@ -380,6 +489,9 @@ cc_bool Builder_MakeChunk(struct ChunkInfo* info) {
 	int xMax, yMax, zMax, totalVerts;
 	int cIndex, index;
 	int x, y, z, xx, yy, zz;
+#ifdef BUILDER_SHADOW_CASTERS
+	int casterType;
+#endif
 	int x1 = info->centreX - HALF_CHUNK_SIZE;
 	int y1 = info->centreY - HALF_CHUNK_SIZE;
 	int z1 = info->centreZ - HALF_CHUNK_SIZE;
@@ -447,6 +559,15 @@ cc_bool Builder_MakeChunk(struct ChunkInfo* info) {
 
 				index = Builder_PackCount(xx, yy, zz);
 				Builder_ChunkIndex = cIndex;
+#ifdef BUILDER_SHADOW_CASTERS
+				casterType = Builder_CasterType(Builder_Block);
+				if (casterType != CASTER_OPAQUE) {
+					Builder_SwapCasterType(casterType);
+					Builder_RenderBlock(index, x, y, z);
+					Builder_SwapCasterType(casterType);
+					continue;
+				}
+#endif
 				Builder_RenderBlock(index, x, y, z);
 			}
 		}
@@ -463,6 +584,9 @@ cc_bool Builder_MakeChunk(struct ChunkInfo* info) {
 	}
 #else
 	Gfx_UnlockVb(info->vb);
+#endif
+#ifdef BUILDER_SHADOW_CASTERS
+	OutputShadowCasters(info->vb);
 #endif
 	return true;
 }
@@ -530,7 +654,7 @@ static void Builder_DrawSprite(int x, int y, int z) {
 	
 	bright = Blocks.Brightness[Builder_Block];
 	part   = &Builder_Parts[Atlas1D_Index(loc)];
-	color  = bright ? PACKEDCOL_WHITE : Lighting.Color_Sprite_Fast(x, y, z);
+	color  = bright ? BUILDER_FULLBRIGHT_COL : Lighting.Color_Sprite_Fast(x, y, z);
 	Block_Tint(color, Builder_Block);
 
 	/* Draw Z axis */
@@ -703,7 +827,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 		offset = (lightFlags >> FACE_XMIN) & 1;
 		part   = &Builder_Parts[baseOffset + Atlas1D_Index(loc)];
 
-		col = fullBright ? PACKEDCOL_WHITE :
+		col = fullBright ? BUILDER_FULLBRIGHT_COL :
 			x >= offset ? Lighting.Color_XSide_Fast(x - offset, y, z) : Env.SunXSide;
 		Drawer_XMin(count_XMin, col, loc, &part->faces.vertices[FACE_XMIN]);
 	}
@@ -713,7 +837,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 		offset = (lightFlags >> FACE_XMAX) & 1;
 		part   = &Builder_Parts[baseOffset + Atlas1D_Index(loc)];
 
-		col = fullBright ? PACKEDCOL_WHITE :
+		col = fullBright ? BUILDER_FULLBRIGHT_COL :
 			x <= (World.MaxX - offset) ? Lighting.Color_XSide_Fast(x + offset, y, z) : Env.SunXSide;
 		Drawer_XMax(count_XMax, col, loc, &part->faces.vertices[FACE_XMAX]);
 	}
@@ -723,7 +847,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 		offset = (lightFlags >> FACE_ZMIN) & 1;
 		part   = &Builder_Parts[baseOffset + Atlas1D_Index(loc)];
 
-		col = fullBright ? PACKEDCOL_WHITE :
+		col = fullBright ? BUILDER_FULLBRIGHT_COL :
 			z >= offset ? Lighting.Color_ZSide_Fast(x, y, z - offset) : Env.SunZSide;
 		Drawer_ZMin(count_ZMin, col, loc, &part->faces.vertices[FACE_ZMIN]);
 	}
@@ -733,7 +857,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 		offset = (lightFlags >> FACE_ZMAX) & 1;
 		part   = &Builder_Parts[baseOffset + Atlas1D_Index(loc)];
 
-		col = fullBright ? PACKEDCOL_WHITE :
+		col = fullBright ? BUILDER_FULLBRIGHT_COL :
 			z <= (World.MaxZ - offset) ? Lighting.Color_ZSide_Fast(x, y, z + offset) : Env.SunZSide;
 		Drawer_ZMax(count_ZMax, col, loc, &part->faces.vertices[FACE_ZMAX]);
 	}
@@ -743,7 +867,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 		offset = (lightFlags >> FACE_YMIN) & 1;
 		part   = &Builder_Parts[baseOffset + Atlas1D_Index(loc)];
 
-		col = fullBright ? PACKEDCOL_WHITE : Lighting.Color_YMin_Fast(x, y - offset, z);
+		col = fullBright ? BUILDER_FULLBRIGHT_COL : Lighting.Color_YMin_Fast(x, y - offset, z);
 		Drawer_YMin(count_YMin, col, loc, &part->faces.vertices[FACE_YMIN]);
 	}
 
@@ -752,7 +876,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 		offset = (lightFlags >> FACE_YMAX) & 1;
 		part   = &Builder_Parts[baseOffset + Atlas1D_Index(loc)];
 
-		col = fullBright ? PACKEDCOL_WHITE : Lighting.Color_YMax_Fast(x, y + offset, z);
+		col = fullBright ? BUILDER_FULLBRIGHT_COL : Lighting.Color_YMax_Fast(x, y + offset, z);
 		Drawer_YMax(count_YMax, col, loc, &part->faces.vertices[FACE_YMAX]);
 	}
 }
@@ -982,7 +1106,7 @@ static void Adv_DrawXMin(int count) {
 	int aY1_Z0 = Adv_CountBits(F, xM1_yP1_zM1, xM1_yCC_zM1, xM1_yP1_zCC, xM1_yCC_zCC);
 	int aY1_Z1 = Adv_CountBits(F, xM1_yP1_zP1, xM1_yCC_zP1, xM1_yP1_zCC, xM1_yCC_zCC);
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	PackedCol col0_0 = Builder_FullBright ? white : adv_lerpX[aY0_Z0], col1_0 = Builder_FullBright ? white : adv_lerpX[aY1_Z0];
 	PackedCol col1_1 = Builder_FullBright ? white : adv_lerpX[aY1_Z1], col0_1 = Builder_FullBright ? white : adv_lerpX[aY0_Z1];
 	struct VertexTextured* vertices, v;
@@ -1024,7 +1148,7 @@ static void Adv_DrawXMax(int count) {
 	int aY1_Z0 = Adv_CountBits(F, xP1_yP1_zM1, xP1_yCC_zM1, xP1_yP1_zCC, xP1_yCC_zCC);
 	int aY1_Z1 = Adv_CountBits(F, xP1_yP1_zP1, xP1_yCC_zP1, xP1_yP1_zCC, xP1_yCC_zCC);
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	PackedCol col0_0 = Builder_FullBright ? white : adv_lerpX[aY0_Z0], col1_0 = Builder_FullBright ? white : adv_lerpX[aY1_Z0];
 	PackedCol col1_1 = Builder_FullBright ? white : adv_lerpX[aY1_Z1], col0_1 = Builder_FullBright ? white : adv_lerpX[aY0_Z1];
 	struct VertexTextured* vertices, v;
@@ -1066,7 +1190,7 @@ static void Adv_DrawZMin(int count) {
 	int aX1_Y0 = Adv_CountBits(F, xP1_yM1_zM1, xP1_yCC_zM1, xCC_yM1_zM1, xCC_yCC_zM1);
 	int aX1_Y1 = Adv_CountBits(F, xP1_yP1_zM1, xP1_yCC_zM1, xCC_yP1_zM1, xCC_yCC_zM1);
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	PackedCol col0_0 = Builder_FullBright ? white : adv_lerpZ[aX0_Y0], col1_0 = Builder_FullBright ? white : adv_lerpZ[aX1_Y0];
 	PackedCol col1_1 = Builder_FullBright ? white : adv_lerpZ[aX1_Y1], col0_1 = Builder_FullBright ? white : adv_lerpZ[aX0_Y1];
 	struct VertexTextured* vertices, v;
@@ -1108,7 +1232,7 @@ static void Adv_DrawZMax(int count) {
 	int aX0_Y1 = Adv_CountBits(F, xM1_yP1_zP1, xM1_yCC_zP1, xCC_yP1_zP1, xCC_yCC_zP1);
 	int aX1_Y1 = Adv_CountBits(F, xP1_yP1_zP1, xP1_yCC_zP1, xCC_yP1_zP1, xCC_yCC_zP1);
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	PackedCol col1_1 = Builder_FullBright ? white : adv_lerpZ[aX1_Y1], col1_0 = Builder_FullBright ? white : adv_lerpZ[aX1_Y0];
 	PackedCol col0_0 = Builder_FullBright ? white : adv_lerpZ[aX0_Y0], col0_1 = Builder_FullBright ? white : adv_lerpZ[aX0_Y1];
 	struct VertexTextured* vertices, v;
@@ -1150,7 +1274,7 @@ static void Adv_DrawYMin(int count) {
 	int aX0_Z1 = Adv_CountBits(F, xM1_yM1_zP1, xM1_yM1_zCC, xCC_yM1_zP1, xCC_yM1_zCC);
 	int aX1_Z1 = Adv_CountBits(F, xP1_yM1_zP1, xP1_yM1_zCC, xCC_yM1_zP1, xCC_yM1_zCC);
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	PackedCol col0_1 = Builder_FullBright ? white : adv_lerpY[aX0_Z1], col1_1 = Builder_FullBright ? white : adv_lerpY[aX1_Z1];
 	PackedCol col1_0 = Builder_FullBright ? white : adv_lerpY[aX1_Z0], col0_0 = Builder_FullBright ? white : adv_lerpY[aX0_Z0];
 	struct VertexTextured* vertices, v;
@@ -1192,7 +1316,7 @@ static void Adv_DrawYMax(int count) {
 	int aX0_Z1 = Adv_CountBits(F, xM1_yP1_zP1, xM1_yP1_zCC, xCC_yP1_zP1, xCC_yP1_zCC);
 	int aX1_Z1 = Adv_CountBits(F, xP1_yP1_zP1, xP1_yP1_zCC, xCC_yP1_zP1, xCC_yP1_zCC);
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	PackedCol col0_0 = Builder_FullBright ? white : adv_lerp[aX0_Z0], col1_0 = Builder_FullBright ? white : adv_lerp[aX1_Z0];
 	PackedCol col1_1 = Builder_FullBright ? white : adv_lerp[aX1_Z1], col0_1 = Builder_FullBright ? white : adv_lerp[aX0_Z1];
 	struct VertexTextured* vertices, v;
@@ -1346,7 +1470,7 @@ static void Modern_DrawXMin(int count, int x, int y, int z) {
 	float v2 = vOrigin + adv_minBB.y * Atlas1D.InvTileSize * UV2_Scale;
 	struct Builder1DPart* part = &Builder_Parts[adv_baseOffset + Atlas1D_Index(texLoc)];
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	int offset = 1;// (Blocks.LightOffset[Builder_Block] >> FACE_XMIN) & 1;
 	PackedCol orig = Lighting.Color_XSide_Fast(x-offset, y, z);
 	PackedCol col0_0 = Builder_FullBright ? white : Modern_GetColorX(orig, x-offset, y, z, -1, -1);
@@ -1379,7 +1503,7 @@ static void Modern_DrawXMax(int count, int x, int y, int z) {
 	float v2 = vOrigin + adv_minBB.y * Atlas1D.InvTileSize * UV2_Scale;
 	struct Builder1DPart* part = &Builder_Parts[adv_baseOffset + Atlas1D_Index(texLoc)];
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	int offset = 1;// (Blocks.LightOffset[Builder_Block] >> FACE_XMAX) & 1;
 	PackedCol orig = Lighting.Color_XSide_Fast(x+offset, y, z);
 	PackedCol col0_0 = Builder_FullBright ? white : Modern_GetColorX(orig, x+offset, y, z, -1, -1);
@@ -1425,7 +1549,7 @@ static void Modern_DrawZMin(int count, int x, int y, int z) {
 	float v2 = vOrigin + adv_minBB.y * Atlas1D.InvTileSize * UV2_Scale;
 	struct Builder1DPart* part = &Builder_Parts[adv_baseOffset + Atlas1D_Index(texLoc)];
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	int offset = 1;// (Blocks.LightOffset[Builder_Block] >> FACE_ZMIN) & 1;
 	PackedCol orig = Lighting.Color_ZSide_Fast(x, y, z-offset);
 	PackedCol col0_0 = Builder_FullBright ? white : Modern_GetColorZ(orig, x, y, z-offset, -1, -1);
@@ -1458,7 +1582,7 @@ static void Modern_DrawZMax(int count, int x, int y, int z) {
 	float v2 = vOrigin + adv_minBB.y * Atlas1D.InvTileSize * UV2_Scale;
 	struct Builder1DPart* part = &Builder_Parts[adv_baseOffset + Atlas1D_Index(texLoc)];
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	int offset = 1;// (Blocks.LightOffset[Builder_Block] >> FACE_ZMAX) & 1;
 	PackedCol orig = Lighting.Color_ZSide_Fast(x, y, z+offset);
 	PackedCol col0_0 = Builder_FullBright ? white : Modern_GetColorZ(orig, x, y, z+offset, -1, -1);
@@ -1504,7 +1628,7 @@ static void Modern_DrawYMin(int count, int x, int y, int z) {
 	float v2 = vOrigin + adv_maxBB.z * Atlas1D.InvTileSize * UV2_Scale;
 	struct Builder1DPart* part = &Builder_Parts[adv_baseOffset + Atlas1D_Index(texLoc)];
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	int offset = 1;// (Blocks.LightOffset[Builder_Block] >> FACE_YMIN) & 1;
 	PackedCol orig = Lighting.Color_YMin_Fast(x, y-offset, z);
 	PackedCol col0_0 = Builder_FullBright ? white : Modern_GetColorYMin(orig, x, y-offset, z, -1, -1);
@@ -1550,7 +1674,7 @@ static void Modern_DrawYMax(int count, int x, int y, int z) {
 	float v2 = vOrigin + adv_maxBB.z * Atlas1D.InvTileSize * UV2_Scale;
 	struct Builder1DPart* part = &Builder_Parts[adv_baseOffset + Atlas1D_Index(texLoc)];
 
-	PackedCol tint, white = PACKEDCOL_WHITE;
+	PackedCol tint, white = BUILDER_FULLBRIGHT_COL;
 	int offset = 1;// (Blocks.LightOffset[Builder_Block] >> FACE_YMAX) & 1;
 	PackedCol orig = Lighting.Color(x, y+offset, z);
 	PackedCol col0_0 = Builder_FullBright ? white : Modern_GetColorYMax(orig, x, y+offset, z, -1, -1);
@@ -1635,7 +1759,10 @@ static void ModernBuilder_SetActive(void) { NormalBuilder_SetActive(); }
 *#########################################################################################################################*/
 cc_bool Builder_SmoothLighting;
 void Builder_ApplyActive(void) {
-	if (Builder_SmoothLighting) {
+	/* Sun shadows from the graphics backend replace all lighting settings */
+	if (Lighting_GfxSunShadows) {
+		NormalBuilder_SetActive();
+	} else if (Builder_SmoothLighting) {
 		if (Lighting_Mode != LIGHTING_MODE_CLASSIC) {
 			ModernBuilder_SetActive();
 		}

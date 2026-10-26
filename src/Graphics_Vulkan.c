@@ -2405,13 +2405,13 @@ void Gfx_ClearBuffers(GfxBuffers buffers) {
 #define RT_GeometryCount(vertices) (((vertices) + RT_MAX_GEOMETRY_VERTICES - 1) / RT_MAX_GEOMETRY_VERTICES)
 
 static const char* const rtSunAngle_Names[]   = { "Low", "Medium", "High", "Overhead" };
-static const char* const rtSunDir_Names[]     = { "North", "East", "South", "West" };
+static const char* const rtSunDir_Names[]     = { "North", "Northeast", "East", "Southeast", "South", "Southwest", "West", "Northwest" };
 static const char* const rtShadowDist_Names[] = { "64", "128", "256", "Max" };
 static const float rtSunAngle_Degrees[]  = { 20.0f, 40.0f, 60.0f, 90.0f };
 static const float rtShadowDist_Blocks[] = { 64.0f, 128.0f, 256.0f, 4096.0f };
-/* Horizontal direction towards the sun (north is -Z) */
-static const float rtSunDir_X[] = {  0.0f, 1.0f, 0.0f, -1.0f };
-static const float rtSunDir_Z[] = { -1.0f, 0.0f, 1.0f,  0.0f };
+/* Horizontal direction towards the sun (north is -Z, diagonals are normalised) */
+static const float rtSunDir_X[] = {  0.0f,  0.70710678f, 1.0f, 0.70710678f, 0.0f, -0.70710678f, -1.0f, -0.70710678f };
+static const float rtSunDir_Z[] = { -1.0f, -0.70710678f, 0.0f, 0.70710678f, 1.0f,  0.70710678f,  0.0f, -0.70710678f };
 
 static void RT_Init(void) {
 	VkFlags address = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -2422,7 +2422,7 @@ static void RT_Init(void) {
 
 	rtEnabled    = Options_GetBool(RT_OPT_ENABLED, false);
 	rtSunAngle   = Options_GetEnum(RT_OPT_SUN_ANGLE,   1, rtSunAngle_Names,   Array_Elems(rtSunAngle_Names));
-	rtSunDir     = Options_GetEnum(RT_OPT_SUN_DIR,     1, rtSunDir_Names,     Array_Elems(rtSunDir_Names));
+	rtSunDir     = Options_GetEnum(RT_OPT_SUN_DIR,     2, rtSunDir_Names,     Array_Elems(rtSunDir_Names));
 	rtShadowDist = Options_GetEnum(RT_OPT_SHADOW_DIST, 2, rtShadowDist_Names, Array_Elems(rtShadowDist_Names));
 }
 

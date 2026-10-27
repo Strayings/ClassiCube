@@ -139,7 +139,7 @@ struct RTParams {
 	float vX, vY, vZ, _pad2;
 	struct Matrix prevMVP;   /* Transform chunks were drawn with in the previous frame */
 	float screenW, screenH; int frame, hasPrev;
-	float maxHistory, _pad3[3];
+	float maxHistory, aoStrength, aoRange, _pad3;
 };
 
 static VkInstance instance;
@@ -216,7 +216,7 @@ static cc_bool rtSupported, rtEnabled, rtActive, dirtyRtSet;
 /* Whether chunks were drawn with ray traced shadows in the current/previous frame, and with what transform */
 static cc_bool rtDrawn, rtPrevDrawn;
 static struct Matrix rtFrameMVP, rtPrevMVP;
-static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness;
+static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO;
 static VkDeviceSize rtScratchAlign;
 static struct MemPool asPool, scratchPool;
 static VkDescriptorSetLayout rtSetLayout;
@@ -2561,6 +2561,9 @@ void Gfx_ClearBuffers(GfxBuffers buffers) {
 #define RT_OPT_SUN_DIR     "gfx-rt-sundir"
 #define RT_OPT_SHADOW_DIST "gfx-rt-shadowdist"
 #define RT_OPT_SOFTNESS    "gfx-rt-softness"
+#define RT_OPT_AO          "gfx-rt-ao"
+/* How far away blocks can be and still block sky light */
+#define RT_AO_RANGE 16.0f
 /* Each geometry can only use up to 16384 quads, since that's all the default index buffer has */
 #define RT_MAX_GEOMETRY_VERTICES 65536
 /* Extra space in the top level acceleration structure for chunks built during the frame */
@@ -2571,13 +2574,17 @@ static const char* const rtSunAngle_Names[]   = { "Low", "Medium", "High", "Over
 static const char* const rtSunDir_Names[]     = { "North", "Northeast", "East", "Southeast", "South", "Southwest", "West", "Northwest" };
 static const char* const rtShadowDist_Names[] = { "64", "128", "256", "Max" };
 static const char* const rtSoftness_Names[]   = { "Off", "Low", "Medium", "High" };
+static const char* const rtAO_Names[]         = { "Off", "Low", "Medium", "High" };
 static const float rtSunAngle_Degrees[]  = { 20.0f, 40.0f, 60.0f, 90.0f };
 static const float rtShadowDist_Blocks[] = { 64.0f, 128.0f, 256.0f, 4096.0f };
-/* Angular radius of the sun's disc (the real sun is about 0.27 degrees), how many points on the disc */
-/*  each pixel cycles through over multiple frames (one ray per frame), and how many frames are blended */
+/* Angular radius of the sun's disc (the real sun is about 0.27 degrees), and how many points on the disc */
+/*  each pixel cycles through over multiple frames (one ray per frame) */
 static const float rtSoftness_Degrees[] = { 0.0f, 2.0f, 4.0f, 8.0f };
 static const int   rtSoftness_Samples[] = { 1, 32, 64, 64 };
-static const float rtSoftness_History[] = { 1.0f, 24.0f, 32.0f, 48.0f };
+/* How many frames of shadows and sky light are blended together */
+#define RT_MAX_HISTORY 32.0f
+/* How much ambient light is reduced in places that can't see the sky (never all of it, so caves aren't pitch black) */
+static const float rtAO_Strength[] = { 0.0f, 0.4f, 0.6f, 0.8f };
 /* Horizontal direction towards the sun (north is -Z, diagonals are normalised) */
 static const float rtSunDir_X[] = {  0.0f,  0.70710678f, 1.0f, 0.70710678f, 0.0f, -0.70710678f, -1.0f, -0.70710678f };
 static const float rtSunDir_Z[] = { -1.0f, -0.70710678f, 0.0f, 0.70710678f, 1.0f,  0.70710678f,  0.0f, -0.70710678f };
@@ -2594,6 +2601,7 @@ static void RT_Init(void) {
 	rtSunDir     = Options_GetEnum(RT_OPT_SUN_DIR,     2, rtSunDir_Names,     Array_Elems(rtSunDir_Names));
 	rtShadowDist = Options_GetEnum(RT_OPT_SHADOW_DIST, 2, rtShadowDist_Names, Array_Elems(rtShadowDist_Names));
 	rtSoftness   = Options_GetEnum(RT_OPT_SOFTNESS,    2, rtSoftness_Names,   Array_Elems(rtSoftness_Names));
+	rtAO         = Options_GetEnum(RT_OPT_AO,          2, rtAO_Names,         Array_Elems(rtAO_Names));
 }
 
 static void RT_ListAdd(struct ChunkRT*** list, int* count, int* max, struct ChunkRT* rt) {
@@ -3052,7 +3060,9 @@ static void RT_UpdateConstants(void) {
 	p->screenW    = (float)swapExtent.width;
 	p->screenH    = (float)swapExtent.height;
 	p->frame      = (int)(frameCounter & 0xFFFFFF);
-	p->maxHistory = rtSoftness_History[rtSoftness];
+	p->maxHistory = RT_MAX_HISTORY;
+	p->aoStrength = rtAO_Strength[rtAO];
+	p->aoRange    = RT_AO_RANGE;
 }
 
 /* The shadow history written this frame is only usable next frame if chunks were drawn this frame */
@@ -3112,6 +3122,12 @@ static void RT_SetSoftness(int v) {
 	RT_SaveEnum(RT_OPT_SOFTNESS, rtSoftness_Names[v]);
 }
 
+static int  RT_GetAO(void) { return rtAO; }
+static void RT_SetAO(int v) {
+	rtAO = v;
+	RT_SaveEnum(RT_OPT_AO, rtAO_Names[v]);
+}
+
 static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
 	MenuOptionsScreen_AddBool(s, "RT shadows",
 		RT_GetEnabled,    RT_SetEnabled,
@@ -3132,6 +3148,10 @@ static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
 		RT_GetSoftness,   RT_SetSoftness,
 		"&eHow blurry the edges of shadows are.\n" \
 		"&eSofter shadows use more rays, so render slower.");
+	MenuOptionsScreen_AddEnum(s, "Ambient occlusion", rtAO_Names, Array_Elems(rtAO_Names),
+		RT_GetAO,         RT_SetAO,
+		"&eDarkens corners, caves and areas under trees,\n" \
+		"&ebased on how much of the sky they can see.");
 }
 
 

@@ -141,6 +141,7 @@ struct RTParams {
 	float screenW, screenH; int frame, hasPrev;
 	float maxHistory, aoStrength, aoRange, _pad3;
 	float sunR, sunG, sunB, giStrength;
+	float godStrength, godDensity, godG, godRange; /* God rays (sunlight scattered by the air) */
 };
 
 static VkInstance instance;
@@ -223,7 +224,7 @@ static cc_bool rtDrawn, rtPrevDrawn;
 /* Set when an option changes, since the previous frames' shadows/lighting no longer apply */
 static cc_bool rtResetHistory;
 static struct Matrix rtFrameMVP, rtPrevMVP;
-static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI;
+static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI, rtGodRays;
 static VkDeviceSize rtScratchAlign;
 static struct MemPool asPool, scratchPool;
 static VkDescriptorSetLayout rtSetLayout;
@@ -2609,6 +2610,12 @@ void Gfx_ClearBuffers(GfxBuffers buffers) {
 #define RT_OPT_SOFTNESS    "gfx-rt-softness"
 #define RT_OPT_AO          "gfx-rt-ao"
 #define RT_OPT_GI          "gfx-rt-gi"
+#define RT_OPT_GOD_RAYS    "gfx-rt-godrays"
+/* How much sunlight the air scatters per block, how much it scatters forwards (Henyey-Greenstein g), */
+/*  and how far along the view ray it's calculated for */
+#define RT_GOD_DENSITY 0.02f
+#define RT_GOD_G       0.4f
+#define RT_GOD_RANGE   96.0f
 /* How far away blocks can be and still block sky light */
 #define RT_AO_RANGE 16.0f
 /* Each geometry can only use up to 16384 quads, since that's all the default index buffer has */
@@ -2623,6 +2630,8 @@ static const char* const rtShadowDist_Names[] = { "64", "128", "256", "Max" };
 static const char* const rtSoftness_Names[]   = { "Off", "Low", "Medium", "High" };
 static const char* const rtAO_Names[]         = { "Off", "Low", "Medium", "High" };
 static const char* const rtGI_Names[]         = { "Off", "On" };
+static const char* const rtGodRays_Names[]    = { "Off", "Low", "Medium", "High" };
+static const float rtGodRays_Strength[]       = { 0.0f, 0.06f, 0.12f, 0.2f };
 static const float rtSunAngle_Degrees[]  = { 20.0f, 40.0f, 60.0f, 90.0f };
 static const float rtShadowDist_Blocks[] = { 64.0f, 128.0f, 256.0f, 4096.0f };
 /* Angular radius of the sun's disc (the real sun is about 0.27 degrees), and how many points on the disc */
@@ -2651,6 +2660,7 @@ static void RT_Init(void) {
 	rtSoftness   = Options_GetEnum(RT_OPT_SOFTNESS,    2, rtSoftness_Names,   Array_Elems(rtSoftness_Names));
 	rtAO         = Options_GetEnum(RT_OPT_AO,          2, rtAO_Names,         Array_Elems(rtAO_Names));
 	rtGI         = Options_GetEnum(RT_OPT_GI,          1, rtGI_Names,         Array_Elems(rtGI_Names));
+	rtGodRays    = Options_GetEnum(RT_OPT_GOD_RAYS,    2, rtGodRays_Names,    Array_Elems(rtGodRays_Names));
 }
 
 static void RT_ListAdd(struct ChunkRT*** list, int* count, int* max, struct ChunkRT* rt) {
@@ -3125,6 +3135,11 @@ static void RT_UpdateConstants(void) {
 	p->sunG = PackedCol_G(Env.SunCol) / 255.0f;
 	p->sunB = PackedCol_B(Env.SunCol) / 255.0f;
 	p->giStrength = rtGI ? 1.0f : 0.0f;
+
+	p->godStrength = rtGodRays_Strength[rtGodRays];
+	p->godDensity  = RT_GOD_DENSITY;
+	p->godG        = RT_GOD_G;
+	p->godRange    = RT_GOD_RANGE;
 }
 
 /* The shadow history written this frame is only usable next frame if chunks were drawn this frame */
@@ -3195,6 +3210,13 @@ static void RT_SetAO(int v) {
 	RT_SaveEnum(RT_OPT_AO, rtAO_Names[v]);
 }
 
+static int  RT_GetGodRays(void) { return rtGodRays; }
+static void RT_SetGodRays(int v) {
+	rtResetHistory = true;
+	rtGodRays = v;
+	RT_SaveEnum(RT_OPT_GOD_RAYS, rtGodRays_Names[v]);
+}
+
 static int  RT_GetGI(void) { return rtGI; }
 static void RT_SetGI(int v) {
 	rtResetHistory = true;
@@ -3230,6 +3252,10 @@ static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
 		RT_GetGI,         RT_SetGI,
 		"&eLight bounces off blocks onto nearby blocks,\n" \
 		"&ee.g. sunlit grass lights up walls next to it.");
+	MenuOptionsScreen_AddEnum(s, "God rays", rtGodRays_Names, Array_Elems(rtGodRays_Names),
+		RT_GetGodRays,    RT_SetGodRays,
+		"&eShafts of sunlight in the air, e.g. through trees,\n" \
+		"&ebrightest when looking towards the sun.");
 }
 
 

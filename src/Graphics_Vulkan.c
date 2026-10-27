@@ -11,6 +11,8 @@
 #include "Block.h"
 #include "EnvRenderer.h"
 #include "Game.h"
+#include "TexturePack.h"
+#include "Bitmap.h"
 
 /* Vulkan 1.1 backend (Windows only for now) */
 
@@ -100,6 +102,9 @@ struct ChunkRT {
 	/* Ranges of cutout vertices (e.g. leaves) come first, then ranges of opaque vertices */
 	int* ranges;
 	int numRanges, numCutout, numGeoms, listIndex;
+	/* Light emitting blocks in the chunk (x, y, z, block) */
+	int* lights;
+	int numLights;
 	cc_bool built;
 };
 
@@ -147,6 +152,11 @@ struct RTParams {
 	float godStrength, godDensity, godG, godRange; /* God rays (sunlight scattered by the air) */
 	float scatterR, scatterG, scatterB, caustics;   /* Colour of scattered light, and caustics under water */
 	float skyDY; int skybox; float time, _pad4;      /* See EnvRenderer_RenderSky/RenderSkybox */
+	/* Light emitting blocks near the camera (2 vec4s each: position + intensity, colour), and a grid */
+	/*  of cells around the camera (offset + count, into the list of light indices after the cells) */
+	VkDeviceAddress lights, lightGrid;
+	float gridX, gridY, gridZ, invCellSize;
+	int gridDim, numLights; float lightStrength, _pad5;
 };
 
 static VkInstance instance;
@@ -229,7 +239,7 @@ static cc_bool rtDrawn, rtPrevDrawn;
 /* Set when an option changes, since the previous frames' shadows/lighting no longer apply */
 static cc_bool rtResetHistory;
 static struct Matrix rtFrameMVP, rtPrevMVP;
-static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI, rtGodRays;
+static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI, rtGodRays, rtBlockLights;
 static VkDeviceSize rtScratchAlign;
 static struct MemPool asPool, scratchPool;
 static VkDescriptorSetLayout rtSetLayout;
@@ -237,7 +247,7 @@ static VkDescriptorPool rtDescPool;
 /* Contains the struct RTParams for each frame */
 /*  (256 is the largest minUniformBufferOffsetAlignment allowed by the Vulkan spec) */
 static struct RingChunk rtParams;
-#define RT_PARAMS_STRIDE 256
+#define RT_PARAMS_STRIDE 512
 #define RT_FrameParams() ((struct RTParams*)(rtParams.data + frameIndex * RT_PARAMS_STRIDE))
 static VkShaderModule vsRtModules[2], fsRtModules[6], fsSkyModules[6];
 /* Whether the sky is currently being drawn (see Gfx_SetSkyRendering) */
@@ -2647,6 +2657,7 @@ void Gfx_ClearBuffers(GfxBuffers buffers) {
 #define RT_OPT_AO          "gfx-rt-ao"
 #define RT_OPT_GI          "gfx-rt-gi"
 #define RT_OPT_GOD_RAYS    "gfx-rt-godrays"
+#define RT_OPT_BLOCK_LIGHTS "gfx-rt-blocklights"
 /* How much sunlight the air scatters per block, how much it scatters forwards (Henyey-Greenstein g), */
 /*  and how far along the view ray it's calculated for */
 #define RT_GOD_DENSITY 0.02f
@@ -2668,6 +2679,8 @@ static const char* const rtAO_Names[]         = { "Off", "Low", "Medium", "High"
 static const char* const rtGI_Names[]         = { "Off", "On" };
 static const char* const rtGodRays_Names[]    = { "Off", "Low", "Medium", "High" };
 static const float rtGodRays_Strength[]       = { 0.0f, 0.06f, 0.12f, 0.2f };
+static const char* const rtBlockLights_Names[] = { "Off", "Low", "Medium", "High" };
+static const float rtBlockLights_Strength[]    = { 0.0f, 3.0f, 6.0f, 12.0f };
 static const float rtSunAngle_Degrees[]  = { 20.0f, 40.0f, 60.0f, 90.0f };
 static const float rtShadowDist_Blocks[] = { 64.0f, 128.0f, 256.0f, 4096.0f };
 /* Angular radius of the sun's disc (the real sun is about 0.27 degrees), and how many points on the disc */
@@ -2697,6 +2710,7 @@ static void RT_Init(void) {
 	rtAO         = Options_GetEnum(RT_OPT_AO,          2, rtAO_Names,         Array_Elems(rtAO_Names));
 	rtGI         = Options_GetEnum(RT_OPT_GI,          1, rtGI_Names,         Array_Elems(rtGI_Names));
 	rtGodRays    = Options_GetEnum(RT_OPT_GOD_RAYS,    2, rtGodRays_Names,    Array_Elems(rtGodRays_Names));
+	rtBlockLights = Options_GetEnum(RT_OPT_BLOCK_LIGHTS, 2, rtBlockLights_Names, Array_Elems(rtBlockLights_Names));
 }
 
 static void RT_ListAdd(struct ChunkRT*** list, int* count, int* max, struct ChunkRT* rt) {
@@ -2735,6 +2749,7 @@ static void RT_FreeChunk(struct ChunkRT* rt) {
 	rt->vb->rt = NULL;
 
 	Mem_Free(rt->ranges);
+	Mem_Free(rt->lights);
 	Mem_Free(rt);
 }
 
@@ -2750,7 +2765,8 @@ static void RT_FreeAll(void) {
 
 void Gfx_SetSkyRendering(cc_bool enabled) { rtSkyDraw = enabled; }
 
-void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, int numCutout) {
+void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, int numCutout,
+						const int* lights, int numLights) {
 	struct MemAlloc* alloc = (struct MemAlloc*)vb;
 	int i, numRanges = numOpaque + numCutout;
 	struct ChunkRT* rt;
@@ -2772,6 +2788,14 @@ void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, in
 	rt->numRanges = numRanges;
 	rt->numCutout = numCutout;
 	rt->vb        = alloc;
+
+	if (numLights) {
+		rt->lights = (int*)Mem_TryAlloc(numLights * 4, sizeof(int));
+		if (rt->lights) {
+			Mem_Copy(rt->lights, lights, numLights * 4 * sizeof(int));
+			rt->numLights = numLights;
+		}
+	}
 	alloc->rt     = rt;
 	RT_ListAdd(&rtPending, &numRtPending, &maxRtPending, rt);
 }
@@ -3028,6 +3052,194 @@ static int RT_FillTable(struct ChunkRT* rt, VkDeviceAddress* table) {
 	return n;
 }
 
+/* Light colour of a block is the average colour of its texture (brightened so the brightest channel is full) */
+static PackedCol rtLightCols[BLOCK_COUNT];
+static cc_bool rtLightColsValid[BLOCK_COUNT];
+static BitmapCol* rtLightColsAtlas;
+static int rtLightColsTileSize;
+
+static void RT_AddTileColor(TextureLoc loc, int* sums) {
+	int size = Atlas2D.TileSize, x, y;
+	int x0 = Atlas2D_TileX(loc) * size, y0 = Atlas2D_TileY(loc) * size;
+	BitmapCol* row;
+	BitmapCol c;
+	if (x0 + size > Atlas2D.Bmp.width || y0 + size > Atlas2D.Bmp.height) return;
+
+	for (y = y0; y < y0 + size; y++)
+	{
+		row = Bitmap_GetRow(&Atlas2D.Bmp, y);
+		for (x = x0; x < x0 + size; x++)
+		{
+			c = row[x];
+			if (BitmapCol_A(c) < 128) continue;
+			sums[0] += BitmapCol_R(c); sums[1] += BitmapCol_G(c); sums[2] += BitmapCol_B(c);
+		}
+	}
+}
+
+static PackedCol RT_LightColor(BlockID block) {
+	int sums[3] = { 0, 0, 0 }, maxC;
+	/* Texture pack changed, so the colours need to be calculated again */
+	if (Atlas2D.Bmp.scan0 != rtLightColsAtlas || Atlas2D.TileSize != rtLightColsTileSize) {
+		Mem_Set(rtLightColsValid, 0, sizeof(rtLightColsValid));
+		rtLightColsAtlas    = Atlas2D.Bmp.scan0;
+		rtLightColsTileSize = Atlas2D.TileSize;
+	}
+	if (rtLightColsValid[block]) return rtLightCols[block];
+
+	if (Atlas2D.Bmp.scan0) {
+		RT_AddTileColor(Block_Tex(block, FACE_YMAX), sums);
+		RT_AddTileColor(Block_Tex(block, FACE_XMAX), sums);
+	}
+	maxC = max(sums[0], max(sums[1], sums[2]));
+	rtLightCols[block] = maxC ? PackedCol_Make(sums[0] * 255 / maxC, sums[1] * 255 / maxC, sums[2] * 255 / maxC, 255) : PACKEDCOL_WHITE;
+	rtLightColsValid[block] = true;
+	return rtLightCols[block];
+}
+
+/* Lights within this many blocks of the camera (along each axis) are used, nearest first */
+#define RT_LIGHT_GRID      12   /* Cells along each axis of the grid around the camera */
+#define RT_LIGHT_CELL      8    /* Size of each cell in blocks */
+#define RT_LIGHT_REACH     16   /* How far light from a block reaches */
+#define RT_LIGHTS_PER_CELL 16
+#define RT_MAX_LIGHTS      2048
+#define RT_LIGHT_RANGE     (RT_LIGHT_GRID * RT_LIGHT_CELL / 2 + RT_LIGHT_REACH)
+#define RT_LIGHT_CELLS     (RT_LIGHT_GRID * RT_LIGHT_GRID * RT_LIGHT_GRID)
+
+static int rtLightCands[RT_MAX_LIGHTS * 4];
+static int rtLightSorted[RT_MAX_LIGHTS * 4];
+static int rtLightBuckets[RT_LIGHT_RANGE + 2];
+static int rtCellCounts[RT_LIGHT_CELLS];
+
+/* Finds the cells of the grid that a light at x/y/z reaches */
+static void RT_LightCells(const int* light, const int* origin, int* lo, int* hi) {
+	int i;
+	for (i = 0; i < 3; i++)
+	{
+		lo[i] = (light[i] - RT_LIGHT_REACH     - origin[i]) / RT_LIGHT_CELL;
+		hi[i] = (light[i] + RT_LIGHT_REACH + 1 - origin[i]) / RT_LIGHT_CELL;
+		if (light[i] - RT_LIGHT_REACH - origin[i] < 0) lo[i] = 0;
+		lo[i] = max(lo[i], 0); hi[i] = min(hi[i], RT_LIGHT_GRID - 1);
+	}
+}
+
+/* Gathers the light emitting blocks near the camera, and which lights reach each cell of the grid */
+static void RT_BuildLights(struct RTParams* p, cc_uint32 count) {
+	int origin[3], lo[3], hi[3], cam[3];
+	int i, j, x, y, z, d, numCands = 0, numLights = 0, total, cell;
+	struct ChunkRT* rt;
+	VkDeviceAddress lightsAddr, gridAddr;
+	float* lights;
+	int* grid;
+	int* light;
+	PackedCol col;
+	float intensity;
+
+	p->numLights = 0;
+	if (!rtBlockLights) return;
+
+	cam[0] = (int)Math_Floor(Camera.CurrentPos.x);
+	cam[1] = (int)Math_Floor(Camera.CurrentPos.y);
+	cam[2] = (int)Math_Floor(Camera.CurrentPos.z);
+	for (i = 0; i < 3; i++)
+	{
+		origin[i] = (int)Math_Floor((float)cam[i] / RT_LIGHT_CELL) * RT_LIGHT_CELL - (RT_LIGHT_GRID / 2) * RT_LIGHT_CELL;
+	}
+
+	/* Gather lights near the camera, counted by distance (so the nearest are kept when there are too many) */
+	Mem_Set(rtLightBuckets, 0, sizeof(rtLightBuckets));
+	for (i = 0; i < (int)count && numCands < RT_MAX_LIGHTS; i++)
+	{
+		rt = rtChunks[i];
+		for (j = 0; j < rt->numLights && numCands < RT_MAX_LIGHTS; j++)
+		{
+			light = &rt->lights[j * 4];
+			d = max(Math_AbsI(light[0] - cam[0]), max(Math_AbsI(light[1] - cam[1]), Math_AbsI(light[2] - cam[2])));
+			if (d > RT_LIGHT_RANGE) continue;
+
+			Mem_Copy(&rtLightCands[numCands * 4], light, 4 * sizeof(int));
+			rtLightBuckets[d + 1]++;
+			numCands++;
+		}
+	}
+	if (!numCands) return;
+
+	for (d = 1; d < RT_LIGHT_RANGE + 2; d++) rtLightBuckets[d] += rtLightBuckets[d - 1];
+	for (i = 0; i < numCands; i++)
+	{
+		light = &rtLightCands[i * 4];
+		d = max(Math_AbsI(light[0] - cam[0]), max(Math_AbsI(light[1] - cam[1]), Math_AbsI(light[2] - cam[2])));
+		Mem_Copy(&rtLightSorted[rtLightBuckets[d]++ * 4], light, 4 * sizeof(int));
+	}
+	numLights = numCands;
+
+	/* Count how many lights reach each cell (capped, nearest lights first) */
+	Mem_Set(rtCellCounts, 0, sizeof(rtCellCounts));
+	total = 0;
+	for (i = 0; i < numLights; i++)
+	{
+		RT_LightCells(&rtLightSorted[i * 4], origin, lo, hi);
+		for (y = lo[1]; y <= hi[1]; y++)
+			for (z = lo[2]; z <= hi[2]; z++)
+				for (x = lo[0]; x <= hi[0]; x++)
+				{
+					cell = (y * RT_LIGHT_GRID + z) * RT_LIGHT_GRID + x;
+					if (rtCellCounts[cell] < RT_LIGHTS_PER_CELL) { rtCellCounts[cell]++; total++; }
+				}
+	}
+
+	lights = (float*)Ring_AllocAddress(numLights * 8 * sizeof(float), &lightsAddr);
+	grid   = (int*)Ring_AllocAddress((RT_LIGHT_CELLS * 2 + total) * sizeof(int), &gridAddr);
+	if (!lights || !grid) return;
+
+	for (i = 0; i < numLights; i++)
+	{
+		light     = &rtLightSorted[i * 4];
+		col       = RT_LightColor((BlockID)light[3]);
+		intensity = max(Blocks.Brightness[light[3]] & 0x0F, Blocks.Brightness[light[3]] >> 4) / 15.0f;
+
+		lights[i * 8 + 0] = light[0] + 0.5f;
+		lights[i * 8 + 1] = light[1] + 0.5f;
+		lights[i * 8 + 2] = light[2] + 0.5f;
+		lights[i * 8 + 3] = intensity;
+		lights[i * 8 + 4] = PackedCol_R(col) / 255.0f;
+		lights[i * 8 + 5] = PackedCol_G(col) / 255.0f;
+		lights[i * 8 + 6] = PackedCol_B(col) / 255.0f;
+		lights[i * 8 + 7] = 0.0f;
+	}
+
+	/* Each cell is (offset, count), with the offsets being into the light indices after the cells */
+	total = RT_LIGHT_CELLS * 2;
+	for (cell = 0; cell < RT_LIGHT_CELLS; cell++)
+	{
+		grid[cell * 2]     = total;
+		grid[cell * 2 + 1] = 0;
+		total += rtCellCounts[cell];
+	}
+	for (i = 0; i < numLights; i++)
+	{
+		RT_LightCells(&rtLightSorted[i * 4], origin, lo, hi);
+		for (y = lo[1]; y <= hi[1]; y++)
+			for (z = lo[2]; z <= hi[2]; z++)
+				for (x = lo[0]; x <= hi[0]; x++)
+				{
+					cell = (y * RT_LIGHT_GRID + z) * RT_LIGHT_GRID + x;
+					if (grid[cell * 2 + 1] >= rtCellCounts[cell]) continue;
+					grid[grid[cell * 2] + grid[cell * 2 + 1]] = i;
+					grid[cell * 2 + 1]++;
+				}
+	}
+
+	p->lights      = lightsAddr;
+	p->lightGrid   = gridAddr;
+	p->gridX       = (float)origin[0];
+	p->gridY       = (float)origin[1];
+	p->gridZ       = (float)origin[2];
+	p->invCellSize = 1.0f / RT_LIGHT_CELL;
+	p->gridDim     = RT_LIGHT_GRID;
+	p->numLights   = numLights;
+}
+
 static void RT_BuildTLAS(VkCommandBuffer cmd) {
 	VkAccelerationStructureGeometryKHR geometry       = { 0 };
 	VkAccelerationStructureBuildGeometryInfoKHR build = { 0 };
@@ -3075,6 +3287,7 @@ static void RT_BuildTLAS(VkCommandBuffer cmd) {
 	RT_FrameParams()->table = table ? tableAddress : 0;
 	/* Bounced light needs the table to find what was hit */
 	if (!table || overflow) RT_FrameParams()->giStrength = 0.0f;
+	RT_BuildLights(RT_FrameParams(), count);
 
 	RT_InitTLASGeometry(&geometry, &build);
 	geometry.geometry.instances.data.deviceAddress = address;
@@ -3218,6 +3431,7 @@ static void RT_UpdateConstants(void) {
 	p->sunB = PackedCol_B(Env.SunCol) / 255.0f;
 	p->giStrength = rtGI ? 1.0f : 0.0f;
 
+	p->lightStrength = rtBlockLights_Strength[rtBlockLights];
 	p->godStrength = rtGodRays_Strength[rtGodRays];
 	p->godDensity  = RT_GOD_DENSITY;
 	p->godG        = RT_GOD_G;
@@ -3302,6 +3516,13 @@ static void RT_SetAO(int v) {
 	RT_SaveEnum(RT_OPT_AO, rtAO_Names[v]);
 }
 
+static int  RT_GetBlockLights(void) { return rtBlockLights; }
+static void RT_SetBlockLights(int v) {
+	rtResetHistory = true;
+	rtBlockLights = v;
+	RT_SaveEnum(RT_OPT_BLOCK_LIGHTS, rtBlockLights_Names[v]);
+}
+
 static int  RT_GetGodRays(void) { return rtGodRays; }
 static void RT_SetGodRays(int v) {
 	rtResetHistory = true;
@@ -3348,6 +3569,10 @@ static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
 		RT_GetGodRays,    RT_SetGodRays,
 		"&eShafts of sunlight in the air, e.g. through trees,\n" \
 		"&ebrightest when looking towards the sun.");
+	MenuOptionsScreen_AddEnum(s, "Block lights", rtBlockLights_Names, Array_Elems(rtBlockLights_Names),
+		RT_GetBlockLights, RT_SetBlockLights,
+		"&eBlocks that give off light (e.g. lava) light up\n" \
+		"&enearby blocks, in the colour of their texture.");
 }
 
 

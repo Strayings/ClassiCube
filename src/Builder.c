@@ -70,6 +70,11 @@ struct Builder1DPart {
 };
 
 #ifdef BUILDER_SHADOW_CASTERS
+/* Light emitting blocks in the chunk being built (x, y, z, block), for ray traced block lighting */
+#define BUILDER_MAX_LIGHTS 1024
+static int Builder_Lights[BUILDER_MAX_LIGHTS * 4];
+static int Builder_NumLights;
+
 /* Vertices of each face are ordered as [opaque casters][cutout casters][non casters] */
 #define CASTER_OPAQUE 0
 #define CASTER_CUTOUT 1 /* Casts shadows with gaps where the texture is transparent (e.g. leaves) */
@@ -181,7 +186,7 @@ static void OutputShadowCasters(GfxResourceID vb) {
 		}
 		if (type == CASTER_OPAQUE) numOpaque = count / 2;
 	}
-	Gfx_SetShadowCasters(vb, ranges, numOpaque, count / 2 - numOpaque);
+	Gfx_SetShadowCasters(vb, ranges, numOpaque, count / 2 - numOpaque, Builder_Lights, Builder_NumLights);
 }
 #endif
 
@@ -550,6 +555,9 @@ cc_bool Builder_MakeChunk(struct ChunkInfo* info) {
 #endif
 	Builder_PostPrepareChunk();
 	/* now render the chunk */
+#ifdef BUILDER_SHADOW_CASTERS
+	Builder_NumLights = 0;
+#endif
 
 	for (y = y1, yy = 0; y < yMax; y++, yy++) {
 		for (z = z1, zz = 0; z < zMax; z++, zz++) {
@@ -558,6 +566,12 @@ cc_bool Builder_MakeChunk(struct ChunkInfo* info) {
 			for (x = x1, xx = 0; x < xMax; x++, xx++, cIndex++) {
 				Builder_Block = chunk[cIndex];
 				if (Blocks.Draw[Builder_Block] == DRAW_GAS) continue;
+#ifdef BUILDER_SHADOW_CASTERS
+				if (Blocks.Brightness[Builder_Block] && Builder_NumLights < BUILDER_MAX_LIGHTS) {
+					int* light = &Builder_Lights[Builder_NumLights++ * 4];
+					light[0] = x; light[1] = y; light[2] = z; light[3] = Builder_Block;
+				}
+#endif
 
 				index = Builder_PackCount(xx, yy, zz);
 				Builder_ChunkIndex = cIndex;

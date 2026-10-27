@@ -96,7 +96,7 @@ struct ChunkRT {
 	struct MemAlloc* vb;
 	/* Ranges of cutout vertices (e.g. leaves) come first, then ranges of opaque vertices */
 	int* ranges;
-	int numRanges, numCutout, numCutoutGeoms, listIndex;
+	int numRanges, numCutout, numGeoms, listIndex;
 	cc_bool built;
 };
 
@@ -140,6 +140,7 @@ struct RTParams {
 	struct Matrix prevMVP;   /* Transform chunks were drawn with in the previous frame */
 	float screenW, screenH; int frame, hasPrev;
 	float maxHistory, aoStrength, aoRange, _pad3;
+	float sunR, sunG, sunB, giStrength;
 };
 
 static VkInstance instance;
@@ -168,11 +169,15 @@ static VkSemaphore renderSems[MAX_SWAP_IMAGES];
 static VkImage depthImage;
 static VkImageView depthView;
 static struct MemAlloc depthAlloc;
-/* Ray traced shadows of each pixel, which are blended over multiple frames to give smooth soft shadows */
-/*  (frame slot i writes to history image i, and reads the previous frame's history image) */
-static VkImage historyImages[FRAMES_IN_FLIGHT];
-static VkImageView historyViews[FRAMES_IN_FLIGHT];
-static struct MemAlloc historyAllocs[FRAMES_IN_FLIGHT];
+/* Ray traced shadows/sky light (0) and bounced light (1) of each pixel, which are blended over */
+/*  multiple frames to give smooth results (frame slot i writes to history images [x][i], and reads */
+/*  the previous frame's history images). These are colour attachments 2 and 3 of the render pass */
+#define HISTORY_IMAGES 2
+static VkImage historyImages[HISTORY_IMAGES][FRAMES_IN_FLIGHT];
+/* Whether the history images were just created, and so still need to be transitioned to the right layout */
+static cc_bool historyFresh;
+static VkImageView historyViews[HISTORY_IMAGES][FRAMES_IN_FLIGHT];
+static struct MemAlloc historyAllocs[HISTORY_IMAGES][FRAMES_IN_FLIGHT];
 #define HISTORY_FORMAT VK_FORMAT_R16G16B16A16_SFLOAT
 static cc_bool swapchainDirty;
 
@@ -215,8 +220,10 @@ static void (VKAPI_PTR *vkCmdSetCullModeEXT)(VkCommandBuffer cmd, VkFlags cullMo
 static cc_bool rtSupported, rtEnabled, rtActive, dirtyRtSet;
 /* Whether chunks were drawn with ray traced shadows in the current/previous frame, and with what transform */
 static cc_bool rtDrawn, rtPrevDrawn;
+/* Set when an option changes, since the previous frames' shadows/lighting no longer apply */
+static cc_bool rtResetHistory;
 static struct Matrix rtFrameMVP, rtPrevMVP;
-static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO;
+static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI;
 static VkDeviceSize rtScratchAlign;
 static struct MemPool asPool, scratchPool;
 static VkDescriptorSetLayout rtSetLayout;
@@ -990,11 +997,11 @@ static void ChooseFormats(void) {
 /* When ray traced shadows are supported, there's also a 2nd colour attachment for the shadow history */
 /*  (which is cleared at the start of each frame, unless history is false) */
 static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
-	VkAttachmentDescription attachments[3] = { { 0 } };
+	VkAttachmentDescription attachments[4] = { { 0 } };
 	VkSubpassDependency deps[2]       = { { 0 } };
 	VkSubpassDescription subpass      = { 0 };
 	VkRenderPassCreateInfo info       = { 0 };
-	VkAttachmentReference colorRefs[2], depthRef;
+	VkAttachmentReference colorRefs[3], depthRef;
 	VkRenderPass pass;
 	VkResult res;
 
@@ -1025,16 +1032,19 @@ static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
 	attachments[2].initialLayout  = resume ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
 	/* The next frame reads it in fragment shaders */
 	attachments[2].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	attachments[3] = attachments[2];
 
 	colorRefs[0].attachment = 0;
 	colorRefs[0].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	colorRefs[1].attachment = 2;
 	colorRefs[1].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	colorRefs[2].attachment = 3;
+	colorRefs[2].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	depthRef.attachment     = 1;
 	depthRef.layout         = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
 	subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	subpass.colorAttachmentCount    = rtSupported ? 2 : 1;
+	subpass.colorAttachmentCount    = rtSupported ? 3 : 1;
 	subpass.pColorAttachments       = colorRefs;
 	subpass.pDepthStencilAttachment = &depthRef;
 
@@ -1060,7 +1070,7 @@ static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
 	deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
 	info.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-	info.attachmentCount = rtSupported ? 3 : 2;
+	info.attachmentCount = rtSupported ? 4 : 2;
 	info.pAttachments    = attachments;
 	info.subpassCount    = 1;
 	info.pSubpasses      = &subpass;
@@ -1150,13 +1160,16 @@ static void DestroySwapchainResources(void) {
 	}
 	swapCount = 0;
 
-	for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+	for (i = 0; i < HISTORY_IMAGES; i++)
 	{
-		if (historyViews[j])  vkDestroyImageView(device, historyViews[j], NULL);
-		if (historyImages[j]) vkDestroyImage(device, historyImages[j], NULL);
-		MemAlloc_Free(&imagePool, &historyAllocs[j]);
-		historyViews[j]  = 0;
-		historyImages[j] = 0;
+		for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+		{
+			if (historyViews[i][j])  vkDestroyImageView(device, historyViews[i][j], NULL);
+			if (historyImages[i][j]) vkDestroyImage(device, historyImages[i][j], NULL);
+			MemAlloc_Free(&imagePool, &historyAllocs[i][j]);
+			historyViews[i][j]  = 0;
+			historyImages[i][j] = 0;
+		}
 	}
 
 	/* Depth buffer doesn't exist when the window was minimised */
@@ -1224,7 +1237,7 @@ static void CreateDepthBuffer(void) {
 	if (res) Process_Abort2(res, "Failed to create Vulkan depth buffer view");
 }
 
-/* Each frame slot's ray tracing descriptor set reads the previous frame's shadow history */
+/* Each frame slot's ray tracing descriptor set reads the previous frame's history images */
 static void CreateHistoryImages(void) {
 	VkImageCreateInfo info         = { 0 };
 	VkImageViewCreateInfo viewInfo = { 0 };
@@ -1232,7 +1245,7 @@ static void CreateHistoryImages(void) {
 	VkDescriptorImageInfo imageInfo;
 	VkMemoryRequirements reqs;
 	VkResult res;
-	int i;
+	int i, j;
 
 	info.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	info.imageType     = VK_IMAGE_TYPE_2D;
@@ -1255,42 +1268,55 @@ static void CreateHistoryImages(void) {
 	viewInfo.subresourceRange.levelCount = 1;
 	viewInfo.subresourceRange.layerCount = 1;
 
-	for (i = 0; i < FRAMES_IN_FLIGHT; i++)
+	for (i = 0; i < HISTORY_IMAGES; i++)
 	{
-		res = vkCreateImage(device, &info, NULL, &historyImages[i]);
-		if (res) Process_Abort2(res, "Failed to create Vulkan shadow history image");
+		for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+		{
+			res = vkCreateImage(device, &info, NULL, &historyImages[i][j]);
+			if (res) Process_Abort2(res, "Failed to create Vulkan history image");
 
-		vkGetImageMemoryRequirements(device, historyImages[i], &reqs);
-		if (!AllocMemory(&imagePool, &reqs, &historyAllocs[i])) Process_Abort("Out of video memory! (allocating shadow history)");
-		vkBindImageMemory(device, historyImages[i], historyAllocs[i].block->memory, historyAllocs[i].offset);
+			vkGetImageMemoryRequirements(device, historyImages[i][j], &reqs);
+			if (!AllocMemory(&imagePool, &reqs, &historyAllocs[i][j])) Process_Abort("Out of video memory! (allocating ray tracing history)");
+			vkBindImageMemory(device, historyImages[i][j], historyAllocs[i][j].block->memory, historyAllocs[i][j].offset);
 
-		viewInfo.image = historyImages[i];
-		res = vkCreateImageView(device, &viewInfo, NULL, &historyViews[i]);
-		if (res) Process_Abort2(res, "Failed to create Vulkan shadow history view");
+			viewInfo.image = historyImages[i][j];
+			res = vkCreateImageView(device, &viewInfo, NULL, &historyViews[i][j]);
+			if (res) Process_Abort2(res, "Failed to create Vulkan history view");
 
-		/* Contents are undefined until a frame draws chunks, but the image still has to be in */
-		/*  the right layout, since the descriptor set referencing it might be bound before then */
-		ImageBarrier(UploadCmd(), historyImages[i], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-					VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		}
 	}
+	/* Contents are undefined until a frame draws chunks, but the images still have to be in the right */
+	/*  layout, since the descriptor sets referencing them might be bound before then (see BeginRenderPass) */
+	historyFresh = true;
 
 	write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-	write.dstBinding      = 2;
 	write.descriptorCount = 1;
 	write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	write.pImageInfo      = &imageInfo;
 
-	for (i = 0; i < FRAMES_IN_FLIGHT; i++)
+	for (i = 0; i < HISTORY_IMAGES; i++)
 	{
-		/* Only read using texelFetch, so the sampler doesn't matter */
-		imageInfo.sampler     = samplers[0];
-		imageInfo.imageView   = historyViews[(i + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT];
-		imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		write.dstSet          = frames[i].rtSet;
-		vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+		for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+		{
+			/* Only read using texelFetch, so the sampler doesn't matter */
+			imageInfo.sampler     = samplers[0];
+			imageInfo.imageView   = historyViews[i][(j + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT];
+			imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			write.dstSet          = frames[j].rtSet;
+			write.dstBinding      = 2 + i;
+			vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+		}
 	}
-	/* Previous frame's history is gone */
+	/* Previous frame's history is gone, including for the frame currently being recorded */
+	/*  (whose parameters were already set in RT_BeginFrame, but haven't been used by the GPU yet) */
 	rtPrevDrawn = false;
+	for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+	{
+		struct RTParams* p = (struct RTParams*)(rtParams.data + j * RT_PARAMS_STRIDE);
+		p->hasPrev = false;
+		p->screenW = (float)swapExtent.width;
+		p->screenH = (float)swapExtent.height;
+	}
 }
 
 static void CreateSwapchain(void) {
@@ -1300,7 +1326,7 @@ static void CreateSwapchain(void) {
 	VkSemaphoreCreateInfo semInfo  = { 0 };
 	VkSwapchainKHR old = swapchain;
 	VkSurfaceCapabilitiesKHR caps;
-	VkImageView attachments[3];
+	VkImageView attachments[4];
 	cc_uint32 i, j, count;
 	VkResult res;
 
@@ -1368,7 +1394,7 @@ static void CreateSwapchain(void) {
 
 	fbInfo.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
 	fbInfo.renderPass      = renderPass;
-	fbInfo.attachmentCount = rtSupported ? 3 : 2;
+	fbInfo.attachmentCount = rtSupported ? 4 : 2;
 	fbInfo.pAttachments    = attachments;
 	fbInfo.width           = swapExtent.width;
 	fbInfo.height          = swapExtent.height;
@@ -1386,7 +1412,8 @@ static void CreateSwapchain(void) {
 		{
 			attachments[0] = swapViews[i];
 			attachments[1] = depthView;
-			attachments[2] = historyViews[j];
+			attachments[2] = historyViews[0][j];
+			attachments[3] = historyViews[1][j];
 			res = vkCreateFramebuffer(device, &fbInfo, NULL, &framebuffers[i][j]);
 			if (res) Process_Abort2(res, "Failed to create Vulkan framebuffer");
 		}
@@ -1452,9 +1479,9 @@ static VkShaderModule CreateShader(const struct ShaderDesc* desc) {
 }
 
 /* Set 1 contains the top level acceleration structure for ray traced shadows (binding 0), */
-/*  struct RTParams (binding 1), and the previous frame's shadow history (binding 2) */
+/*  struct RTParams (binding 1), and the previous frame's history images (bindings 2 and 3) */
 static void CreateRTDescriptors(void) {
-	VkDescriptorSetLayoutBinding bindings[3] = { { 0 } };
+	VkDescriptorSetLayoutBinding bindings[4] = { { 0 } };
 	VkDescriptorSetLayoutCreateInfo setInfo  = { 0 };
 	VkDescriptorPoolCreateInfo poolInfo      = { 0 };
 	VkDescriptorSetAllocateInfo allocInfo    = { 0 };
@@ -1476,9 +1503,11 @@ static void CreateRTDescriptors(void) {
 	bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	bindings[2].descriptorCount = 1;
 	bindings[2].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+	bindings[3] = bindings[2];
+	bindings[3].binding         = 3;
 
 	setInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	setInfo.bindingCount = 3;
+	setInfo.bindingCount = 4;
 	setInfo.pBindings    = bindings;
 
 	res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &rtSetLayout);
@@ -1489,7 +1518,7 @@ static void CreateRTDescriptors(void) {
 	sizes[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	sizes[1].descriptorCount = FRAMES_IN_FLIGHT;
 	sizes[2].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	sizes[2].descriptorCount = FRAMES_IN_FLIGHT;
+	sizes[2].descriptorCount = FRAMES_IN_FLIGHT * HISTORY_IMAGES;
 
 	poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets       = FRAMES_IN_FLIGHT;
@@ -1631,7 +1660,7 @@ static VkPipeline CreatePipeline(int key) {
 	VkPipelineRasterizationStateCreateInfo raster        = { 0 };
 	VkPipelineMultisampleStateCreateInfo multisample     = { 0 };
 	VkPipelineDepthStencilStateCreateInfo depth          = { 0 };
-	VkPipelineColorBlendAttachmentState blendAttachments[2] = { { 0 } };
+	VkPipelineColorBlendAttachmentState blendAttachments[3] = { { 0 } };
 	VkPipelineColorBlendStateCreateInfo blend            = { 0 };
 	VkPipelineDynamicStateCreateInfo dynamic             = { 0 };
 	VkGraphicsPipelineCreateInfo info                    = { 0 };
@@ -1693,12 +1722,14 @@ static VkPipeline CreatePipeline(int key) {
 	blendAttachments[0].alphaBlendOp        = VK_BLEND_OP_ADD;
 	blendAttachments[0].colorWriteMask      = (key >> 5) & 0x0F;
 
-	/* Only opaque chunk faces write to the shadow history (see PrepareDraw) */
-	if (rt && !blendAttachments[0].blendEnable && blendAttachments[0].colorWriteMask)
+	/* Only opaque chunk faces write to the history images (see PrepareDraw) */
+	if (rt && !blendAttachments[0].blendEnable && blendAttachments[0].colorWriteMask) {
 		blendAttachments[1].colorWriteMask = 0x0F;
+		blendAttachments[2].colorWriteMask = 0x0F;
+	}
 
 	blend.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-	blend.attachmentCount = rtSupported ? 2 : 1;
+	blend.attachmentCount = rtSupported ? 3 : 1;
 	blend.pAttachments    = blendAttachments;
 
 	dynamic.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
@@ -2222,7 +2253,7 @@ static void InvalidateState(void) {
 
 static void BeginRenderPass(VkRenderPass pass) {
 	VkRenderPassBeginInfo info = { 0 };
-	VkClearValue clears[3]     = { { { { 0 } } } };
+	VkClearValue clears[4]     = { { { { 0 } } } };
 	BeginCmd(frame->drawCmd);
 	drawBegun = true;
 	InvalidateState();
@@ -2235,8 +2266,23 @@ static void BeginRenderPass(VkRenderPass pass) {
 	info.renderPass        = pass;
 	info.framebuffer       = framebuffers[imageIndex][rtSupported ? frameIndex : 0];
 	info.renderArea.extent = swapExtent;
-	info.clearValueCount   = rtSupported ? 3 : 0;
+	info.clearValueCount   = rtSupported ? 4 : 0;
 	info.pClearValues      = clears;
+
+	/* Swapchain recreation happens before this (see AcquireImage), so the images can't be destroyed */
+	/*  between recording this and the command buffer being submitted */
+	if (historyFresh) {
+		int i, j;
+		for (i = 0; i < HISTORY_IMAGES; i++)
+		{
+			for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+			{
+				ImageBarrier(frame->drawCmd, historyImages[i][j], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+							VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+			}
+		}
+		historyFresh = false;
+	}
 
 	vkCmdBeginRenderPass(frame->drawCmd, &info, VK_SUBPASS_CONTENTS_INLINE);
 	renderPassActive = true;
@@ -2562,6 +2608,7 @@ void Gfx_ClearBuffers(GfxBuffers buffers) {
 #define RT_OPT_SHADOW_DIST "gfx-rt-shadowdist"
 #define RT_OPT_SOFTNESS    "gfx-rt-softness"
 #define RT_OPT_AO          "gfx-rt-ao"
+#define RT_OPT_GI          "gfx-rt-gi"
 /* How far away blocks can be and still block sky light */
 #define RT_AO_RANGE 16.0f
 /* Each geometry can only use up to 16384 quads, since that's all the default index buffer has */
@@ -2575,6 +2622,7 @@ static const char* const rtSunDir_Names[]     = { "North", "Northeast", "East", 
 static const char* const rtShadowDist_Names[] = { "64", "128", "256", "Max" };
 static const char* const rtSoftness_Names[]   = { "Off", "Low", "Medium", "High" };
 static const char* const rtAO_Names[]         = { "Off", "Low", "Medium", "High" };
+static const char* const rtGI_Names[]         = { "Off", "On" };
 static const float rtSunAngle_Degrees[]  = { 20.0f, 40.0f, 60.0f, 90.0f };
 static const float rtShadowDist_Blocks[] = { 64.0f, 128.0f, 256.0f, 4096.0f };
 /* Angular radius of the sun's disc (the real sun is about 0.27 degrees), and how many points on the disc */
@@ -2602,6 +2650,7 @@ static void RT_Init(void) {
 	rtShadowDist = Options_GetEnum(RT_OPT_SHADOW_DIST, 2, rtShadowDist_Names, Array_Elems(rtShadowDist_Names));
 	rtSoftness   = Options_GetEnum(RT_OPT_SOFTNESS,    2, rtSoftness_Names,   Array_Elems(rtSoftness_Names));
 	rtAO         = Options_GetEnum(RT_OPT_AO,          2, rtAO_Names,         Array_Elems(rtAO_Names));
+	rtGI         = Options_GetEnum(RT_OPT_GI,          1, rtGI_Names,         Array_Elems(rtGI_Names));
 }
 
 static void RT_ListAdd(struct ChunkRT*** list, int* count, int* max, struct ChunkRT* rt) {
@@ -2667,9 +2716,9 @@ void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, in
 	/* Cutout ranges go first, so their geometries are the first geometries in the BLAS */
 	Mem_Copy(rt->ranges,                 ranges + numOpaque * 2, numCutout * 2 * sizeof(int));
 	Mem_Copy(rt->ranges + numCutout * 2, ranges,                 numOpaque * 2 * sizeof(int));
-	for (i = 0; i < numCutout; i++)
+	for (i = 0; i < numRanges; i++)
 	{
-		rt->numCutoutGeoms += RT_GeometryCount(rt->ranges[i * 2 + 1]);
+		rt->numGeoms += RT_GeometryCount(rt->ranges[i * 2 + 1]);
 	}
 
 	rt->numRanges = numRanges;
@@ -2911,12 +2960,13 @@ static void RT_BuildChunks(VkCommandBuffer cmd) {
 	Mem_Free(primCounts);
 }
 
-/* Each cutout geometry's entry in the table is the address of the geometry's first vertex */
+/* Each geometry's entry in the table is the address of the geometry's first vertex */
+/*  (used for alpha testing cutout geometry, and for finding what bounced light hit) */
 static int RT_FillTable(struct ChunkRT* rt, VkDeviceAddress* table) {
 	VkDeviceAddress vb = MemAlloc_Address(rt->vb);
 	int i, first, count, vertices, n = 0;
 
-	for (i = 0; i < rt->numCutout; i++)
+	for (i = 0; i < rt->numRanges; i++)
 	{
 		first = rt->ranges[i * 2];
 		count = rt->ranges[i * 2 + 1];
@@ -2941,7 +2991,7 @@ static void RT_BuildTLAS(VkCommandBuffer cmd) {
 	struct ChunkRT* rt;
 	cc_uint32 i, flags, base = 0, numGeoms = 0, count = min((cc_uint32)numRtChunks, frame->tlasCapacity);
 
-	for (i = 0; i < count; i++) { numGeoms += rtChunks[i]->numCutoutGeoms; }
+	for (i = 0; i < count; i++) { numGeoms += rtChunks[i]->numGeoms; }
 	table = (VkDeviceAddress*)Ring_AllocAddress(max(numGeoms, 1) * sizeof(VkDeviceAddress), &tableAddress);
 
 	instances = (VkAccelerationStructureInstanceKHR*)Ring_AllocAddress(
@@ -2959,19 +3009,21 @@ static void RT_BuildTLAS(VkCommandBuffer cmd) {
 		instances[i].matrix[2][2] = 1.0f;
 		flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 
-		/* The custom index is where the instance's cutout geometries start in the table */
+		/* The custom index is where the instance's geometries start in the table */
 		/*  (if there's no room in the table, cutout geometries are just treated as opaque) */
-		if (table && rt->numCutoutGeoms && base < (1u << 24)) {
+		if (table && base < (1u << 24)) {
 			instances[i].customIndexAndMask = base | (0xFFu << 24);
 			base += RT_FillTable(rt, table + base);
 		} else {
 			instances[i].customIndexAndMask = 0xFFu << 24;
-			flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
 		}
+		if (!rt->numCutout || !table) flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
 		instances[i].sbtOffsetAndFlags = flags << 24;
 		instances[i].accelerationStructureReference = rt->address;
 	}
 	RT_FrameParams()->table = table ? tableAddress : 0;
+	/* Bounced light needs the table to find what was hit */
+	if (!table) RT_FrameParams()->giStrength = 0.0f;
 
 	RT_InitTLASGeometry(&geometry, &build);
 	geometry.geometry.instances.data.deviceAddress = address;
@@ -3056,13 +3108,23 @@ static void RT_UpdateConstants(void) {
 
 	/* For finding where each pixel was in the previous frame's shadow history */
 	p->prevMVP    = rtPrevMVP;
-	p->hasPrev    = rtPrevDrawn;
+	p->hasPrev    = rtPrevDrawn && !rtResetHistory;
+	rtResetHistory = false;
 	p->screenW    = (float)swapExtent.width;
 	p->screenH    = (float)swapExtent.height;
-	p->frame      = (int)(frameCounter & 0xFFFFFF);
+	/* Each pixel steps through the points on the sun's disc/hemisphere 9 at a time, rather than */
+	/*  in order from the centre outwards (which shimmers). 9 doesn't divide 32 or 64, so all points */
+	/*  are still used, and 2^24 is a multiple of both so there's no jump when the counter wraps */
+	p->frame      = (int)((frameCounter * 9u) & 0xFFFFFF);
 	p->maxHistory = RT_MAX_HISTORY;
 	p->aoStrength = rtAO_Strength[rtAO];
 	p->aoRange    = RT_AO_RANGE;
+
+	/* Bounced light is relative to sunlight, since vertex colours include the sun colour */
+	p->sunR = PackedCol_R(Env.SunCol) / 255.0f;
+	p->sunG = PackedCol_G(Env.SunCol) / 255.0f;
+	p->sunB = PackedCol_B(Env.SunCol) / 255.0f;
+	p->giStrength = rtGI ? 1.0f : 0.0f;
 }
 
 /* The shadow history written this frame is only usable next frame if chunks were drawn this frame */
@@ -3100,32 +3162,44 @@ static void RT_SaveEnum(const char* key, const char* value) {
 
 static int  RT_GetSunAngle(void) { return rtSunAngle; }
 static void RT_SetSunAngle(int v) {
+	rtResetHistory = true;
 	rtSunAngle = v;
 	RT_SaveEnum(RT_OPT_SUN_ANGLE, rtSunAngle_Names[v]);
 }
 
 static int  RT_GetSunDir(void) { return rtSunDir; }
 static void RT_SetSunDir(int v) {
+	rtResetHistory = true;
 	rtSunDir = v;
 	RT_SaveEnum(RT_OPT_SUN_DIR, rtSunDir_Names[v]);
 }
 
 static int  RT_GetShadowDist(void) { return rtShadowDist; }
 static void RT_SetShadowDist(int v) {
+	rtResetHistory = true;
 	rtShadowDist = v;
 	RT_SaveEnum(RT_OPT_SHADOW_DIST, rtShadowDist_Names[v]);
 }
 
 static int  RT_GetSoftness(void) { return rtSoftness; }
 static void RT_SetSoftness(int v) {
+	rtResetHistory = true;
 	rtSoftness = v;
 	RT_SaveEnum(RT_OPT_SOFTNESS, rtSoftness_Names[v]);
 }
 
 static int  RT_GetAO(void) { return rtAO; }
 static void RT_SetAO(int v) {
+	rtResetHistory = true;
 	rtAO = v;
 	RT_SaveEnum(RT_OPT_AO, rtAO_Names[v]);
+}
+
+static int  RT_GetGI(void) { return rtGI; }
+static void RT_SetGI(int v) {
+	rtResetHistory = true;
+	rtGI = v;
+	RT_SaveEnum(RT_OPT_GI, rtGI_Names[v]);
 }
 
 static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
@@ -3152,6 +3226,10 @@ static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
 		RT_GetAO,         RT_SetAO,
 		"&eDarkens corners, caves and areas under trees,\n" \
 		"&ebased on how much of the sky they can see.");
+	MenuOptionsScreen_AddEnum(s, "Global illumination", rtGI_Names, Array_Elems(rtGI_Names),
+		RT_GetGI,         RT_SetGI,
+		"&eLight bounces off blocks onto nearby blocks,\n" \
+		"&ee.g. sunlit grass lights up walls next to it.");
 }
 
 
@@ -3165,7 +3243,6 @@ static VkResult SubmitFrame(cc_bool present) {
 	cc_uint32 count = 0;
 
 	RT_RecordBuilds();
-	RT_EndFrame();
 	if (uploadBegun) { EndUploadCmd(); cmds[count++] = frame->uploadCmd; }
 	if (drawBegun)   { vkEndCommandBuffer(frame->drawCmd); cmds[count++] = frame->drawCmd; }
 
@@ -3238,6 +3315,7 @@ void Gfx_EndFrame(void) {
 	}
 
 	res = SubmitFrame(present);
+	RT_EndFrame();
 	if (res) {
 		HandleError(res, "Failed to submit Vulkan commands");
 	} else if (present) {

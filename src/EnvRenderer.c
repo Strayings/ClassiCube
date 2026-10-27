@@ -278,6 +278,9 @@ void EnvRenderer_RenderSky(void) {
 	skyY  = max(Camera.CurrentPos.y + 8.0f, normY);
 	Gfx_SetVertexFormat(VERTEX_FORMAT_COLOURED);
 	Gfx_BindVb(sky_vb);
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+	Gfx_SetSkyRendering(true);
+#endif
 
 	if (skyY == normY) {
 		Gfx_DrawVb_IndexedTris(sky_vertices);
@@ -292,6 +295,9 @@ void EnvRenderer_RenderSky(void) {
 		Gfx_DrawVb_IndexedTris(sky_vertices);
 		Gfx_LoadMatrix(MATRIX_VIEW, &Gfx.View);
 	}
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+	Gfx_SetSkyRendering(false);
+#endif
 }
 
 /*########################################################################################################################*
@@ -365,7 +371,13 @@ void EnvRenderer_RenderSkybox(void) {
 
 	Gfx_LoadMatrix(MATRIX_VIEW, &m);
 	Gfx_BindVb(skybox_vb);
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+	Gfx_SetSkyRendering(true);
 	Gfx_DrawVb_IndexedTris(SKYBOX_COUNT);
+	Gfx_SetSkyRendering(false);
+#else
+	Gfx_DrawVb_IndexedTris(SKYBOX_COUNT);
+#endif
 
 	Gfx_LoadMatrix(MATRIX_VIEW, &Gfx.View);
 	Gfx_SetDepthWrite(true);

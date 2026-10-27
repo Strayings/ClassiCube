@@ -8,6 +8,9 @@
 #include "Lighting.h"
 #include "World.h"
 #include "Camera.h"
+#include "Block.h"
+#include "EnvRenderer.h"
+#include "Game.h"
 
 /* Vulkan 1.1 backend (Windows only for now) */
 
@@ -45,7 +48,7 @@ static const struct DynamicLibSym vk_funcs[] = {
 #define RING_MAX_KEEP    (32 * 1024 * 1024)
 #define RING_MAX_CHUNKS  32
 #define DESC_POOL_SETS   512
-#define PIPELINE_KEYS    16384
+#define PIPELINE_KEYS    32768
 #define WAIT_FOREVER     ((cc_uint64)-1)
 
 #define GARBAGE_BUFFER  0
@@ -142,6 +145,8 @@ struct RTParams {
 	float maxHistory, aoStrength, aoRange, _pad3;
 	float sunR, sunG, sunB, giStrength;
 	float godStrength, godDensity, godG, godRange; /* God rays (sunlight scattered by the air) */
+	float scatterR, scatterG, scatterB, caustics;   /* Colour of scattered light, and caustics under water */
+	float skyDY; int skybox; float time, _pad4;      /* See EnvRenderer_RenderSky/RenderSkybox */
 };
 
 static VkInstance instance;
@@ -234,7 +239,9 @@ static VkDescriptorPool rtDescPool;
 static struct RingChunk rtParams;
 #define RT_PARAMS_STRIDE 256
 #define RT_FrameParams() ((struct RTParams*)(rtParams.data + frameIndex * RT_PARAMS_STRIDE))
-static VkShaderModule vsRtModule, fsRtModules[6];
+static VkShaderModule vsRtModules[2], fsRtModules[6], fsSkyModules[6];
+/* Whether the sky is currently being drawn (see Gfx_SetSkyRendering) */
+static cc_bool rtSkyDraw;
 /* Chunks waiting for their BLAS to be built, and chunks which have a BLAS */
 static struct ChunkRT** rtPending;
 static struct ChunkRT** rtChunks;
@@ -1463,7 +1470,19 @@ static const struct ShaderDesc fs_rt_descs[] = {
 	{ fs_textured_density_rt,      sizeof(fs_textured_density_rt)      },
 	{ fs_textured_test_density_rt, sizeof(fs_textured_test_density_rt) },
 };
-static const struct ShaderDesc vs_rt_desc = { vs_textured_rt, sizeof(vs_textured_rt) };
+/* Indexed by vertex format + fog mode * 2 */
+static const struct ShaderDesc fs_sky_descs[] = {
+	{ fs_colored_sky_rt,          sizeof(fs_colored_sky_rt)          },
+	{ fs_textured_sky_rt,         sizeof(fs_textured_sky_rt)         },
+	{ fs_colored_sky_linear_rt,   sizeof(fs_colored_sky_linear_rt)   },
+	{ fs_textured_sky_linear_rt,  sizeof(fs_textured_sky_linear_rt)  },
+	{ fs_colored_sky_density_rt,  sizeof(fs_colored_sky_density_rt)  },
+	{ fs_textured_sky_density_rt, sizeof(fs_textured_sky_density_rt) },
+};
+static const struct ShaderDesc vs_rt_descs[] = {
+	{ vs_colored_rt,  sizeof(vs_colored_rt)  },
+	{ vs_textured_rt, sizeof(vs_textured_rt) },
+};
 
 static VkShaderModule CreateShader(const struct ShaderDesc* desc) {
 	VkShaderModuleCreateInfo info = { 0 };
@@ -1556,8 +1575,9 @@ static void CreateRTDescriptors(void) {
 		vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
 	}
 
-	vsRtModule = CreateShader(&vs_rt_desc);
-	for (i = 0; i < Array_Elems(fsRtModules); i++) fsRtModules[i] = CreateShader(&fs_rt_descs[i]);
+	for (i = 0; i < Array_Elems(vsRtModules);  i++) vsRtModules[i]  = CreateShader(&vs_rt_descs[i]);
+	for (i = 0; i < Array_Elems(fsRtModules);  i++) fsRtModules[i]  = CreateShader(&fs_rt_descs[i]);
+	for (i = 0; i < Array_Elems(fsSkyModules); i++) fsSkyModules[i] = CreateShader(&fs_sky_descs[i]);
 }
 
 static void CreatePipelineObjects(void) {
@@ -1642,8 +1662,9 @@ static void DestroyPipelineObjects(void) {
 	vkDestroyDescriptorSetLayout(device, setLayout, NULL);
 
 	if (!rtSupported) return;
-	vkDestroyShaderModule(device, vsRtModule, NULL);
-	for (i = 0; i < Array_Elems(fsRtModules); i++) vkDestroyShaderModule(device, fsRtModules[i], NULL);
+	for (i = 0; i < Array_Elems(vsRtModules);  i++) vkDestroyShaderModule(device, vsRtModules[i],  NULL);
+	for (i = 0; i < Array_Elems(fsRtModules);  i++) vkDestroyShaderModule(device, fsRtModules[i],  NULL);
+	for (i = 0; i < Array_Elems(fsSkyModules); i++) vkDestroyShaderModule(device, fsSkyModules[i], NULL);
 	vkDestroyDescriptorPool(device, rtDescPool, NULL);
 	vkDestroyDescriptorSetLayout(device, rtSetLayout, NULL);
 	RingChunk_Destroy(&rtParams);
@@ -1667,16 +1688,21 @@ static VkPipeline CreatePipeline(int key) {
 	VkGraphicsPipelineCreateInfo info                    = { 0 };
 	VkPipeline pipeline;
 	VkResult res;
-	int fmt = key & 1, rt = (key >> 13) & 1;
+	int fmt = key & 1, rt = (key >> 13) & 1, sky = (key >> 14) & 1;
 
 	stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
-	stages[0].module = rt ? vsRtModule : vsModules[fmt];
+	stages[0].module = rt ? vsRtModules[fmt] : vsModules[fmt];
 	stages[0].pName  = "main";
 	stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
 	/* Ray traced variants only exist for textured vertices (i.e. chunk meshes) */
-	stages[1].module = rt ? fsRtModules[((key >> 1) & 1) + ((key >> 2) & 3) * 2] : fsModules[key & 0x0F];
+	/*  (or for the sky, which can be coloured or textured) */
+	if (sky) {
+		stages[1].module = fsSkyModules[fmt + ((key >> 2) & 3) * 2];
+	} else {
+		stages[1].module = rt ? fsRtModules[((key >> 1) & 1) + ((key >> 2) & 3) * 2] : fsModules[key & 0x0F];
+	}
 	stages[1].pName  = "main";
 
 	binding.stride    = strideSizes[fmt];
@@ -2321,19 +2347,19 @@ static cc_bool EnsureRenderPass(void) {
 
 /* Bit 0 = format, 1 = alpha test, 2-3 = fog, 4 = blending, 5-8 = colour mask, */
 /*  9 = depth test, 10 = depth write, 11 = culling (only without dynamic cull mode), */
-/*  12 = lines, 13 = ray traced shadows */
-static int CalcPipelineKey(cc_bool lines, cc_bool rt) {
+/*  12 = lines, 13 = ray traced shadows, 14 = ray traced sky */
+static int CalcPipelineKey(cc_bool lines, cc_bool rt, cc_bool sky) {
 	int fog = 0, cull = dynamicCull ? 0 : cullFaces;
 	if (gfx_fogEnabled && gfx_fogMode >= 0) fog = gfx_fogMode == FOG_LINEAR ? 1 : 2;
 
 	return gfx_format | (gfx_alphaTest << 1) | (fog << 2) | (gfx_alphaBlend << 4) | (colorMask << 5) |
-		(gfx_depthTest << 9) | (gfx_depthWrite << 10) | (cull << 11) | (lines << 12) | (rt << 13);
+		(gfx_depthTest << 9) | (gfx_depthWrite << 10) | (cull << 11) | (lines << 12) | (rt << 13) | (sky << 14);
 }
 
 static cc_bool PrepareDraw(cc_bool lines, cc_bool terrain) {
 	struct VulkanTexture* tex = curTex ? curTex : (struct VulkanTexture*)white_square;
 	cc_bool textured = gfx_format == VERTEX_FORMAT_TEXTURED;
-	cc_bool rt;
+	cc_bool rt, sky;
 	float temporal;
 	VkCommandBuffer cmd;
 	int key;
@@ -2345,14 +2371,18 @@ static cc_bool PrepareDraw(cc_bool lines, cc_bool terrain) {
 	cmd = frame->drawCmd;
 
 	/* No point tracing rays when nothing is written to the colour buffer (e.g. depth only pass) */
-	rt  = terrain && textured && rtActive && frame->tlas && colorMask;
-	key = CalcPipelineKey(lines, rt);
+	/*  The sky only has god rays, so it's only ray traced when they're on */
+	sky = rtSkyDraw && rtActive && frame->tlas && colorMask && rtGodRays && !lines;
+	rt  = (terrain && textured && rtActive && frame->tlas && colorMask) || sky;
+	key = CalcPipelineKey(lines, rt, sky);
 
 	/* Translucent faces (e.g. water) don't use the shadow history, since otherwise they would */
 	/*  replace the history of the faces behind them every frame */
 	temporal = (rt && !gfx_alphaBlend) ? 1.0f : 0.0f;
 	if (temporal != pc.rtTemporal) { pc.rtTemporal = temporal; dirtyConstants = true; }
-	if (rt) { rtDrawn = true; rtFrameMVP = pc.mvp; }
+	if (rt) rtDrawn = true;
+	/* The sky is drawn with a different view matrix (e.g. skybox is centred on the camera) */
+	if (rt && !sky) rtFrameMVP = pc.mvp;
 	if (key != boundPipeline) {
 		if (!pipelines[key]) pipelines[key] = CreatePipeline(key);
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[key]);
@@ -2386,6 +2416,12 @@ static cc_bool PrepareDraw(cc_bool lines, cc_bool terrain) {
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
 								0, 1, &tex->sets[mipmapsOn], 0, NULL);
 		dirtyTexture = false;
+	} else if (rt && !textured) {
+		/* Ray traced shaders always use the texture (for alpha testing), even for the coloured sky */
+		tex = (struct VulkanTexture*)white_square;
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+								0, 1, &tex->sets[mipmapsOn], 0, NULL);
+		dirtyTexture = true;
 	}
 	if (dirtyVb) {
 		vkCmdBindVertexBuffers(cmd, 0, 1, &vbBuffer, &vbOffset);
@@ -2712,6 +2748,8 @@ static void RT_FreeAll(void) {
 	rtPending = NULL; maxRtPending = 0;
 }
 
+void Gfx_SetSkyRendering(cc_bool enabled) { rtSkyDraw = enabled; }
+
 void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, int numCutout) {
 	struct MemAlloc* alloc = (struct MemAlloc*)vb;
 	int i, numRanges = numOpaque + numCutout;
@@ -3000,6 +3038,7 @@ static void RT_BuildTLAS(VkCommandBuffer cmd) {
 	VkDeviceAddress address, tableAddress = 0;
 	struct ChunkRT* rt;
 	cc_uint32 i, flags, base = 0, numGeoms = 0, count = min((cc_uint32)numRtChunks, frame->tlasCapacity);
+	cc_bool inTable, overflow = false;
 
 	for (i = 0; i < count; i++) { numGeoms += rtChunks[i]->numGeoms; }
 	table = (VkDeviceAddress*)Ring_AllocAddress(max(numGeoms, 1) * sizeof(VkDeviceAddress), &tableAddress);
@@ -3021,19 +3060,21 @@ static void RT_BuildTLAS(VkCommandBuffer cmd) {
 
 		/* The custom index is where the instance's geometries start in the table */
 		/*  (if there's no room in the table, cutout geometries are just treated as opaque) */
-		if (table && base < (1u << 24)) {
+		inTable = table && base < (1u << 24);
+		if (inTable) {
 			instances[i].customIndexAndMask = base | (0xFFu << 24);
 			base += RT_FillTable(rt, table + base);
 		} else {
 			instances[i].customIndexAndMask = 0xFFu << 24;
+			overflow = true;
 		}
-		if (!rt->numCutout || !table) flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+		if (!rt->numCutout || !inTable) flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
 		instances[i].sbtOffsetAndFlags = flags << 24;
 		instances[i].accelerationStructureReference = rt->address;
 	}
 	RT_FrameParams()->table = table ? tableAddress : 0;
 	/* Bounced light needs the table to find what was hit */
-	if (!table) RT_FrameParams()->giStrength = 0.0f;
+	if (!table || overflow) RT_FrameParams()->giStrength = 0.0f;
 
 	RT_InitTLASGeometry(&geometry, &build);
 	geometry.geometry.instances.data.deviceAddress = address;
@@ -3075,6 +3116,47 @@ static void RT_RecordBuilds(void) {
 
 /* Blocks in shadow are darkened by the same amount as with classic lighting */
 static float RT_ShadowRatio(int shadow, int sun) { return sun ? min((float)shadow / sun, 1.0f) : 1.0f; }
+
+/* Returns the liquid the camera is inside (same check as for underwater fog), or BLOCK_AIR */
+static BlockID RT_CameraLiquid(void) {
+	Vec3 pos = Camera.CurrentPos;
+	BlockID block;
+	IVec3 coords;
+
+	if (!World.Loaded) return BLOCK_AIR;
+	IVec3_Floor(&coords, &pos);
+	block = World_SafeGetBlock(coords.x, coords.y, coords.z);
+	if (!Blocks.IsLiquid[block] || !Blocks.FogDensity[block]) return BLOCK_AIR;
+
+	if (pos.x < coords.x + Blocks.MinBB[block].x || pos.x > coords.x + Blocks.MaxBB[block].x) return BLOCK_AIR;
+	if (pos.y < coords.y + Blocks.MinBB[block].y || pos.y > coords.y + Blocks.MaxBB[block].y) return BLOCK_AIR;
+	if (pos.z < coords.z + Blocks.MinBB[block].z || pos.z > coords.z + Blocks.MaxBB[block].z) return BLOCK_AIR;
+	return block;
+}
+
+/* Under water, the water scatters much more light than air (mostly forwards), tinted by the */
+/*  water's fog colour, and the shafts are made wavy by moving caustics */
+static void RT_UpdateWater(struct RTParams* p) {
+	BlockID liquid = RT_CameraLiquid();
+	PackedCol fog;
+	float r, g, b, maxC;
+	if (liquid == BLOCK_AIR || Blocks.Draw[liquid] != DRAW_TRANSLUCENT) return;
+
+	fog  = Blocks.FogCol[liquid];
+	r    = (float)PackedCol_R(fog); g = (float)PackedCol_G(fog); b = (float)PackedCol_B(fog);
+	maxC = max(r, max(g, b));
+	if (maxC < 1.0f) maxC = 1.0f;
+
+	p->godDensity   = Blocks.FogDensity[liquid] * 0.6f;
+	Math_Clamp(p->godDensity, 0.02f, 0.15f);
+	p->godG         = 0.7f;
+	p->godRange     = 48.0f;
+	p->godStrength *= 2.5f;
+	p->caustics     = 1.0f;
+	p->scatterR     = p->sunR * (0.3f + 0.7f * r / maxC);
+	p->scatterG     = p->sunG * (0.3f + 0.7f * g / maxC);
+	p->scatterB     = p->sunB * (0.3f + 0.7f * b / maxC);
+}
 
 /* Called at the start of the frame (the GPU has already finished with this frame's parameters) */
 static void RT_UpdateConstants(void) {
@@ -3140,6 +3222,16 @@ static void RT_UpdateConstants(void) {
 	p->godDensity  = RT_GOD_DENSITY;
 	p->godG        = RT_GOD_G;
 	p->godRange    = RT_GOD_RANGE;
+	p->scatterR    = p->sunR;
+	p->scatterG    = p->sunG;
+	p->scatterB    = p->sunB;
+	p->caustics    = 0.0f;
+	RT_UpdateWater(p);
+
+	/* Sky is moved up to stay above the camera (see EnvRenderer_RenderSky) */
+	p->skyDY  = max(Camera.CurrentPos.y + 8.0f, (float)World.Height + 8.0f) - ((float)World.Height + 8.0f);
+	p->skybox = EnvRenderer_ShouldRenderSkybox();
+	p->time   = (float)(Game.Time - 3600.0 * (int)(Game.Time / 3600.0));
 }
 
 /* The shadow history written this frame is only usable next frame if chunks were drawn this frame */

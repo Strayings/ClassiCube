@@ -78,6 +78,8 @@ struct Builder1DPart {
 static int Builder_CasterType(BlockID block) {
 	cc_uint8 draw = Blocks.Draw[block];
 	if (draw == DRAW_TRANSPARENT || draw == DRAW_TRANSPARENT_THICK) return CASTER_CUTOUT;
+	/* Light goes through translucent blocks (e.g. water), so that there are god rays under water */
+	if (draw == DRAW_TRANSLUCENT) return CASTER_NONE;
 	return Blocks.BlocksLight[block] ? CASTER_OPAQUE : CASTER_NONE;
 }
 #endif

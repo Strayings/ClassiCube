@@ -381,6 +381,8 @@ CC_API void Gfx_SetDynamicVbData(GfxResourceID vb, void* vertices, int vCount);
 /*  ranges contains pairs of first vertex and number of vertices, with the ranges of opaque vertices first, */
 /*  followed by the ranges of vertices which only cast shadows where their texture isn't transparent */
 void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, int numCutout);
+/* Sets whether the sky is being drawn (the sky has god rays when using ray traced shadows) */
+void Gfx_SetSkyRendering(cc_bool enabled);
 #endif
 /* Updates the data of a scratch vertex buffer */
 void Gfx_SetScratchVbData(GfxResourceID vb, void* vertices, int vCount);

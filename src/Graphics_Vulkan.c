@@ -153,7 +153,8 @@ struct RTParams {
 	float godStrength, godDensity, godG, godRange; /* God rays (sunlight scattered by the air) */
 	float scatterR, scatterG, scatterB, caustics;   /* Colour of scattered light, and caustics under water */
 	float skyDY; int skybox; float time, _pad4;      /* See EnvRenderer_RenderSky/RenderSkybox */
-	/* Light emitting blocks near the camera (2 vec4s each: position + intensity, colour + faces light gets out of), */
+	/* Light emitting blocks near the camera (3 vec4s each: centre + intensity, colour + faces light gets out of, */
+	/*  half size of the block's box + unused), */
 	/*  and a grid of cells around the camera (offset + count + scale, offset being into the light indices after the cells) */
 	VkDeviceAddress lights, lightGrid;
 	float gridX, gridY, gridZ, invCellSize;
@@ -3252,6 +3253,7 @@ static void RT_BuildLights(struct RTParams* p, cc_uint32 count) {
 	int* light;
 	BlockID block;
 	PackedCol col;
+	Vec3 boxMin, boxMax;
 	float intensity, kept;
 
 	p->numLights = 0;
@@ -3314,7 +3316,7 @@ static void RT_BuildLights(struct RTParams* p, cc_uint32 count) {
 		}
 	}
 
-	lights = (float*)Ring_AllocAddress(numLights * 8 * sizeof(float), &lightsAddr);
+	lights = (float*)Ring_AllocAddress(numLights * 12 * sizeof(float), &lightsAddr);
 	if (!lights) return;
 
 	for (i = 0; i < numLights; i++)
@@ -3324,17 +3326,24 @@ static void RT_BuildLights(struct RTParams* p, cc_uint32 count) {
 		col       = RT_LightColor(block);
 		intensity = max(Blocks.Brightness[block] & 0x0F, Blocks.Brightness[block] >> 4) / 15.0f;
 
-		lights[i * 8 + 0] = light[0] + 0.5f;
-		lights[i * 8 + 1] = light[1] + 0.5f;
-		lights[i * 8 + 2] = light[2] + 0.5f;
-		lights[i * 8 + 3] = intensity;
-		lights[i * 8 + 4] = PackedCol_R(col) / 255.0f;
-		lights[i * 8 + 5] = PackedCol_G(col) / 255.0f;
-		lights[i * 8 + 6] = PackedCol_B(col) / 255.0f;
-		lights[i * 8 + 7] = (float)(light[3] >> 16); /* Faces light gets out of (see Builder_LightFaces) */
+		/* The box of the block as it's drawn (e.g. lava is drawn a bit lower than a full block) */
+		boxMin = Blocks.RenderMinBB[block]; boxMax = Blocks.RenderMaxBB[block];
+
+		lights[i * 12 + 0]  = light[0] + (boxMin.x + boxMax.x) * 0.5f;
+		lights[i * 12 + 1]  = light[1] + (boxMin.y + boxMax.y) * 0.5f;
+		lights[i * 12 + 2]  = light[2] + (boxMin.z + boxMax.z) * 0.5f;
+		lights[i * 12 + 3]  = intensity;
+		lights[i * 12 + 4]  = PackedCol_R(col) / 255.0f;
+		lights[i * 12 + 5]  = PackedCol_G(col) / 255.0f;
+		lights[i * 12 + 6]  = PackedCol_B(col) / 255.0f;
+		lights[i * 12 + 7]  = (float)(light[3] >> 16); /* Faces light gets out of (see Builder_LightFaces) */
+		lights[i * 12 + 8]  = (boxMax.x - boxMin.x) * 0.5f;
+		lights[i * 12 + 9]  = (boxMax.y - boxMin.y) * 0.5f;
+		lights[i * 12 + 10] = (boxMax.z - boxMin.z) * 0.5f;
+		lights[i * 12 + 11] = 0.0f;
 
 		/* How bright the light is overall */
-		rtLightPower[i] = intensity * (0.2126f * lights[i * 8 + 4] + 0.7152f * lights[i * 8 + 5] + 0.0722f * lights[i * 8 + 6]);
+		rtLightPower[i] = intensity * (0.2126f * lights[i * 12 + 4] + 0.7152f * lights[i * 12 + 5] + 0.0722f * lights[i * 12 + 6]);
 	}
 
 	/* Each cell has the most important lights reaching it, and when there are too many lights, their light */

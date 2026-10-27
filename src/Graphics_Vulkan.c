@@ -50,12 +50,15 @@ static const struct DynamicLibSym vk_funcs[] = {
 #define RING_MAX_KEEP    (32 * 1024 * 1024)
 #define RING_MAX_CHUNKS  32
 #define DESC_POOL_SETS   512
-#define PIPELINE_KEYS    32768
+#define PIPELINE_KEYS    131072
+#define KEY_DEPTH_PREPASS (1 << 15) /* See CalcPipelineKey */
+#define KEY_AFTER_PREPASS (1 << 16)
 #define WAIT_FOREVER     ((cc_uint64)-1)
 
 #define GARBAGE_BUFFER  0
 #define GARBAGE_TEXTURE 1
 #define GARBAGE_SCRATCH 2
+#define GARBAGE_RING    3
 
 struct ShaderDesc { const unsigned int* data; int len; };
 
@@ -153,12 +156,11 @@ struct RTParams {
 	float godStrength, godDensity, godG, godRange; /* God rays (sunlight scattered by the air) */
 	float scatterR, scatterG, scatterB, caustics;   /* Colour of scattered light, and caustics under water */
 	float skyDY; int skybox; float time, _pad4;      /* See EnvRenderer_RenderSky/RenderSkybox */
-	/* Light emitting blocks near the camera (3 vec4s each: centre + intensity, colour + faces light gets out of, */
-	/*  half size of the block's box + unused), */
-	/*  and a grid of cells around the camera (offset + count + scale, offset being into the light indices after the cells) */
+	/* Light emitting blocks (3 vec4s each: centre + intensity, colour + faces light gets out of, half size of */
+	/*  the block's box + unused), and a grid of cells covering the world (offset + count, see RT_BuildLights) */
 	VkDeviceAddress lights, lightGrid;
-	float gridX, gridY, gridZ, invCellSize;
-	int gridDim, numLights; float lightStrength, _pad5;
+	float gridW, gridH, gridL, invCellSize; /* Number of cells along each axis */
+	int _pad6, numLights; float lightStrength, _pad5;
 };
 
 static VkInstance instance;
@@ -190,13 +192,16 @@ static struct MemAlloc depthAlloc;
 /* Ray traced shadows/sky light (0) and bounced light (1) of each pixel, which are blended over */
 /*  multiple frames to give smooth results (frame slot i writes to history images [x][i], and reads */
 /*  the previous frame's history images). These are colour attachments 2 and 3 of the render pass */
-#define HISTORY_IMAGES 2
+/* Shadow history, bounced light/god ray history, and picked block light (ReSTIR) */
+#define HISTORY_IMAGES 3
 static VkImage historyImages[HISTORY_IMAGES][FRAMES_IN_FLIGHT];
 /* Whether the history images were just created, and so still need to be transitioned to the right layout */
 static cc_bool historyFresh;
 static VkImageView historyViews[HISTORY_IMAGES][FRAMES_IN_FLIGHT];
 static struct MemAlloc historyAllocs[HISTORY_IMAGES][FRAMES_IN_FLIGHT];
 #define HISTORY_FORMAT VK_FORMAT_R16G16B16A16_SFLOAT
+/* Picked block light needs 32 bit floats, since it includes the light's index */
+#define HistoryFormat(i) ((i) == 2 ? VK_FORMAT_R32G32B32A32_SFLOAT : HISTORY_FORMAT)
 static cc_bool swapchainDirty;
 
 static struct Frame frames[FRAMES_IN_FLIGHT];
@@ -226,6 +231,7 @@ static VkBuffer vbBuffer, ibBuffer;
 static VkDeviceSize vbOffset, ibOffset;
 static struct VulkanTexture* curTex;
 static int boundPipeline;
+static void FlushDeferredDraws(void);
 static cc_bool dirtyViewport, dirtyScissor, dirtyConstants, dirtyTexture, dirtyVb, dirtyIb, dirtyCull;
 static struct Matrix _view, _proj;
 
@@ -251,7 +257,7 @@ static VkDescriptorPool rtDescPool;
 static struct RingChunk rtParams;
 #define RT_PARAMS_STRIDE 512
 #define RT_FrameParams() ((struct RTParams*)(rtParams.data + frameIndex * RT_PARAMS_STRIDE))
-static VkShaderModule vsRtModules[2], fsRtModules[6], fsSkyModules[6];
+static VkShaderModule vsRtModules[2], fsRtModules[6], fsSkyModules[6], fsEarlyModules[3];
 /* Whether the sky is currently being drawn (see Gfx_SetSkyRendering) */
 static cc_bool rtSkyDraw;
 /* Chunks waiting for their BLAS to be built, and chunks which have a BLAS */
@@ -283,6 +289,7 @@ static void RT_FreeChunk(struct ChunkRT* rt);
 static void RT_FreeTLAS(struct Frame* f);
 static void RT_Init(void);
 static void RT_FreeAll(void);
+static void RT_FreeLights(void);
 static void RT_Unlink(struct ChunkRT* rt);
 
 
@@ -662,6 +669,9 @@ static void Garbage_Collect(struct Frame* f) {
 	{
 		if (f->garbage[i].type == GARBAGE_TEXTURE) {
 			FreeTexture((struct VulkanTexture*)f->garbage[i].obj);
+		} else if (f->garbage[i].type == GARBAGE_RING) {
+			RingChunk_Destroy((struct RingChunk*)f->garbage[i].obj);
+			Mem_Free(f->garbage[i].obj);
 		} else if (f->garbage[i].type == GARBAGE_SCRATCH) {
 			alloc = (struct MemAlloc*)f->garbage[i].obj;
 			MemAlloc_Free(&scratchPool, alloc);
@@ -1019,11 +1029,11 @@ static void ChooseFormats(void) {
 /* When ray traced shadows are supported, there's also a 2nd colour attachment for the shadow history */
 /*  (which is cleared at the start of each frame, unless history is false) */
 static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
-	VkAttachmentDescription attachments[4] = { { 0 } };
+	VkAttachmentDescription attachments[5] = { { 0 } };
 	VkSubpassDependency deps[2]       = { { 0 } };
 	VkSubpassDescription subpass      = { 0 };
 	VkRenderPassCreateInfo info       = { 0 };
-	VkAttachmentReference colorRefs[3], depthRef;
+	VkAttachmentReference colorRefs[4], depthRef;
 	VkRenderPass pass;
 	VkResult res;
 
@@ -1055,6 +1065,8 @@ static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
 	/* The next frame reads it in fragment shaders */
 	attachments[2].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	attachments[3] = attachments[2];
+	attachments[4] = attachments[2];
+	attachments[4].format = HistoryFormat(2);
 
 	colorRefs[0].attachment = 0;
 	colorRefs[0].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1062,11 +1074,13 @@ static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
 	colorRefs[1].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	colorRefs[2].attachment = 3;
 	colorRefs[2].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	colorRefs[3].attachment = 4;
+	colorRefs[3].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	depthRef.attachment     = 1;
 	depthRef.layout         = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
 	subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	subpass.colorAttachmentCount    = rtSupported ? 3 : 1;
+	subpass.colorAttachmentCount    = rtSupported ? 4 : 1;
 	subpass.pColorAttachments       = colorRefs;
 	subpass.pDepthStencilAttachment = &depthRef;
 
@@ -1092,7 +1106,7 @@ static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
 	deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
 	info.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-	info.attachmentCount = rtSupported ? 4 : 2;
+	info.attachmentCount = rtSupported ? 5 : 2;
 	info.pAttachments    = attachments;
 	info.subpassCount    = 1;
 	info.pSubpasses      = &subpass;
@@ -1292,6 +1306,9 @@ static void CreateHistoryImages(void) {
 
 	for (i = 0; i < HISTORY_IMAGES; i++)
 	{
+		info.format     = HistoryFormat(i);
+		viewInfo.format = HistoryFormat(i);
+
 		for (j = 0; j < FRAMES_IN_FLIGHT; j++)
 		{
 			res = vkCreateImage(device, &info, NULL, &historyImages[i][j]);
@@ -1348,7 +1365,7 @@ static void CreateSwapchain(void) {
 	VkSemaphoreCreateInfo semInfo  = { 0 };
 	VkSwapchainKHR old = swapchain;
 	VkSurfaceCapabilitiesKHR caps;
-	VkImageView attachments[4];
+	VkImageView attachments[5];
 	cc_uint32 i, j, count;
 	VkResult res;
 
@@ -1416,7 +1433,7 @@ static void CreateSwapchain(void) {
 
 	fbInfo.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
 	fbInfo.renderPass      = renderPass;
-	fbInfo.attachmentCount = rtSupported ? 4 : 2;
+	fbInfo.attachmentCount = rtSupported ? 5 : 2;
 	fbInfo.pAttachments    = attachments;
 	fbInfo.width           = swapExtent.width;
 	fbInfo.height          = swapExtent.height;
@@ -1436,6 +1453,7 @@ static void CreateSwapchain(void) {
 			attachments[1] = depthView;
 			attachments[2] = historyViews[0][j];
 			attachments[3] = historyViews[1][j];
+			attachments[4] = historyViews[2][j];
 			res = vkCreateFramebuffer(device, &fbInfo, NULL, &framebuffers[i][j]);
 			if (res) Process_Abort2(res, "Failed to create Vulkan framebuffer");
 		}
@@ -1484,6 +1502,12 @@ static const struct ShaderDesc fs_rt_descs[] = {
 	{ fs_textured_density_rt,      sizeof(fs_textured_density_rt)      },
 	{ fs_textured_test_density_rt, sizeof(fs_textured_test_density_rt) },
 };
+/* Indexed by fog mode (alpha tested, with early depth testing, see KEY_AFTER_PREPASS) */
+static const struct ShaderDesc fs_early_descs[] = {
+	{ fs_textured_test_early_rt,         sizeof(fs_textured_test_early_rt)         },
+	{ fs_textured_test_linear_early_rt,  sizeof(fs_textured_test_linear_early_rt)  },
+	{ fs_textured_test_density_early_rt, sizeof(fs_textured_test_density_early_rt) },
+};
 /* Indexed by vertex format + fog mode * 2 */
 static const struct ShaderDesc fs_sky_descs[] = {
 	{ fs_colored_sky_rt,          sizeof(fs_colored_sky_rt)          },
@@ -1515,7 +1539,7 @@ static VkShaderModule CreateShader(const struct ShaderDesc* desc) {
 /* Set 1 contains the top level acceleration structure for ray traced shadows (binding 0), */
 /*  struct RTParams (binding 1), and the previous frame's history images (bindings 2 and 3) */
 static void CreateRTDescriptors(void) {
-	VkDescriptorSetLayoutBinding bindings[4] = { { 0 } };
+	VkDescriptorSetLayoutBinding bindings[5] = { { 0 } };
 	VkDescriptorSetLayoutCreateInfo setInfo  = { 0 };
 	VkDescriptorPoolCreateInfo poolInfo      = { 0 };
 	VkDescriptorSetAllocateInfo allocInfo    = { 0 };
@@ -1539,9 +1563,11 @@ static void CreateRTDescriptors(void) {
 	bindings[2].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 	bindings[3] = bindings[2];
 	bindings[3].binding         = 3;
+	bindings[4] = bindings[2];
+	bindings[4].binding         = 4;
 
 	setInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	setInfo.bindingCount = 4;
+	setInfo.bindingCount = 5;
 	setInfo.pBindings    = bindings;
 
 	res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &rtSetLayout);
@@ -1592,6 +1618,7 @@ static void CreateRTDescriptors(void) {
 	for (i = 0; i < Array_Elems(vsRtModules);  i++) vsRtModules[i]  = CreateShader(&vs_rt_descs[i]);
 	for (i = 0; i < Array_Elems(fsRtModules);  i++) fsRtModules[i]  = CreateShader(&fs_rt_descs[i]);
 	for (i = 0; i < Array_Elems(fsSkyModules); i++) fsSkyModules[i] = CreateShader(&fs_sky_descs[i]);
+	for (i = 0; i < Array_Elems(fsEarlyModules); i++) fsEarlyModules[i] = CreateShader(&fs_early_descs[i]);
 }
 
 static void CreatePipelineObjects(void) {
@@ -1678,6 +1705,7 @@ static void DestroyPipelineObjects(void) {
 	if (!rtSupported) return;
 	for (i = 0; i < Array_Elems(vsRtModules);  i++) vkDestroyShaderModule(device, vsRtModules[i],  NULL);
 	for (i = 0; i < Array_Elems(fsRtModules);  i++) vkDestroyShaderModule(device, fsRtModules[i],  NULL);
+	for (i = 0; i < Array_Elems(fsEarlyModules); i++) vkDestroyShaderModule(device, fsEarlyModules[i], NULL);
 	for (i = 0; i < Array_Elems(fsSkyModules); i++) vkDestroyShaderModule(device, fsSkyModules[i], NULL);
 	vkDestroyDescriptorPool(device, rtDescPool, NULL);
 	vkDestroyDescriptorSetLayout(device, rtSetLayout, NULL);
@@ -1696,13 +1724,14 @@ static VkPipeline CreatePipeline(int key) {
 	VkPipelineRasterizationStateCreateInfo raster        = { 0 };
 	VkPipelineMultisampleStateCreateInfo multisample     = { 0 };
 	VkPipelineDepthStencilStateCreateInfo depth          = { 0 };
-	VkPipelineColorBlendAttachmentState blendAttachments[3] = { { 0 } };
+	VkPipelineColorBlendAttachmentState blendAttachments[4] = { { 0 } };
 	VkPipelineColorBlendStateCreateInfo blend            = { 0 };
 	VkPipelineDynamicStateCreateInfo dynamic             = { 0 };
 	VkGraphicsPipelineCreateInfo info                    = { 0 };
 	VkPipeline pipeline;
 	VkResult res;
 	int fmt = key & 1, rt = (key >> 13) & 1, sky = (key >> 14) & 1;
+	cc_bool prepass = (key & KEY_DEPTH_PREPASS) != 0, afterPrepass = (key & KEY_AFTER_PREPASS) != 0;
 
 	stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
 	stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
@@ -1714,6 +1743,13 @@ static VkPipeline CreatePipeline(int key) {
 	/*  (or for the sky, which can be coloured or textured) */
 	if (sky) {
 		stages[1].module = fsSkyModules[fmt + ((key >> 2) & 3) * 2];
+	} else if (afterPrepass && (key & 0x02)) {
+		/* Alpha tested, but with depth testing before the shader runs */
+		stages[1].module = fsEarlyModules[(key >> 2) & 3];
+	} else if (prepass) {
+		/* Only depth is written, so just alpha testing is needed (but with the same vertex shader as */
+		/*  the ray traced pass, so that both passes produce exactly the same depth) */
+		stages[1].module = fsModules[key & 0x03];
 	} else {
 		stages[1].module = rt ? fsRtModules[((key >> 1) & 1) + ((key >> 2) & 3) * 2] : fsModules[key & 0x0F];
 	}
@@ -1753,6 +1789,11 @@ static VkPipeline CreatePipeline(int key) {
 	depth.depthWriteEnable = (key >> 10) & 1;
 	/* Reversed depth buffer, same as Direct3D11 backend */
 	depth.depthCompareOp   = VK_COMPARE_OP_GREATER_OR_EQUAL;
+	/* After the depth pre-pass, only the closest faces are drawn */
+	if (afterPrepass) {
+		depth.depthWriteEnable = 0;
+		depth.depthCompareOp   = VK_COMPARE_OP_EQUAL;
+	}
 
 	blendAttachments[0].blendEnable         = (key >> 4) & 1;
 	blendAttachments[0].srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
@@ -1764,13 +1805,15 @@ static VkPipeline CreatePipeline(int key) {
 	blendAttachments[0].colorWriteMask      = (key >> 5) & 0x0F;
 
 	/* Only opaque chunk faces write to the history images (see PrepareDraw) */
-	if (rt && !blendAttachments[0].blendEnable && blendAttachments[0].colorWriteMask) {
+	if (rt && !prepass && !blendAttachments[0].blendEnable && blendAttachments[0].colorWriteMask) {
 		blendAttachments[1].colorWriteMask = 0x0F;
 		blendAttachments[2].colorWriteMask = 0x0F;
+		blendAttachments[3].colorWriteMask = 0x0F;
 	}
+	if (prepass) blendAttachments[0].colorWriteMask = 0;
 
 	blend.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-	blend.attachmentCount = rtSupported ? 3 : 1;
+	blend.attachmentCount = rtSupported ? 4 : 1;
 	blend.pAttachments    = blendAttachments;
 
 	dynamic.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
@@ -2279,8 +2322,85 @@ void Gfx_BindDynamicVb(GfxResourceID vb) {
 /*########################################################################################################################*
 *------------------------------------------------------Vertex drawing-----------------------------------------------------*
 *#########################################################################################################################*/
+/*########################################################################################################################*
+*------------------------------------------------------Depth pre-pass-----------------------------------------------------*
+*#########################################################################################################################*/
+/* Ray traced chunk faces are expensive to draw, so they are first only drawn to the depth buffer, and then drawn */
+/*  again with the ray traced shader afterwards, but only where they're the closest face (i.e. depth is equal). */
+/*  Otherwise e.g. every layer of leaves in a tree would trace rays, even though only the closest one is seen */
+/* The ray traced draws are recorded and then drawn just before the next draw that isn't a ray traced chunk face */
+struct DeferredDraw {
+	VkBuffer vb, ib;
+	VkDeviceSize vbOffset, ibOffset;
+	VkDescriptorSet texSet;
+	int key, indices, startVertex;
+	cc_bool cull;
+	struct PushConstants pc;
+};
+static struct DeferredDraw* deferredDraws;
+static int numDeferred, maxDeferred;
+static struct DeferredDraw curDeferred;
+static cc_bool deferringDraw;
+
+static void AddDeferredDraw(int indices, int startVertex) {
+	if (numDeferred == maxDeferred) {
+		maxDeferred   = maxDeferred ? maxDeferred * 2 : 1024;
+		deferredDraws = deferredDraws ?
+			(struct DeferredDraw*)Mem_Realloc(deferredDraws, maxDeferred, sizeof(struct DeferredDraw), "Vulkan deferred draws") :
+			(struct DeferredDraw*)Mem_Alloc(maxDeferred, sizeof(struct DeferredDraw), "Vulkan deferred draws");
+	}
+	curDeferred.indices     = indices;
+	curDeferred.startVertex = startVertex;
+	deferredDraws[numDeferred++] = curDeferred;
+}
+
+static void FlushDeferredDraws(void) {
+	VkCommandBuffer cmd = frame->drawCmd;
+	struct DeferredDraw* d;
+	struct DeferredDraw* prev = NULL;
+	int i;
+	if (!numDeferred) return;
+
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 1, 1, &frame->rtSet, 0, NULL);
+	for (i = 0; i < numDeferred; i++, prev = d)
+	{
+		d = &deferredDraws[i];
+		if (!prev || d->key != prev->key) {
+			if (!pipelines[d->key]) pipelines[d->key] = CreatePipeline(d->key);
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[d->key]);
+		}
+		if (!prev || d->texSet != prev->texSet) {
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &d->texSet, 0, NULL);
+		}
+		if (!prev || d->vb != prev->vb || d->vbOffset != prev->vbOffset) {
+			vkCmdBindVertexBuffers(cmd, 0, 1, &d->vb, &d->vbOffset);
+		}
+		if (!prev || d->ib != prev->ib || d->ibOffset != prev->ibOffset) {
+			vkCmdBindIndexBuffer(cmd, d->ib, d->ibOffset, VK_INDEX_TYPE_UINT16);
+		}
+		if (!prev || !Mem_Equal(&d->pc, &prev->pc, sizeof(d->pc))) {
+			vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+								0, sizeof(d->pc), &d->pc);
+		}
+		if (dynamicCull && (!prev || d->cull != prev->cull)) {
+			vkCmdSetCullModeEXT(cmd, d->cull ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE);
+		}
+		vkCmdDrawIndexed(cmd, d->indices, 1, 0, d->startVertex, 0);
+	}
+	numDeferred = 0;
+
+	/* The state above has replaced whatever was bound before */
+	boundPipeline  = -1;
+	dirtyConstants = true;
+	dirtyTexture   = true;
+	dirtyVb        = true;
+	dirtyIb        = true;
+	dirtyCull      = true;
+}
+
 /* Bound state is lost when starting a new command buffer */
 static void InvalidateState(void) {
+	numDeferred    = 0;
 	boundPipeline  = -1;
 	dirtyViewport  = true;
 	dirtyScissor   = true;
@@ -2294,7 +2414,7 @@ static void InvalidateState(void) {
 
 static void BeginRenderPass(VkRenderPass pass) {
 	VkRenderPassBeginInfo info = { 0 };
-	VkClearValue clears[4]     = { { { { 0 } } } };
+	VkClearValue clears[5]     = { { { { 0 } } } };
 	BeginCmd(frame->drawCmd);
 	drawBegun = true;
 	InvalidateState();
@@ -2307,7 +2427,7 @@ static void BeginRenderPass(VkRenderPass pass) {
 	info.renderPass        = pass;
 	info.framebuffer       = framebuffers[imageIndex][rtSupported ? frameIndex : 0];
 	info.renderArea.extent = swapExtent;
-	info.clearValueCount   = rtSupported ? 4 : 0;
+	info.clearValueCount   = rtSupported ? 5 : 0;
 	info.pClearValues      = clears;
 
 	/* Swapchain recreation happens before this (see AcquireImage), so the images can't be destroyed */
@@ -2361,7 +2481,8 @@ static cc_bool EnsureRenderPass(void) {
 
 /* Bit 0 = format, 1 = alpha test, 2-3 = fog, 4 = blending, 5-8 = colour mask, */
 /*  9 = depth test, 10 = depth write, 11 = culling (only without dynamic cull mode), */
-/*  12 = lines, 13 = ray traced shadows, 14 = ray traced sky */
+/*  12 = lines, 13 = ray traced shadows, 14 = ray traced sky, */
+/*  15 = depth pre-pass of ray traced chunk faces, 16 = ray traced chunk faces after depth pre-pass */
 static int CalcPipelineKey(cc_bool lines, cc_bool rt, cc_bool sky) {
 	int fog = 0, cull = dynamicCull ? 0 : cullFaces;
 	if (gfx_fogEnabled && gfx_fogMode >= 0) fog = gfx_fogMode == FOG_LINEAR ? 1 : 2;
@@ -2389,6 +2510,17 @@ static cc_bool PrepareDraw(cc_bool lines, cc_bool terrain) {
 	sky = rtSkyDraw && rtActive && frame->tlas && colorMask && rtGodRays && !lines;
 	rt  = (terrain && textured && rtActive && frame->tlas && colorMask) || sky;
 	key = CalcPipelineKey(lines, rt, sky);
+
+	/* Opaque ray traced chunk faces are drawn to the depth buffer now, and with the ray traced shader later */
+	deferringDraw = rt && !sky && !gfx_alphaBlend && gfx_depthTest && gfx_depthWrite;
+	if (!deferringDraw) FlushDeferredDraws();
+	if (deferringDraw) {
+		/* Still alpha tested, since two faces can be in exactly the same place (e.g. between two leaf blocks), */
+		/*  and the closest depth there might have come from the other face (the alpha tested shaders used */
+		/*  after the pre-pass do depth testing before running, so hidden faces still never run them) */
+		curDeferred.key = (key & ~(1 << 10)) | KEY_AFTER_PREPASS;
+		key |= KEY_DEPTH_PREPASS;
+	}
 
 	/* Translucent faces (e.g. water) don't use the shadow history, since otherwise they would */
 	/*  replace the history of the faces behind them every frame */
@@ -2448,6 +2580,16 @@ static cc_bool PrepareDraw(cc_bool lines, cc_bool terrain) {
 		vkCmdBindIndexBuffer(cmd, ibBuffer, ibOffset, VK_INDEX_TYPE_UINT16);
 		dirtyIb = false;
 	}
+
+	if (deferringDraw) {
+		curDeferred.vb       = vbBuffer;
+		curDeferred.vbOffset = vbOffset;
+		curDeferred.ib       = ibBuffer;
+		curDeferred.ibOffset = ibOffset;
+		curDeferred.texSet   = tex->sets[mipmapsOn];
+		curDeferred.cull     = cullFaces;
+		curDeferred.pc       = pc;
+	}
 	return true;
 }
 
@@ -2476,6 +2618,7 @@ void Gfx_DrawVb_IndexedTris_Range(int verticesCount, int startVertex, DrawHints 
 void Gfx_DrawIndexedTris_T2fC4b(int verticesCount, int startVertex, DrawHints hints) {
 	if (!PrepareDraw(false, true)) return;
 	vkCmdDrawIndexed(frame->drawCmd, ICOUNT(verticesCount), 1, 0, startVertex, 0);
+	if (deferringDraw) AddDeferredDraw(ICOUNT(verticesCount), startVertex);
 }
 
 
@@ -2544,6 +2687,7 @@ void Gfx_DisableTextureOffset(void) {
 /* Negative height flips the viewport vertically, so the same projection matrices as */
 /*  Direct3D can be used (since Vulkan clip space Y points down instead of up) */
 void Gfx_SetViewport(int x, int y, int w, int h) {
+	FlushDeferredDraws();
 	viewport.x        = (float)x;
 	viewport.y        = (float)(y + h);
 	viewport.width    = (float)w;
@@ -2554,6 +2698,7 @@ void Gfx_SetViewport(int x, int y, int w, int h) {
 }
 
 void Gfx_SetScissor(int x, int y, int w, int h) {
+	FlushDeferredDraws();
 	scissor.offset.x      = max(x, 0);
 	scissor.offset.y      = max(y, 0);
 	scissor.extent.width  = max(w, 0);
@@ -2630,6 +2775,7 @@ void Gfx_ClearBuffers(GfxBuffers buffers) {
 	cc_uint32 count = 0;
 
 	if (!EnsureRenderPass()) return;
+	FlushDeferredDraws();
 
 	if (buffers & GFX_BUFFER_COLOR) {
 		attachments[count].aspectMask      = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2692,7 +2838,7 @@ static const float rtSunAngle_Degrees[]  = { 20.0f, 40.0f, 60.0f, 90.0f };
 static const float rtShadowDist_Blocks[] = { 64.0f, 128.0f, 256.0f, 4096.0f };
 /* Angular radius of the sun's disc (the real sun is about 0.27 degrees), and how many points on the disc */
 /*  each pixel cycles through over multiple frames (one ray per frame) */
-static const float rtSoftness_Degrees[] = { 0.0f, 2.0f, 4.0f, 8.0f };
+static const float rtSoftness_Degrees[] = { 0.0f, 1.0f, 2.0f, 4.0f };
 static const int   rtSoftness_Samples[] = { 1, 32, 64, 64 };
 /* How many frames of shadows and sky light are blended together */
 #define RT_MAX_HISTORY 32.0f
@@ -2740,8 +2886,10 @@ static void RT_ListRemove(struct ChunkRT** list, int* count, struct ChunkRT* rt)
 
 /* Called when a chunk's VB is deleted. The BLAS is destroyed later in Garbage_Collect, */
 /*  since the GPU might still be using it in a frame that hasn't finished rendering yet */
+static void RT_LightsChanged(void);
 static void RT_Unlink(struct ChunkRT* rt) {
 	if (rt->listIndex < 0) return;
+	if (rt->numLights) RT_LightsChanged();
 
 	if (!rt->numRanges) {
 		RT_ListRemove(rtLightOnly, &numRtLightOnly, rt);
@@ -2773,6 +2921,7 @@ static void RT_FreeAll(void) {
 	rtChunks    = NULL; maxRtChunks    = 0;
 	rtPending   = NULL; maxRtPending   = 0;
 	rtLightOnly = NULL; maxRtLightOnly = 0;
+	RT_FreeLights();
 }
 
 void Gfx_SetSkyRendering(cc_bool enabled) { rtSkyDraw = enabled; }
@@ -2793,6 +2942,7 @@ void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, in
 		if (rt->lights) {
 			Mem_Copy(rt->lights, lights, numLights * 4 * sizeof(int));
 			rt->numLights = numLights;
+			RT_LightsChanged();
 		}
 	}
 
@@ -2870,7 +3020,7 @@ static void RT_InitTLASGeometry(VkAccelerationStructureGeometryKHR* geometry, Vk
 
 	build->sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
 	build->type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-	build->flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+	build->flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
 	build->mode          = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
 	build->geometryCount = 1;
 	build->pGeometries   = geometry;
@@ -3119,66 +3269,87 @@ static PackedCol RT_LightColor(BlockID block) {
 	return rtLightCols[block];
 }
 
-/* Lights within this many blocks of the camera (along each axis) are used, nearest first. Like the grids */
-/*  big games use for lots of lights (e.g. clipmaps, or RTXDI's "onion" grid), the grid around the camera */
-/*  has multiple levels, with each level's cells being twice the size of the previous level's, so far away */
-/*  lights are still used without needing many more cells (and each point still only traces one light ray) */
-#define RT_LIGHT_GRID      12   /* Cells along each axis of each level of the grid */
-#define RT_LIGHT_CELL      8    /* Size of each cell of the first level in blocks */
-#define RT_LIGHT_LEVELS    4    /* NOTE: Must match LIGHT_LEVELS in misc/vulkan/VulkanShaderGen.c */
+/* Light emitting blocks are kept in a grid of cells covering the whole world. Each cell has a list of the lights */
+/*  that reach it, with the most important lights for the cell first (see the shader for how it's used). Like the */
+/*  sections Radiance uses for block lights, the grid is in world space, so it only has to be rebuilt when lights */
+/*  change, rather than every frame */
+#define RT_LIGHT_CELL      8    /* Size of each cell in blocks */
 #define RT_LIGHT_REACH     16   /* How far light from a block reaches (NOTE: must match FLOAT_INV_REACH2) */
-#define RT_LIGHTS_PER_CELL 16
-#define RT_MAX_LIGHTS      4096
-#define RT_LIGHT_MAX_CELL  (RT_LIGHT_CELL << (RT_LIGHT_LEVELS - 1))
-#define RT_LIGHT_RANGE     ((RT_LIGHT_GRID / 2 + 1) * RT_LIGHT_MAX_CELL + RT_LIGHT_REACH)
-#define RT_LIGHT_CELLS     (RT_LIGHT_GRID * RT_LIGHT_GRID * RT_LIGHT_GRID)
-#define RT_LIGHT_ALL_CELLS (RT_LIGHT_CELLS * RT_LIGHT_LEVELS)
-#define RT_CELL_HEADER     3    /* Offset, count, scale */
+#define RT_LIGHTS_PER_CELL 16   /* NOTE: Must match LIGHTS_PER_CELL in misc/vulkan/VulkanShaderGen.c */
+#define RT_MAX_LIGHTS      65536 /* (when there are more, the lights nearest to the camera are used) */
+#define RT_MAX_LIGHT_ENTRIES (16 * 1024 * 1024)
+/* After lights change, the grid is rebuilt after waiting at least this many seconds (and 10 times as long as */
+/*  the last rebuild took), so that e.g. loading lots of chunks or flowing lava doesn't rebuild it every frame */
+#define RT_LIGHTS_DELAY    0.25
+/* When there are more than RT_MAX_LIGHTS lights, the grid is rebuilt when the camera moves this far */
+#define RT_LIGHTS_MOVE     32
 
-/* Where a level of the grid starts, the size of its cells, and the range of its cells along each axis */
-/*  that are entirely inside the previous level (which are never used, since points there use that level) */
-struct RTLightLevel { int origin[3], size, innerLo[3], innerHi[3]; };
+static struct RingChunk* rtLightData; /* Lights, then the grid */
+static VkDeviceSize rtLightGridOffset;
+static int rtNumLights, rtGridCells[3]; /* Cells along each axis of the grid in rtLightData */
+static int rtLightCells[3];             /* Cells along each axis of the grid being built */
+static cc_bool rtLightsDirty = true, rtLightsCapped;
+static double rtLightsChangedTime, rtLightsDelay = RT_LIGHTS_DELAY;
+static int rtLightsCam[3];
+static void* rtLightsAtlas;
 
-static int rtLightSorted[RT_MAX_LIGHTS * 4];
-static float rtLightPower[RT_MAX_LIGHTS];
-static int rtLightBuckets[RT_LIGHT_RANGE + 2];
-/* The most important lights reaching each cell (in no particular order), and their importance */
-static int   rtCellLights[RT_LIGHT_ALL_CELLS * RT_LIGHTS_PER_CELL];
-static float rtCellWeights[RT_LIGHT_ALL_CELLS * RT_LIGHTS_PER_CELL];
-static int   rtCellCounts[RT_LIGHT_ALL_CELLS];
-static float rtCellTotals[RT_LIGHT_ALL_CELLS];
+/* Temp data while building the grid */
+static int*   rtLightsRaw;
+static float* rtLightPower;
+static int*   rtCellStart;
+static int*   rtCellCount;
+static int*   rtEntries;
+static float* rtEntryWeights;
+static int maxLightsRaw, maxLightPower, maxCellStart, maxCellCount, maxEntries, maxEntryWeights;
 
-static int RT_LightDistance(const int* light, const int* cam) {
-	return max(Math_AbsI(light[0] - cam[0]), max(Math_AbsI(light[1] - cam[1]), Math_AbsI(light[2] - cam[2])));
+static void RT_LightsChanged(void) {
+	if (!rtLightsDirty) rtLightsChangedTime = Game.Time;
+	rtLightsDirty = true;
 }
 
-/* Whether any lights of a chunk might be near the camera (a chunk's lights are all in the same 16x16x16 area) */
-static cc_bool RT_ChunkLightsInRange(const struct ChunkRT* rt, const int* cam) {
-	int i, min, d = 0;
-	if (!rt->numLights) return false;
+static void RT_FreeLights(void) {
+	if (rtLightData) { RingChunk_Destroy(rtLightData); Mem_Free(rtLightData); }
+	rtLightData = NULL;
+	rtNumLights = 0;
 
-	for (i = 0; i < 3; i++)
-	{
-		min = rt->lights[i] & ~(CHUNK_SIZE - 1);
-		d   = max(d, max(min - cam[i], cam[i] - (min + CHUNK_SIZE - 1)));
-	}
-	return d <= RT_LIGHT_RANGE;
+	Mem_Free(rtLightsRaw);    rtLightsRaw    = NULL; maxLightsRaw    = 0;
+	Mem_Free(rtLightPower);   rtLightPower   = NULL; maxLightPower   = 0;
+	Mem_Free(rtCellStart);    rtCellStart    = NULL; maxCellStart    = 0;
+	Mem_Free(rtCellCount);    rtCellCount    = NULL; maxCellCount    = 0;
+	Mem_Free(rtEntries);      rtEntries      = NULL; maxEntries      = 0;
+	Mem_Free(rtEntryWeights); rtEntryWeights = NULL; maxEntryWeights = 0;
+	rtLightsDirty = true;
 }
 
-/* Finds the cells of a level of the grid that a light at x/y/z reaches */
-static cc_bool RT_LightCells(const int* light, const struct RTLightLevel* l, int* lo, int* hi) {
-	int i, lowE, highE;
+/* Makes sure the temp array has room for count elements (keeps its contents) */
+static cc_bool RT_EnsureTemp(void** data, int* max, int count, int elemSize) {
+	void* mem;
+	if (count <= *max) return true;
+
+	/* (Windows doesn't support reallocating NULL) */
+	mem = *data ? Mem_TryRealloc(*data, count, elemSize) : Mem_TryAlloc(count, elemSize);
+	if (!mem) return false;
+	*data = mem; *max = count;
+	return true;
+}
+
+/* Finds the cells that light from the light at the given position reaches (false if none) */
+static cc_bool RT_LightCells(const float* pos, int* lo, int* hi) {
+	int i, block;
 	for (i = 0; i < 3; i++)
 	{
-		lowE  = light[i] - RT_LIGHT_REACH     - l->origin[i];
-		highE = light[i] + RT_LIGHT_REACH + 1 - l->origin[i];
-		if (highE < 0 || lowE >= RT_LIGHT_GRID * l->size) return false;
+		block = (int)Math_Floor(pos[i]);
+		lo[i] = block - RT_LIGHT_REACH;
+		hi[i] = block + RT_LIGHT_REACH + 1;
+		if (hi[i] < 0 || lo[i] >= rtLightCells[i] * RT_LIGHT_CELL) return false;
 
-		lo[i] = lowE < 0 ? 0 : lowE / l->size;
-		hi[i] = min(highE / l->size, RT_LIGHT_GRID - 1);
+		lo[i] = lo[i] < 0 ? 0 : lo[i] / RT_LIGHT_CELL;
+		hi[i] = min(hi[i] / RT_LIGHT_CELL, rtLightCells[i] - 1);
 	}
 	return true;
 }
+
+#define RT_CellIndex(x, y, z) (((y) * rtLightCells[2] + (z)) * rtLightCells[0] + (x))
 
 /* Distance along an axis from p to the range min to min + size */
 static float RT_AxisDistance(float p, int min, int size) {
@@ -3187,141 +3358,167 @@ static float RT_AxisDistance(float p, int min, int size) {
 	return 0.0f;
 }
 
-/* Keeps the light if it's one of the most important lights reaching the cell */
-static void RT_KeepLight(int cell, int index, float weight) {
-	int* lights    = &rtCellLights[cell * RT_LIGHTS_PER_CELL];
-	float* weights = &rtCellWeights[cell * RT_LIGHTS_PER_CELL];
-	int i, n = rtCellCounts[cell], least = 0;
+/* How much light a light gives to (the closest point of) a cell, ignoring shadows (the same as the shader: */
+/*  brightness * window / (1 + distance^2)). Lights closer to the centre of the cell are slightly more */
+/*  important, so that the most important lights of a cell are the closest ones when e.g. lots are inside it */
+static float RT_LightImportance(int index, const float* light, int x, int y, int z) {
+	float dx = RT_AxisDistance(light[0], x * RT_LIGHT_CELL, RT_LIGHT_CELL);
+	float dy = RT_AxisDistance(light[1], y * RT_LIGHT_CELL, RT_LIGHT_CELL);
+	float dz = RT_AxisDistance(light[2], z * RT_LIGHT_CELL, RT_LIGHT_CELL);
+	float d2 = dx * dx + dy * dy + dz * dz;
+	float q  = d2 / (RT_LIGHT_REACH * RT_LIGHT_REACH);
+	float window = 1.0f - q * q, cx, cy, cz;
 
-	rtCellTotals[cell] += weight;
-	if (n < RT_LIGHTS_PER_CELL) {
-		lights[n] = index; weights[n] = weight;
-		rtCellCounts[cell]++; return;
-	}
-
-	/* Replace the least important light, if this light is more important than it */
-	for (i = 1; i < RT_LIGHTS_PER_CELL; i++)
-	{
-		if (weights[i] < weights[least]) least = i;
-	}
-	if (weight <= weights[least]) return;
-	lights[least] = index; weights[least] = weight;
+	if (window <= 0.0f) return 0.0f;
+	cx = light[0] - (x + 0.5f) * RT_LIGHT_CELL;
+	cy = light[1] - (y + 0.5f) * RT_LIGHT_CELL;
+	cz = light[2] - (z + 0.5f) * RT_LIGHT_CELL;
+	return rtLightPower[index] * window * window / (1.0f + d2) / (1.0f + 0.01f * (cx * cx + cy * cy + cz * cz));
 }
 
-/* Adds the light to every cell (of every level) it reaches, weighted by how important it is to the cell */
-/*  (i.e. brightness / (1 + distance to the cell^2)). Cells entirely inside the previous level are skipped */
-static void RT_AddLightToCells(int index, const int* light, const struct RTLightLevel* levels) {
-	const struct RTLightLevel* l;
-	int lo[3], hi[3], x, y, z, L, cell;
-	float dx, dy, dz, power = rtLightPower[index];
-	cc_bool innerYZ;
+/* Moves the most important lights of a cell to the start of its list (most important first), keeping the */
+/*  order of the others. Weights must be more than 0 */
+static void RT_SortCell(int* entries, float* weights, int count) {
+	int top[RT_LIGHTS_PER_CELL], topE[RT_LIGHTS_PER_CELL];
+	float topW[RT_LIGHTS_PER_CELL];
+	int i, j, numTop = 0;
 
-	for (L = 0; L < RT_LIGHT_LEVELS; L++)
+	/* Find the most important lights in one pass (top is kept sorted, most important first) */
+	for (i = 0; i < count; i++)
 	{
-		l = &levels[L];
-		if (!RT_LightCells(light, l, lo, hi)) continue;
+		if (numTop == RT_LIGHTS_PER_CELL && weights[i] <= weights[top[RT_LIGHTS_PER_CELL - 1]]) continue;
 
-		for (y = lo[1]; y <= hi[1]; y++)
+		j = numTop < RT_LIGHTS_PER_CELL ? numTop++ : RT_LIGHTS_PER_CELL - 1;
+		for (; j > 0 && weights[top[j - 1]] < weights[i]; j--) { top[j] = top[j - 1]; }
+		top[j] = i;
+	}
+
+	/* Take them out of the list, then move the others to the end of the list (from the back, so nothing */
+	/*  is overwritten before it's moved), then put them at the start */
+	for (i = 0; i < numTop; i++)
+	{
+		topE[i] = entries[top[i]];
+		topW[i] = weights[top[i]];
+		weights[top[i]] = -1.0f;
+	}
+	for (i = count - 1, j = count - 1; i >= 0; i--)
+	{
+		if (weights[i] < 0.0f) continue;
+		entries[j] = entries[i]; weights[j] = weights[i]; j--;
+	}
+	for (i = 0; i < numTop; i++)
+	{
+		entries[i] = topE[i]; weights[i] = topW[i];
+	}
+}
+
+/* Copies (up to max of) every light in every chunk, whether or not its BLAS has been built yet. */
+/*  Returns how many lights there are in total (which may be more than max) */
+static int RT_GatherLights(int* lights, int max) {
+	struct ChunkRT** lists[3];
+	int counts[3], i, j, k, n = 0;
+	struct ChunkRT* rt;
+
+	lists[0] = rtChunks;    counts[0] = numRtChunks;
+	lists[1] = rtPending;   counts[1] = numRtPending;
+	lists[2] = rtLightOnly; counts[2] = numRtLightOnly;
+
+	for (k = 0; k < 3; k++)
+	{
+		for (i = 0; i < counts[k]; i++)
 		{
-			dy = RT_AxisDistance(light[1] + 0.5f, l->origin[1] + y * l->size, l->size);
-			for (z = lo[2]; z <= hi[2]; z++)
+			rt = lists[k][i];
+			for (j = 0; j < rt->numLights; j++, n++)
 			{
-				dz = RT_AxisDistance(light[2] + 0.5f, l->origin[2] + z * l->size, l->size);
-				innerYZ = y >= l->innerLo[1] && y <= l->innerHi[1] && z >= l->innerLo[2] && z <= l->innerHi[2];
-
-				for (x = lo[0]; x <= hi[0]; x++)
-				{
-					if (innerYZ && x >= l->innerLo[0] && x <= l->innerHi[0]) continue;
-					dx   = RT_AxisDistance(light[0] + 0.5f, l->origin[0] + x * l->size, l->size);
-					cell = L * RT_LIGHT_CELLS + (y * RT_LIGHT_GRID + z) * RT_LIGHT_GRID + x;
-					RT_KeepLight(cell, index, power / (1.0f + dx * dx + dy * dy + dz * dz));
-				}
+				if (lights && n < max) Mem_Copy(&lights[n * 4], &rt->lights[j * 4], 4 * sizeof(int));
 			}
 		}
 	}
+	return n;
 }
 
-/* Gathers the light emitting blocks near the camera, and which lights reach each cell of the grid */
-static void RT_BuildLights(struct RTParams* p, cc_uint32 count) {
-	struct RTLightLevel levels[RT_LIGHT_LEVELS];
-	struct RTLightLevel* l;
-	int cam[3], i, j, L, d, numLights, total, cell, n;
-	struct ChunkRT* rt;
-	VkDeviceAddress lightsAddr, gridAddr;
-	float* lights;
-	int* grid;
-	int* light;
-	BlockID block;
-	PackedCol col;
-	Vec3 boxMin, boxMax;
-	float intensity, kept;
+static int RT_CameraDistance(const int* light, const int* cam) {
+	return max(Math_AbsI(light[0] - cam[0]), max(Math_AbsI(light[1] - cam[1]), Math_AbsI(light[2] - cam[2])));
+}
 
-	p->numLights = 0;
-	if (!rtBlockLights) return;
+/* Keeps only the RT_MAX_LIGHTS lights nearest to the camera (in the same order), returning how many are kept */
+static int RT_KeepNearestLights(int* lights, int count, const int* cam) {
+	int maxDist = max(World.Width, max(World.Height, World.Length)) * 2;
+	int* buckets = (int*)Mem_TryAllocCleared(maxDist + 1, sizeof(int));
+	int i, d, cut, kept = 0, extra, n = 0;
+	if (!buckets) return RT_MAX_LIGHTS;
 
+	for (i = 0; i < count; i++)
+	{
+		buckets[min(RT_CameraDistance(&lights[i * 4], cam), maxDist)]++;
+	}
+	/* Lights closer than cut are all kept, then as many as fit at distance cut */
+	for (cut = 0; cut < maxDist && kept + buckets[cut] <= RT_MAX_LIGHTS; cut++) { kept += buckets[cut]; }
+	extra = RT_MAX_LIGHTS - kept;
+	Mem_Free(buckets);
+
+	for (i = 0; i < count; i++)
+	{
+		d = min(RT_CameraDistance(&lights[i * 4], cam), maxDist);
+		if (d > cut || (d == cut && extra-- <= 0)) continue;
+		if (n != i) Mem_Copy(&lights[n * 4], &lights[i * 4], 4 * sizeof(int));
+		n++;
+	}
+	return n;
+}
+
+static void RT_CameraBlock(int* cam) {
 	cam[0] = (int)Math_Floor(Camera.CurrentPos.x);
 	cam[1] = (int)Math_Floor(Camera.CurrentPos.y);
 	cam[2] = (int)Math_Floor(Camera.CurrentPos.z);
+}
 
-	/* Each level is centred on the cell (of that level) containing the camera */
-	/* NOTE: The shader works out where each level starts the same way */
-	for (L = 0; L < RT_LIGHT_LEVELS; L++)
-	{
-		l       = &levels[L];
-		l->size = RT_LIGHT_CELL << L;
+/* Rebuilds the light data and grid from every light in the world */
+/*  (if anything fails, RT_LightsChanged is called so that it's tried again later) */
+static void RT_RebuildLights(void) {
+	struct RingChunk* data;
+	int lo[3], hi[3], x, y, z, i, n, cell, total, numLights, numCells, numEntries;
+	int* light;
+	float* lights;
+	int* grid;
+	BlockID block;
+	PackedCol col;
+	Vec3 boxMin, boxMax;
+	float intensity, imp, sum;
+	VkDeviceSize lightsSize, size;
 
-		for (i = 0; i < 3; i++)
-		{
-			l->origin[i] = (int)Math_Floor((float)cam[i] / l->size) * l->size - (RT_LIGHT_GRID / 2) * l->size;
-			if (!L) { l->innerLo[i] = 1; l->innerHi[i] = 0; continue; }
+	rtLightsDirty   = false;
+	rtLightsAtlas   = Atlas2D.Bmp.scan0;
+	rtLightCells[0] = (World.Width  + RT_LIGHT_CELL - 1) / RT_LIGHT_CELL;
+	rtLightCells[1] = (World.Height + RT_LIGHT_CELL - 1) / RT_LIGHT_CELL;
+	rtLightCells[2] = (World.Length + RT_LIGHT_CELL - 1) / RT_LIGHT_CELL;
+	numCells  = rtLightCells[0] * rtLightCells[1] * rtLightCells[2];
+	total     = RT_GatherLights(NULL, 0);
 
-			d = levels[L - 1].origin[i] - l->origin[i];
-			l->innerLo[i] = (d + l->size - 1) / l->size;
-			l->innerHi[i] = (d + RT_LIGHT_GRID * levels[L - 1].size) / l->size - 1;
-		}
+	if (!total || !numCells) {
+		if (rtLightData) { Garbage_Add(GARBAGE_RING, rtLightData); rtLightData = NULL; }
+		rtNumLights = 0;
+		return;
 	}
 
-	/* Sort lights near the camera by distance (so the nearest are kept when there are too many) */
-	/*  (chunks with only lights are after the chunks in the TLAS) */
-	Mem_Set(rtLightBuckets, 0, sizeof(rtLightBuckets));
-	for (i = 0; i < (int)count + numRtLightOnly; i++)
-	{
-		rt = i < (int)count ? rtChunks[i] : rtLightOnly[i - count];
-		if (!RT_ChunkLightsInRange(rt, cam)) continue;
+	if (!RT_EnsureTemp((void**)&rtLightsRaw,  &maxLightsRaw,  total * 4, sizeof(int))   ||
+		!RT_EnsureTemp((void**)&rtLightPower, &maxLightPower, total,     sizeof(float)) ||
+		!RT_EnsureTemp((void**)&rtCellStart,  &maxCellStart,  numCells,  sizeof(int))   ||
+		!RT_EnsureTemp((void**)&rtCellCount,  &maxCellCount,  numCells,  sizeof(int))) { RT_LightsChanged(); return; }
+	RT_GatherLights(rtLightsRaw, total);
 
-		for (j = 0; j < rt->numLights; j++)
-		{
-			d = RT_LightDistance(&rt->lights[j * 4], cam);
-			if (d <= RT_LIGHT_RANGE) rtLightBuckets[d + 1]++;
-		}
-	}
+	/* When there are too many lights, the nearest to the camera are used (and rebuilt when it moves far enough) */
+	RT_CameraBlock(rtLightsCam);
+	rtLightsCapped = total > RT_MAX_LIGHTS;
+	numLights      = rtLightsCapped ? RT_KeepNearestLights(rtLightsRaw, total, rtLightsCam) : total;
 
-	for (d = 1; d < RT_LIGHT_RANGE + 2; d++) rtLightBuckets[d] += rtLightBuckets[d - 1];
-	numLights = min(rtLightBuckets[RT_LIGHT_RANGE + 1], RT_MAX_LIGHTS);
-	if (!numLights) return;
-
-	for (i = 0; i < (int)count + numRtLightOnly; i++)
-	{
-		rt = i < (int)count ? rtChunks[i] : rtLightOnly[i - count];
-		if (!RT_ChunkLightsInRange(rt, cam)) continue;
-
-		for (j = 0; j < rt->numLights; j++)
-		{
-			light = &rt->lights[j * 4];
-			d     = RT_LightDistance(light, cam);
-			if (d > RT_LIGHT_RANGE) continue;
-
-			total = rtLightBuckets[d]++;
-			if (total < RT_MAX_LIGHTS) Mem_Copy(&rtLightSorted[total * 4], light, 4 * sizeof(int));
-		}
-	}
-
-	lights = (float*)Ring_AllocAddress(numLights * 12 * sizeof(float), &lightsAddr);
-	if (!lights) return;
+	lightsSize = (VkDeviceSize)numLights * 12 * sizeof(float);
+	lights     = (float*)Mem_TryAlloc(numLights * 12, sizeof(float));
+	if (!lights) { RT_LightsChanged(); return; }
 
 	for (i = 0; i < numLights; i++)
 	{
-		light     = &rtLightSorted[i * 4];
+		light     = &rtLightsRaw[i * 4];
 		block     = (BlockID)(light[3] & 0xFFFF);
 		col       = RT_LightColor(block);
 		intensity = max(Blocks.Brightness[block] & 0x0F, Blocks.Brightness[block] >> 4) / 15.0f;
@@ -3342,52 +3539,134 @@ static void RT_BuildLights(struct RTParams* p, cc_uint32 count) {
 		lights[i * 12 + 10] = (boxMax.z - boxMin.z) * 0.5f;
 		lights[i * 12 + 11] = 0.0f;
 
-		/* How bright the light is overall */
-		rtLightPower[i] = intensity * (0.2126f * lights[i * 12 + 4] + 0.7152f * lights[i * 12 + 5] + 0.0722f * lights[i * 12 + 6]);
+		/* How bright the light is overall (same luminance weights as the shader) */
+		rtLightPower[i] = intensity * (0.299f * lights[i * 12 + 4] + 0.587f * lights[i * 12 + 5] + 0.114f * lights[i * 12 + 6]);
 	}
 
-	/* Each cell has the most important lights reaching it, and when there are too many lights, their light */
-	/*  is scaled up by (total importance of all lights / total importance of the kept lights). This is the */
-	/*  same every frame (unlike e.g. picking a random subset of the lights), so there's no flickering */
-	Mem_Set(rtCellCounts, 0, sizeof(rtCellCounts));
-	Mem_Set(rtCellTotals, 0, sizeof(rtCellTotals));
+	/* Count how many lights reach each cell (lights that can't light any of a cell aren't in its list) */
+	Mem_Set(rtCellCount, 0, numCells * sizeof(int));
+	numEntries = 0;
 	for (i = 0; i < numLights; i++)
 	{
-		RT_AddLightToCells(i, &rtLightSorted[i * 4], levels);
+		if (!RT_LightCells(&lights[i * 12], lo, hi)) continue;
+
+		for (y = lo[1]; y <= hi[1]; y++)
+			for (z = lo[2]; z <= hi[2]; z++)
+				for (x = lo[0]; x <= hi[0]; x++)
+				{
+					if (RT_LightImportance(i, &lights[i * 12], x, y, z) <= 0.0f) continue;
+					rtCellCount[RT_CellIndex(x, y, z)]++; numEntries++;
+				}
+	}
+	numEntries = min(numEntries, RT_MAX_LIGHT_ENTRIES);
+
+	if (!RT_EnsureTemp((void**)&rtEntries,      &maxEntries,      numEntries, sizeof(int)) ||
+		!RT_EnsureTemp((void**)&rtEntryWeights, &maxEntryWeights, numEntries, sizeof(float))) {
+		Mem_Free(lights); RT_LightsChanged(); return;
 	}
 
-	total = RT_LIGHT_ALL_CELLS * RT_CELL_HEADER;
-	for (cell = 0; cell < RT_LIGHT_ALL_CELLS; cell++) { total += rtCellCounts[cell]; }
-
-	grid = (int*)Ring_AllocAddress(total * sizeof(int), &gridAddr);
-	if (!grid) return;
-
-	/* Each cell is (offset, count, scale), with the offsets being into the light indices after the cells */
-	total = RT_LIGHT_ALL_CELLS * RT_CELL_HEADER;
-	for (cell = 0; cell < RT_LIGHT_ALL_CELLS; cell++)
+	/* Each cell's list starts after the previous cell's list */
+	n = 0;
+	for (cell = 0; cell < numCells; cell++)
 	{
-		n    = rtCellCounts[cell];
-		kept = 0.0f;
-		for (i = 0; i < n; i++)
-		{
-			grid[total + i] = rtCellLights[cell * RT_LIGHTS_PER_CELL + i];
-			kept += rtCellWeights[cell * RT_LIGHTS_PER_CELL + i];
-		}
-
-		grid[cell * RT_CELL_HEADER]     = total;
-		grid[cell * RT_CELL_HEADER + 1] = n;
-		((float*)grid)[cell * RT_CELL_HEADER + 2] = kept > 0.0f ? rtCellTotals[cell] / kept : 1.0f;
-		total += n;
+		rtCellStart[cell] = n;
+		n += rtCellCount[cell];
+		rtCellCount[cell] = 0;
 	}
 
-	p->lights      = lightsAddr;
-	p->lightGrid   = gridAddr;
-	p->gridX       = (float)levels[0].origin[0];
-	p->gridY       = (float)levels[0].origin[1];
-	p->gridZ       = (float)levels[0].origin[2];
+	/* Add each light to every cell it reaches, along with how important it is to that cell */
+	for (i = 0; i < numLights; i++)
+	{
+		if (!RT_LightCells(&lights[i * 12], lo, hi)) continue;
+
+		for (y = lo[1]; y <= hi[1]; y++)
+			for (z = lo[2]; z <= hi[2]; z++)
+				for (x = lo[0]; x <= hi[0]; x++)
+				{
+					imp = RT_LightImportance(i, &lights[i * 12], x, y, z);
+					if (imp <= 0.0f) continue;
+
+					cell = RT_CellIndex(x, y, z);
+					n    = rtCellStart[cell] + rtCellCount[cell];
+					if (n >= numEntries) continue;
+
+					rtEntries[n]      = i;
+					rtEntryWeights[n] = imp;
+					rtCellCount[cell]++;
+				}
+	}
+
+	/* The light data, then the grid: (offset, count) for each cell, then each cell's list of */
+	/*  (light index, running total of importance), the total only being for lights after the first 16 */
+	size = lightsSize + ((VkDeviceSize)numCells * 2 + (VkDeviceSize)numEntries * 2) * sizeof(int);
+	data = (struct RingChunk*)Mem_TryAllocCleared(1, sizeof(struct RingChunk));
+	if (!data || !RingChunk_Create(data, size)) { Mem_Free(data); Mem_Free(lights); RT_LightsChanged(); return; }
+
+	Mem_Copy(data->data, lights, (cc_uint32)lightsSize);
+	Mem_Free(lights);
+	grid = (int*)(data->data + lightsSize);
+
+	for (cell = 0; cell < numCells; cell++)
+	{
+		n = rtCellStart[cell];
+		if (rtCellCount[cell] > 1) RT_SortCell(&rtEntries[n], &rtEntryWeights[n], rtCellCount[cell]);
+		grid[cell * 2]     = numCells * 2 + n * 2;
+		grid[cell * 2 + 1] = rtCellCount[cell];
+
+		sum = 0.0f;
+		for (i = 0; i < rtCellCount[cell]; i++)
+		{
+			if (i >= RT_LIGHTS_PER_CELL) sum += rtEntryWeights[n + i];
+			grid[numCells * 2 + (n + i) * 2]     = rtEntries[n + i];
+			((float*)grid)[numCells * 2 + (n + i) * 2 + 1] = sum;
+		}
+	}
+
+	/* The old data might still be used by frames the GPU hasn't finished yet */
+	if (rtLightData) Garbage_Add(GARBAGE_RING, rtLightData);
+	rtLightData       = data;
+	rtLightGridOffset = lightsSize;
+	rtNumLights       = numLights;
+	Mem_Copy(rtGridCells, rtLightCells, sizeof(rtGridCells));
+}
+
+/* Whether the world is a different size to when the grid was built (e.g. a new map was loaded) */
+static cc_bool RT_WorldResized(void) {
+	return rtGridCells[0] != (World.Width  + RT_LIGHT_CELL - 1) / RT_LIGHT_CELL
+		|| rtGridCells[1] != (World.Height + RT_LIGHT_CELL - 1) / RT_LIGHT_CELL
+		|| rtGridCells[2] != (World.Length + RT_LIGHT_CELL - 1) / RT_LIGHT_CELL;
+}
+
+/* Sets this frame's light data, first rebuilding it if lights changed */
+static void RT_BuildLights(struct RTParams* p) {
+	cc_uint64 beg, end;
+	int cam[3];
+	p->numLights = 0;
+	if (!rtBlockLights) return;
+
+	/* Light colours come from the textures */
+	if (Atlas2D.Bmp.scan0 != rtLightsAtlas) RT_LightsChanged();
+	if (rtLightsCapped) {
+		RT_CameraBlock(cam);
+		if (RT_CameraDistance(cam, rtLightsCam) > RT_LIGHTS_MOVE) RT_LightsChanged();
+	}
+
+	/* (the old lights are wrong for a new map, so the grid is rebuilt straight away then) */
+	if (rtLightsDirty && (!rtLightData || RT_WorldResized() || Game.Time - rtLightsChangedTime >= rtLightsDelay)) {
+		beg = Stopwatch_Measure();
+		RT_RebuildLights();
+		end = Stopwatch_Measure();
+		rtLightsDelay = max(RT_LIGHTS_DELAY, 10.0 * Stopwatch_ElapsedMicroseconds(beg, end) / 1e6);
+	}
+	if (!rtLightData || !rtNumLights) return;
+
+	p->lights      = rtLightData->address;
+	p->lightGrid   = rtLightData->address + rtLightGridOffset;
+	p->gridW       = (float)rtGridCells[0];
+	p->gridH       = (float)rtGridCells[1];
+	p->gridL       = (float)rtGridCells[2];
 	p->invCellSize = 1.0f / RT_LIGHT_CELL;
-	p->gridDim     = RT_LIGHT_GRID;
-	p->numLights   = numLights;
+	p->numLights   = rtNumLights;
 }
 
 static void RT_BuildTLAS(VkCommandBuffer cmd) {
@@ -3437,7 +3716,7 @@ static void RT_BuildTLAS(VkCommandBuffer cmd) {
 	RT_FrameParams()->table = table ? tableAddress : 0;
 	/* Bounced light needs the table to find what was hit */
 	if (!table || overflow) RT_FrameParams()->giStrength = 0.0f;
-	RT_BuildLights(RT_FrameParams(), count);
+	RT_BuildLights(RT_FrameParams());
 
 	RT_InitTLASGeometry(&geometry, &build);
 	geometry.geometry.instances.data.deviceAddress = address;
@@ -3805,6 +4084,7 @@ void Gfx_EndFrame(void) {
 	VkResult res;
 
 	if (renderPassActive) {
+		FlushDeferredDraws();
 		vkCmdEndRenderPass(frame->drawCmd);
 		renderPassActive = false;
 	}
@@ -3891,6 +4171,7 @@ cc_result Gfx_TakeScreenshot(struct Stream* output) {
 
 	cmd   = frame->drawCmd;
 	image = swapImages[imageIndex];
+	FlushDeferredDraws();
 	vkCmdEndRenderPass(cmd);
 	renderPassActive = false;
 

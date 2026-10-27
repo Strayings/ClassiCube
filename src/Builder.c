@@ -91,33 +91,49 @@ static int Builder_CasterType(BlockID block) {
 
 /* Whether light can get out of a face of a light emitting block (i.e. the face isn't hidden, and also isn't */
 /*  covered by a solid block, e.g. lava's top face is lower than a full block so it's never hidden) */
-static cc_bool Builder_LightFaceOpen(int tileIdx, int cIndex, int faceBit) {
+static cc_bool Builder_LightFaceOpen(BlockID b, int cIndex, int faceBit) {
 	BlockID other = Builder_Chunk[cIndex];
-	return !(Blocks.Hidden[tileIdx + other] & faceBit) && !Blocks.FullOpaque[other];
+	if (Blocks.Hidden[b * BLOCK_COUNT + other] & faceBit) return false;
+	if (Blocks.FullOpaque[other]) return false;
+
+	/* Liquids of the same kind cover each other (e.g. lava next to still lava), same as when it's the same block */
+	return !(Blocks.IsLiquid[b] && Blocks.IsLiquid[other] && Blocks.ExtendedCollide[b] == Blocks.ExtendedCollide[other]
+			&& (Blocks.Hidden[b * BLOCK_COUNT + b] & faceBit));
 }
 
 /* Which faces of a light emitting block light gets out of (none for blocks completely surrounded by other */
 /*  blocks, e.g. lava under other lava). Outside the map counts as covered where the map's sides and bottom */
 /*  are drawn, same as in Builder_Stretch */
 static int Builder_LightFaces(BlockID b, int cIndex, int x, int y, int z) {
-	int tileIdx  = b * BLOCK_COUNT, faces = 0;
+	int faces    = 0;
 	cc_bool edge = y < Builder_SidesLevel || (b >= BLOCK_WATER && b <= BLOCK_STILL_LAVA && y < Builder_EdgeLevel);
 
-	if (x == 0          ? !edge : Builder_LightFaceOpen(tileIdx, cIndex - 1,             FACE_BIT_XMIN)) faces |= FACE_BIT_XMIN;
-	if (x == World.MaxX ? !edge : Builder_LightFaceOpen(tileIdx, cIndex + 1,             FACE_BIT_XMAX)) faces |= FACE_BIT_XMAX;
-	if (z == 0          ? !edge : Builder_LightFaceOpen(tileIdx, cIndex - EXTCHUNK_SIZE, FACE_BIT_ZMIN)) faces |= FACE_BIT_ZMIN;
-	if (z == World.MaxZ ? !edge : Builder_LightFaceOpen(tileIdx, cIndex + EXTCHUNK_SIZE, FACE_BIT_ZMAX)) faces |= FACE_BIT_ZMAX;
-	if (y != 0 && Builder_LightFaceOpen(tileIdx, cIndex - EXTCHUNK_SIZE_2, FACE_BIT_YMIN)) faces |= FACE_BIT_YMIN;
-	if (Builder_LightFaceOpen(tileIdx, cIndex + EXTCHUNK_SIZE_2, FACE_BIT_YMAX))            faces |= FACE_BIT_YMAX;
+	if (x == 0          ? !edge : Builder_LightFaceOpen(b, cIndex - 1,             FACE_BIT_XMIN)) faces |= FACE_BIT_XMIN;
+	if (x == World.MaxX ? !edge : Builder_LightFaceOpen(b, cIndex + 1,             FACE_BIT_XMAX)) faces |= FACE_BIT_XMAX;
+	if (z == 0          ? !edge : Builder_LightFaceOpen(b, cIndex - EXTCHUNK_SIZE, FACE_BIT_ZMIN)) faces |= FACE_BIT_ZMIN;
+	if (z == World.MaxZ ? !edge : Builder_LightFaceOpen(b, cIndex + EXTCHUNK_SIZE, FACE_BIT_ZMAX)) faces |= FACE_BIT_ZMAX;
+	if (y != 0 && Builder_LightFaceOpen(b, cIndex - EXTCHUNK_SIZE_2, FACE_BIT_YMIN)) faces |= FACE_BIT_YMIN;
+	if (Builder_LightFaceOpen(b, cIndex + EXTCHUNK_SIZE_2, FACE_BIT_YMAX))            faces |= FACE_BIT_YMAX;
 	return faces;
+}
+
+/* Whether the block fills its whole cell along the axis of the given face (e.g. leaves do, fences don't) */
+static cc_bool Builder_SpansAxis(BlockID b, Face face) {
+	switch (face >> 1) {
+	case 0:  return Blocks.MinBB[b].x == 0.0f && Blocks.MaxBB[b].x == 1.0f; /* FACE_XMIN/XMAX */
+	case 1:  return Blocks.MinBB[b].z == 0.0f && Blocks.MaxBB[b].z == 1.0f; /* FACE_ZMIN/ZMAX */
+	default: return Blocks.MinBB[b].y == 0.0f && Blocks.MaxBB[b].y == 1.0f; /* FACE_YMIN/YMAX */
+	}
 }
 
 /* Faces between two of the same cutout block (e.g. between leaves) are still drawn, but don't cast shadows. */
 /*  Rays then only go through the outer faces of e.g. a tree's leaves instead of every layer of them, so */
 /*  there are gaps that light gets through, and rays don't have to alpha test many faces (which is slow) */
+/*  (only when the two faces are in the same place, i.e. not e.g. between two fence posts) */
 static int Builder_FaceCasterType(BlockID block, int cIndex, Face face) {
 	int type = Builder_CasterType(block);
-	if (type == CASTER_CUTOUT && Builder_Chunk[cIndex + Builder_Offsets[face]] == block) return CASTER_NONE;
+	if (type == CASTER_CUTOUT && Builder_Chunk[cIndex + Builder_Offsets[face]] == block
+		&& Builder_SpansAxis(block, face)) return CASTER_NONE;
 	return type;
 }
 

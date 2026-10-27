@@ -71,6 +71,7 @@
 #define OP_FORD_GREATER_THAN     186
 #define OP_FORD_GREATER_EQUAL    190
 #define OP_SHIFT_RIGHT_LOGICAL   194
+#define OP_BITWISE_XOR           198
 #define OP_SHIFT_LEFT_LOGICAL    196
 #define OP_BITWISE_AND           199
 #define OP_DPDX                  207
@@ -105,6 +106,7 @@
 #define MODEL_VERTEX           0
 #define MODEL_FRAGMENT         4
 #define MODE_ORIGIN_UPPER_LEFT 7
+#define MODE_EARLY_FRAGMENT_TESTS 9
 
 #define STORAGE_UNIFORM_CONSTANT 0
 #define STORAGE_INPUT            1
@@ -127,6 +129,7 @@
 
 #define BUILTIN_POSITION   0
 #define BUILTIN_FRAG_COORD 15
+#define BUILTIN_HELPER_INVOCATION 23
 
 /* https://registry.khronos.org/SPIR-V/specs/unified1/GLSL.std.450.html */
 #define GLSL_FABS   4
@@ -175,11 +178,21 @@
 #define FLOAT_PLASTIC     0x3F413FAAu /* 0.7548777 (plastic number, for a 2nd low discrepancy sequence) */
 #define FLOAT_LIGHT_GAP   0x3C23D70Au /* 0.01 (just outside/inside a light block's face) */
 #define FLOAT_EIGHTH      0x3E000000u /* 0.125 */
+#define FLOAT_EIGHT       0x41000000u /* 8.0 */
+#define FLOAT_GOD_FADE    0x3E19999Au /* 0.15 (god rays fade out over the last 15% of the shadow distance) */
 #define FLOAT_TINY        0x0DA24260u /* 1e-30 */
 #define FLOAT_ALMOST_ONE  0x3F7FFFFFu /* 0.99999994 (largest float below 1) */
 #define FLOAT_NEG_ONE     0xBF800000u /* -1.0 */
 #define FLOAT_INV_REACH2  0x3B800000u /* 1 / 16^2 (light from a block reaches 16 blocks, see RT_LIGHT_REACH) */
-#define LIGHT_LEVELS      4           /* Levels of the grid of lights (NOTE: must match RT_LIGHT_LEVELS) */
+#define LIGHTS_PER_CELL   16          /* Most important lights of each cell (NOTE: must match RT_LIGHTS_PER_CELL) */
+#define RESTIR_MAX_M      20          /* Most frames worth of picked lights that are reused (see block lights) */
+#define RESTIR_RADIUS     12          /* Neighbouring pixels within this many pixels have their picked light reused */
+#define FLOAT_RESTIR_MAX_M  0x41A00000u /* 20.0 */
+#define FLOAT_RESTIR_RADIUS 0x41400000u /* 12.0 */
+#define FLOAT_TWO_PI        0x40C90FDBu /* 2 pi */
+#define FLOAT_NEIGHBOUR_TOL 0x3DCCCCCDu /* 0.1 (neighbours' depth can differ by 10%) */
+#define FLOAT_INV_2POW24  0x33800000u /* 1 / 2^24 */
+#define FLOAT_MAX_LEN     0x427C0000u /* 63.0 (longest history, see out_history) */
 #define FLOAT_LUM_R       0x3E991687u /* 0.299 */
 #define FLOAT_LUM_G       0x3F1645A2u /* 0.587 */
 #define FLOAT_LUM_B       0x3DE978D5u /* 0.114 */
@@ -548,6 +561,232 @@ static void EmitTrace(const struct TraceIds* t, unsigned int cond, unsigned int 
 	EmitTraceEnd(t, hit, counter, traceMerge);
 }
 
+/* Ids used when tracing a ray to a light emitting block */
+struct LightRayIds {
+	unsigned int ext, tInt, tFloat, tVec3, tVec4, tIVec3, tBVec3, tBool, tVec4Ptr;
+	unsigned int cZero, cOne, cInt0, cInt1, cInt2, cIdx3, cTiny, cMinWeight, cDepthTol;
+	unsigned int cVec3Zero, cVec3Gap, cVec3NegOne, cIVec3Zero, cIVec3One, cFaceBitsLo, cFaceBitsHi;
+	unsigned int lights, origin, lightStrength, vBounce, vLightHits;
+	unsigned int n, axisAligned, cInvReach2, cLumW;
+	const struct TraceIds* trace;
+};
+
+/* Light that the light emitting block lights[li] would give origin (ignoring shadows): colour * intensity * cos * */
+/*  window / (1 + distance^2), where window = (1 - (distance / reach)^4)^2 smoothly fades the light out to 0 at the */
+/*  edge of its reach, and cos = max(dot(n, L), 0) (abs(dot(n, L)) for sprites, which are lit from both sides) */
+struct LightEval { unsigned int lpos, lmask, f, phat; };
+static void EmitLightEval(const struct LightRayIds* L, unsigned int li, struct LightEval* e) {
+	unsigned int ext = L->ext;
+	unsigned int l2 = Id(), p0P = Id(), p0 = Id(), l2b = Id(), p1P = Id(), p1 = Id(), inten = Id(), lcol = Id();
+	unsigned int toL = Id(), d2 = Id(), invD = Id(), Ld = Id(), cosR = Id(), cosF = Id(), cosA = Id(), cosC = Id();
+	unsigned int fq = Id(), fq2 = Id(), fw0 = Id(), fw1 = Id(), fw = Id(), intenW = Id(), d2p = Id(), atten = Id(), kL = Id();
+	e->lpos = Id(); e->lmask = Id(); e->f = Id(); e->phat = Id();
+
+	Op(OP_IMUL, 4, L->tInt, l2, li, L->cIdx3);
+	Op(OP_PTR_ACCESS_CHAIN, 4, L->tVec4Ptr, p0P, L->lights, l2);
+	Op(OP_LOAD, 5, L->tVec4, p0, p0P, MEMORY_ALIGNED, 16);
+	Op(OP_IADD, 4, L->tInt, l2b, l2, L->cInt1);
+	Op(OP_PTR_ACCESS_CHAIN, 4, L->tVec4Ptr, p1P, L->lights, l2b);
+	Op(OP_LOAD, 5, L->tVec4, p1, p1P, MEMORY_ALIGNED, 16);
+	Op(OP_VECTOR_SHUFFLE, 7, L->tVec3, e->lpos, p0, p0, 0, 1, 2);
+	Op(OP_COMPOSITE_EXTRACT, 4, L->tFloat, inten, p0, 3);
+	Op(OP_VECTOR_SHUFFLE, 7, L->tVec3, lcol, p1, p1, 0, 1, 2);
+	Op(OP_COMPOSITE_EXTRACT, 4, L->tFloat, e->lmask, p1, 3);
+
+	Op(OP_FSUB, 4, L->tVec3, toL, e->lpos, L->origin);
+	Op(OP_DOT,  4, L->tFloat, d2, toL, toL);
+	Op(OP_EXT_INST, 5, L->tFloat, invD, ext, GLSL_INVERSE_SQRT, d2);
+	Op(OP_VECTOR_TIMES_SCALAR, 4, L->tVec3, Ld, toL, invD);
+	Op(OP_DOT,  4, L->tFloat, cosR, L->n, Ld);
+	Op(OP_EXT_INST, 6, L->tFloat, cosF, ext, GLSL_FMAX, cosR, L->cZero);
+	Op(OP_EXT_INST, 5, L->tFloat, cosA, ext, GLSL_FABS, cosR);
+	Op(OP_SELECT, 5, L->tFloat, cosC, L->axisAligned, cosF, cosA);
+	Op(OP_FMUL, 4, L->tFloat, fq,  d2, L->cInvReach2);
+	Op(OP_FMUL, 4, L->tFloat, fq2, fq, fq);
+	Op(OP_FSUB, 4, L->tFloat, fw0, L->cOne, fq2);
+	Op(OP_EXT_INST, 6, L->tFloat, fw1, ext, GLSL_FMAX, fw0, L->cZero);
+	Op(OP_FMUL, 4, L->tFloat, fw,     fw1, fw1);
+	Op(OP_FMUL, 4, L->tFloat, intenW, inten, fw);
+	Op(OP_FADD, 4, L->tFloat, d2p,   d2, L->cOne);
+	Op(OP_FDIV, 4, L->tFloat, atten, intenW, d2p);
+	Op(OP_FMUL, 4, L->tFloat, kL,    atten, cosC);
+	Op(OP_VECTOR_TIMES_SCALAR, 4, L->tVec3, e->f, lcol, kL);
+	Op(OP_DOT,  4, L->tFloat, e->phat, e->f, L->cLumW);
+}
+
+/* Ids used for ReSTIR (see the block lights in FragmentShader) */
+struct RestirIds {
+	const struct LightRayIds* L;
+	unsigned int tInt, tFloat, tVec3, tVec4, tIVec2, tBool;
+	unsigned int cZero, cInt0, cIdx8, cInv2Pow24, cLcgA, cLcgC, cMaxM;
+	unsigned int resImage, numLights;
+	unsigned int vRng, vWSum, vM, vSelIdx, vSelF, vSelW, vSelPos, vSelMask;
+};
+
+/* Returns a random number in [0, 1) from the random number state (a linear congruential generator) */
+static unsigned int EmitRandom(const struct RestirIds* R) {
+	unsigned int h = Id(), hA = Id(), hB = Id(), h24 = Id(), hF = Id(), r = Id();
+	Op(OP_LOAD, 3, R->tInt, h, R->vRng);
+	Op(OP_IMUL, 4, R->tInt, hA, h, R->cLcgA);
+	Op(OP_IADD, 4, R->tInt, hB, hA, R->cLcgC);
+	Op(OP_STORE, 2, R->vRng, hB);
+	Op(OP_SHIFT_RIGHT_LOGICAL, 4, R->tInt, h24, hB, R->cIdx8);
+	Op(OP_CONVERT_S_TO_F, 3, R->tFloat, hF, h24);
+	Op(OP_FMUL, 4, R->tFloat, r, hF, R->cInv2Pow24);
+	return r;
+}
+
+/* If ok, adds the light the previous frame picked at pixel pix (light index, W, M in out_res) to the reservoir, */
+/*  with weight = weight of that light at this point * W * min(M, 20) */
+static void EmitReuse(const struct RestirIds* R, unsigned int ok, unsigned int pix) {
+	unsigned int rv = Id(), yF = Id(), Wp = Id(), Mp = Id(), li = Id(), hasM = Id(), ltZero = Id(), ge0 = Id(), ltN = Id();
+	unsigned int v1 = Id(), v2 = Id(), v3 = Id(), liS = Id(), mC = Id(), w0 = Id(), w1 = Id(), w = Id();
+	unsigned int ws = Id(), ws2 = Id(), u, uw = Id(), take0 = Id(), wPos = Id(), take = Id();
+	unsigned int si = Id(), sf = Id(), sw = Id(), sp = Id(), sm = Id(), ni = Id(), nf = Id(), nw = Id(), np = Id(), nm = Id();
+	unsigned int m = Id(), mAdd = Id(), m2 = Id();
+	struct LightEval ev;
+
+	Op(OP_IMAGE_FETCH, 6, R->tVec4, rv, R->resImage, pix, IMAGE_OPERAND_LOD, R->cInt0);
+	Op(OP_COMPOSITE_EXTRACT, 4, R->tFloat, yF, rv, 0);
+	Op(OP_COMPOSITE_EXTRACT, 4, R->tFloat, Wp, rv, 1);
+	Op(OP_COMPOSITE_EXTRACT, 4, R->tFloat, Mp, rv, 2);
+	Op(OP_CONVERT_F_TO_S, 3, R->tInt, li, yF);
+	Op(OP_FORD_GREATER_THAN, 4, R->tBool, hasM, Mp, R->cZero);
+	Op(OP_SLESS_THAN, 4, R->tBool, ltZero, li, R->cInt0);
+	Op(OP_LOGICAL_NOT, 3, R->tBool, ge0, ltZero);
+	Op(OP_SLESS_THAN, 4, R->tBool, ltN, li, R->numLights);
+	Op(OP_LOGICAL_AND, 4, R->tBool, v1, ok, hasM);
+	Op(OP_LOGICAL_AND, 4, R->tBool, v2, v1, ge0);
+	Op(OP_LOGICAL_AND, 4, R->tBool, v3, v2, ltN);
+	Op(OP_SELECT, 5, R->tInt, liS, v3, li, R->cInt0);
+	EmitLightEval(R->L, liS, &ev);
+
+	Op(OP_EXT_INST, 6, R->tFloat, mC, R->L->ext, GLSL_FMIN, Mp, R->cMaxM);
+	Op(OP_FMUL, 4, R->tFloat, w0, ev.phat, Wp);
+	Op(OP_FMUL, 4, R->tFloat, w1, w0, mC);
+	Op(OP_SELECT, 5, R->tFloat, w, v3, w1, R->cZero);
+	Op(OP_LOAD, 3, R->tFloat, ws, R->vWSum);
+	Op(OP_FADD, 4, R->tFloat, ws2, ws, w);
+	Op(OP_STORE, 2, R->vWSum, ws2);
+
+	/* Picked with probability weight / total weight */
+	u = EmitRandom(R);
+	Op(OP_FMUL, 4, R->tFloat, uw, u, ws2);
+	Op(OP_FORD_LESS_THAN,    4, R->tBool, take0, uw, w);
+	Op(OP_FORD_GREATER_THAN, 4, R->tBool, wPos,  w, R->cZero);
+	Op(OP_LOGICAL_AND, 4, R->tBool, take, take0, wPos);
+	Op(OP_LOAD, 3, R->tVec3,  sf, R->vSelF);
+	Op(OP_LOAD, 3, R->tFloat, sw, R->vSelW);
+	Op(OP_LOAD, 3, R->tVec3,  sp, R->vSelPos);
+	Op(OP_LOAD, 3, R->tFloat, sm, R->vSelMask);
+	Op(OP_LOAD, 3, R->tInt,   si, R->vSelIdx);
+	Op(OP_SELECT, 5, R->tVec3,  nf, take, ev.f,     sf);
+	Op(OP_SELECT, 5, R->tFloat, nw, take, ev.phat,  sw);
+	Op(OP_SELECT, 5, R->tVec3,  np, take, ev.lpos,  sp);
+	Op(OP_SELECT, 5, R->tFloat, nm, take, ev.lmask, sm);
+	Op(OP_SELECT, 5, R->tInt,   ni, take, liS,      si);
+	Op(OP_STORE, 2, R->vSelF,    nf);
+	Op(OP_STORE, 2, R->vSelW,    nw);
+	Op(OP_STORE, 2, R->vSelPos,  np);
+	Op(OP_STORE, 2, R->vSelMask, nm);
+	Op(OP_STORE, 2, R->vSelIdx,  ni);
+
+	Op(OP_LOAD, 3, R->tFloat, m, R->vM);
+	Op(OP_SELECT, 5, R->tFloat, mAdd, v3, mC, R->cZero);
+	Op(OP_FADD, 4, R->tFloat, m2, m, mAdd);
+	Op(OP_STORE, 2, R->vM, m2);
+}
+
+/* If cond is true, traces a ray from origin to the light emitting block lights[li] (centre lpos, faces lmask), and */
+/*  if it isn't blocked, adds light * lightStrength to the bounced light. The ray goes to a face of the block's */
+/*  box that light gets out of (i.e. isn't covered by another block) and that origin is in front of (the one it's */
+/*  furthest in front of), at the point on that face closest to the line from origin to the light's centre. When */
+/*  there's no such face, origin is right next to the light (e.g. a wall next to fire, whose light comes from inside */
+/*  its block), so the ray goes to the light's centre instead (anywhere else, a ray to the centre would go through */
+/*  the surface of whatever covers the light, so it's still blocked) */
+static void EmitLightRay(const struct LightRayIds* L, unsigned int cond, unsigned int li, unsigned int lpos,
+						unsigned int lmask, unsigned int light, unsigned int vBlocked) {
+	unsigned int ext = L->ext;
+	unsigned int l3 = Id(), l3b = Id(), p2P = Id(), p2 = Id(), he = Id(), heOut = Id(), heIn0 = Id(), heIn = Id(), heNeg = Id();
+	unsigned int dl = Id(), adl = Id(), maskI = Id(), maskV = Id(), negV = Id(), bitsV = Id(), shV = Id(), andV = Id(), openV = Id();
+	unsigned int frontV = Id(), okV = Id(), scoreV = Id(), sx = Id(), sy = Id(), sz = Id(), bestYZ = Id(), best = Id(), faceOk = Id();
+	unsigned int useX = Id(), yOverZ = Id(), notX = Id(), useY = Id(), notY = Id(), useZ = Id(), px = Id(), py = Id(), pz = Id();
+	unsigned int pick = Id(), bestS = Id(), faceDist = Id(), sc = Id(), offL = Id(), offC = Id(), sgn = Id(), faceOff = Id(), off3 = Id();
+	unsigned int surfFace = Id(), surf = Id(), seg = Id(), segLen = Id(), segSafe = Id(), invSeg = Id(), dirS = Id(), tmaxA = Id(), tmaxS = Id();
+	unsigned int hit, merge, visK = Id(), add = Id(), acc = Id(), acc2 = Id();
+
+	/* The light's box (half size), e.g. lava is lower than a full block */
+	Op(OP_IMUL, 4, L->tInt, l3,  li, L->cIdx3);
+	Op(OP_IADD, 4, L->tInt, l3b, l3, L->cInt2);
+	Op(OP_PTR_ACCESS_CHAIN, 4, L->tVec4Ptr, p2P, L->lights, l3b);
+	Op(OP_LOAD, 5, L->tVec4, p2, p2P, MEMORY_ALIGNED, 16);
+	Op(OP_VECTOR_SHUFFLE, 7, L->tVec3, he, p2, p2, 0, 1, 2);
+	Op(OP_FADD, 4, L->tVec3, heOut, he, L->cVec3Gap);
+	Op(OP_FSUB, 4, L->tVec3, heIn0, he, L->cVec3Gap);
+	Op(OP_EXT_INST, 6, L->tVec3, heIn, ext, GLSL_FMAX, heIn0, L->cVec3Zero);
+	Op(OP_FNEGATE, 3, L->tVec3, heNeg, heIn);
+
+	Op(OP_FSUB, 4, L->tVec3, dl, L->origin, lpos);
+	Op(OP_EXT_INST, 5, L->tVec3, adl, ext, GLSL_FABS, dl);
+	Op(OP_CONVERT_F_TO_S, 3, L->tInt, maskI, lmask);
+	Op(OP_COMPOSITE_CONSTRUCT, 5, L->tIVec3, maskV, maskI, maskI, maskI);
+	Op(OP_FORD_LESS_THAN, 4, L->tBVec3, negV, dl, L->cVec3Zero);
+	Op(OP_SELECT, 5, L->tIVec3, bitsV, negV, L->cFaceBitsLo, L->cFaceBitsHi);
+	Op(OP_SHIFT_RIGHT_LOGICAL, 4, L->tIVec3, shV, maskV, bitsV);
+	Op(OP_BITWISE_AND, 4, L->tIVec3, andV, shV, L->cIVec3One);
+	Op(OP_INOT_EQUAL, 4, L->tBVec3, openV, andV, L->cIVec3Zero);
+	Op(OP_FORD_GREATER_THAN, 4, L->tBVec3, frontV, adl, he);
+	Op(OP_LOGICAL_AND, 4, L->tBVec3, okV, openV, frontV);
+	Op(OP_SELECT, 5, L->tVec3, scoreV, okV, adl, L->cVec3NegOne);
+	Op(OP_COMPOSITE_EXTRACT, 4, L->tFloat, sx, scoreV, 0);
+	Op(OP_COMPOSITE_EXTRACT, 4, L->tFloat, sy, scoreV, 1);
+	Op(OP_COMPOSITE_EXTRACT, 4, L->tFloat, sz, scoreV, 2);
+	Op(OP_EXT_INST, 6, L->tFloat, bestYZ, ext, GLSL_FMAX, sy, sz);
+	Op(OP_EXT_INST, 6, L->tFloat, best,   ext, GLSL_FMAX, sx, bestYZ);
+	Op(OP_FORD_GREATER_THAN, 4, L->tBool, faceOk, best, L->cZero);
+	Op(OP_FORD_GREATER_EQUAL, 4, L->tBool, useX,   sx, best);
+	Op(OP_FORD_GREATER_EQUAL, 4, L->tBool, yOverZ, sy, sz);
+	Op(OP_LOGICAL_NOT, 3, L->tBool, notX, useX);
+	Op(OP_LOGICAL_AND, 4, L->tBool, useY, notX, yOverZ);
+	Op(OP_LOGICAL_NOT, 3, L->tBool, notY, yOverZ);
+	Op(OP_LOGICAL_AND, 4, L->tBool, useZ, notX, notY);
+	Op(OP_SELECT, 5, L->tFloat, px, useX, L->cOne, L->cZero);
+	Op(OP_SELECT, 5, L->tFloat, py, useY, L->cOne, L->cZero);
+	Op(OP_SELECT, 5, L->tFloat, pz, useZ, L->cOne, L->cZero);
+	Op(OP_COMPOSITE_CONSTRUCT, 5, L->tVec3, pick, px, py, pz);
+	Op(OP_EXT_INST, 6, L->tFloat, bestS, ext, GLSL_FMAX, best, L->cTiny);
+	Op(OP_DOT,  4, L->tFloat, faceDist, pick, heOut);
+	Op(OP_FDIV, 4, L->tFloat, sc, faceDist, bestS);
+	Op(OP_VECTOR_TIMES_SCALAR, 4, L->tVec3, offL, dl, sc);
+	Op(OP_EXT_INST, 7, L->tVec3, offC, ext, GLSL_FCLAMP, offL, heNeg, heIn);
+	Op(OP_EXT_INST, 5, L->tVec3, sgn, ext, GLSL_FSIGN, dl);
+	Op(OP_FMUL, 4, L->tVec3, faceOff, sgn, heOut);
+	Op(OP_EXT_INST, 7, L->tVec3, off3, ext, GLSL_FMIX, offC, faceOff, pick);
+	Op(OP_FADD, 4, L->tVec3, surfFace, lpos, off3);
+	Op(OP_SELECT, 5, L->tVec3, surf, faceOk, surfFace, lpos);
+	Op(OP_FSUB, 4, L->tVec3, seg, surf, L->origin);
+	Op(OP_EXT_INST, 5, L->tFloat, segLen, ext, GLSL_LENGTH, seg);
+	Op(OP_EXT_INST, 6, L->tFloat, segSafe, ext, GLSL_FMAX, segLen, L->cMinWeight);
+	Op(OP_FDIV, 4, L->tFloat, invSeg, L->cOne, segSafe);
+	Op(OP_VECTOR_TIMES_SCALAR, 4, L->tVec3, dirS, seg, invSeg);
+	Op(OP_FSUB, 4, L->tFloat, tmaxA, segLen, L->cDepthTol);
+	Op(OP_EXT_INST, 6, L->tFloat, tmaxS, ext, GLSL_FMAX, tmaxA, L->cMinWeight);
+
+	Op(OP_STORE, 2, L->vLightHits, L->cInt0);
+	hit = EmitTraceBegin(L->trace, cond, L->origin, dirS, tmaxS, L->trace->cFlags, &merge);
+	Op(OP_SELECT, 5, L->tFloat, visK, hit, L->cZero, L->lightStrength);
+	Op(OP_VECTOR_TIMES_SCALAR, 4, L->tVec3, add, light, visK);
+	Op(OP_LOAD, 3, L->tVec3, acc, L->vBounce);
+	Op(OP_FADD, 4, L->tVec3, acc2, acc, add);
+	Op(OP_STORE, 2, L->vBounce, acc2);
+	if (vBlocked) {
+		unsigned int hitI = Id();
+		Op(OP_SELECT, 5, L->tInt, hitI, hit, L->cInt1, L->cInt0);
+		Op(OP_STORE, 2, vBlocked, hitI);
+	}
+	EmitTraceEnd(L->trace, hit, L->vLightHits, merge);
+}
+
 /* Equivalent GLSL:
 #extension GL_EXT_ray_query : require                (ray traced shadows only)
 #extension GL_EXT_buffer_reference : require          (ray traced shadows only)
@@ -571,29 +810,37 @@ layout(set = 1, binding = 1) uniform Params {
 	float aoStrength; float aoRange; vec3 sunCol; float giStrength;
 	float godStrength; float godDensity; float godG; float godRange;
 	vec3 scatterCol; float caustics; float skyDY; int skybox; float time;
-	Lights lights; Ints lightGrid; vec3 gridOrigin; float invCellSize; int gridDim; int numLights; float lightStrength;
+	Lights lights; Ints lightGrid; vec3 gridCells; float invCellSize; int unused; int numLights; float lightStrength;
 };
 (block lights: lights[i * 3] = (centre, intensity), lights[i * 3 + 1] = (colour, faces), lights[i * 3 + 2] = (half size of
- the block's box, unused); lightGrid[cell * 3] = offset of the
- cell's light indices in lightGrid, lightGrid[cell * 3 + 1] = number of them, lightGrid[cell * 3 + 2] = scale (as float
- bits, total lights reaching the cell / number of them in the cell). The grid has 4 levels of gridDim^3 cells, level L
- having cells of size 2^L / invCellSize and starting at floor(centre / size) * size - gridDim / 2 * size, where
- centre = gridOrigin + gridDim / 2 / invCellSize; the finest level containing the point is used.
- Per ray, if shaded && numLights > 0 (at any distance): every light of the point's cell is weighted by
- lum(colour * intensity * cos * (1 - (d^2 / 16^2)^2)^2 / (1 + d^2)), with cos = max(dot(n, L), 0) (abs(dot(n, L)) for
- sprites), and one is picked with weighted reservoir sampling (using one random number per ray, rescaled after each
- light). The ray goes to the face of that light block's box that light gets out of (faces = bit mask of FACE_XMIN etc)
- and the point is furthest in front of (or its centre if there's no such face), and if it isn't blocked, light / (weight / total weight) * scale * lightStrength
- is added to the bounced light. GI hits on fully bright blocks give no light when numLights > 0)
+ the block's box, unused); lightGrid[cell * 2] = offset of the cell's light indices in lightGrid, lightGrid[cell * 2 + 1]
+ = number of them, sorted with the most important first. The grid covers the world in cells of 1 / invCellSize blocks,
+ gridCells along each axis, cell index = (y * gridCells.z + z) * gridCells.x + x.
+ Per pixel (on the first ray), if shaded && numLights > 0 (at any distance), block lights use ReSTIR (like Radiance):
+ p(light) = lum(colour * intensity * cos * (1 - (d^2 / 16^2)^2)^2 / (1 + d^2)) (cos = abs(dot(n, L)) for sprites).
+ 1. One light is picked from the first 16 of the point's cell, plus one picked from the rest of its list (in proportion
+    to the running totals of importance stored in the list, scaled by 1 / that probability), with weighted reservoir
+    sampling: wsum = sum of weights, M = 1.
+ 2. The previous frame's picked light at the nearest pixel (if it was the same surface), and at 2 random pixels within
+    12 pixels (if their depth is within 10% and they face the same way), are each added with weight
+    p(their light) * their W * min(their M, 20), and M += min(their M, 20).
+ 3. W = wsum / (M * p(picked light)). The ray goes to the face of the picked light's box that light gets out of (faces
+    = bit mask of FACE_XMIN etc) and the point is furthest in front of (or its centre if there's no such face). If it
+    isn't blocked, colour * W * lightStrength is added to the bounced light.
+ 4. out_res = (picked light index, blocked ? 0 : W, min(M, 20), 0).
+ Translucent faces instead get the sum of up to 64 of the cell's lights without rays.
+ GI hits on fully bright blocks give no light when numLights > 0)
 (sky variants: the sky has no surface, so in_world is replaced with camPos + dir * 1000, where dir is the
  direction of the sky plane/skybox from the camera; only god rays are applied (* 0.3 * clamp(dir.y * 4, 0, 1),
  i.e. fading out towards the horizon where the sky plane ends), after fog, with depth 60000
  and face 7 stored in the history; god ray traces aren't alpha tested)
 layout(set = 1, binding = 2) uniform sampler2D history; (previous frame's out_history)
 layout(set = 1, binding = 3) uniform sampler2D giHistory; (previous frame's out_gi)
+layout(set = 1, binding = 4) uniform sampler2D resHistory; (previous frame's out_res)
 layout(location = 2) in vec3 in_world;
 layout(location = 1) out vec4 out_history;            (sun visibility, view depth, face * 64 + history length, sky visibility)
 layout(location = 2) out vec4 out_gi;                 (bounced light, god rays)
+layout(location = 3) out vec4 out_res;                (picked block light: light index, W, M, unused)
 
 (Blocked() but finding the closest hit, and then the light leaving the hit point towards the ray origin)
 vec3 Bounce(vec3 origin, vec3 dir, float tMax, vec3 sunSample, out bool hit) {
@@ -646,6 +893,7 @@ void main() {
 
 	float face   = !axis ? 1.0 : (abs(normal.y) > 0.5 ? (normal.y > 0.5 ? 1.0 : 0.5) : (abs(normal.x) > 0.5 ? 0.6 : 0.8));
 	float faceID = !axis ? 3.0 : dot(normal, vec3(1, 2, 3)) + 3.0; (0-6, which way the face points)
+	(faceKey = length(toCam) < shadowDist ? faceID : faceID + 8, used instead of faceID for the history below)
 	float direct = !axis ? 1.0 : clamp(dot(normal, sunDir) * diffuseScale, 0.0, 1.0);
 	bool shaded  = in_col.a > 0.998; (alpha 254 = fully bright)
 	bool doSun   = direct > 0.01, doSky = aoStrength > 0.0;
@@ -680,7 +928,8 @@ void main() {
 	bool inRange = length(toCam) < shadowDist; (sunlight, sky light and god rays only apply within the shadow distance)
 	if ((inRange && ((shaded && (doSun || doSky)) || doGod)) || (shaded && numLights > 0)) {
 		vec3 origin = in_world + normal * 0.05;
-		int rays    = histLen >= 4.0 ? 1 : 4; (only for the sun: sky/bounce/god/block light rays are only traced when i == 0)
+		int rays    = histLen >= 2.0 ? 1 : (temporal > 0.5 ? 2 : 4); (only for the sun: sky/bounce/god/block light rays are only traced when i == 0)
+		(nothing is traced in helper invocations)
 		int step    = rays == 4 ? max(samples / 4 - 2, 0) : 0, skyStep = rays == 4 ? 14 : 0; (spread around the disc)
 		float ign   = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
 		int sunStart = (temporal > 0.5 ? frame : 0) + int(ign * float(samples));
@@ -737,6 +986,9 @@ void main() {
 	out_col = col;
 }
 */
+/* Whether the next fragment shaders are generated with early depth testing */
+static int earlyTests;
+
 static void FragmentShader(const char* name, int textured, int alphaTest, int fog, int rt, int skyMode) {
 	unsigned int ext, main_, tVoid, tFunc, tFloat, tVec2, tVec3, tVec4, tBool, tInt, tImage, tSampled, tPush;
 	unsigned int pSampled, pPush, pPushVec3, pPushFloat, pInVec2, pInVec4, pOutVec4;
@@ -762,15 +1014,19 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 	unsigned int tIVec3 = 0, tIntPtr = 0, tVec4Ptr = 0, pParamsIntPtr = 0, pParamsVec4Ptr = 0;
 	unsigned int cPlastic = 0, cLightGap = 0, cLumR = 0, cLumG = 0, cLumB = 0, cLumW = 0, cIVec3Zero = 0, cIVec3One = 0;
 	unsigned int vLj = 0, vWSum = 0, vSelF = 0, vSelW = 0, vSelPos = 0, vLightHits = 0, vSumF = 0;
-	unsigned int cEighth = 0, cInvReach2 = 0, cTiny = 0, cAlmostOne = 0, cNegOneF = 0;
+	unsigned int cEighth = 0, cInvReach2 = 0, cTiny = 0, cAlmostOne = 0, cNegOneF = 0, cEightF = 0, cGodFade = 0;
 	unsigned int cVec3NegOne = 0, cVec3Gap = 0, cFaceBitsLo = 0, cFaceBitsHi = 0;
-	unsigned int vU = 0, vSelMask = 0, vSelIdx = 0;
+	unsigned int vU = 0, vSelMask = 0, vSelIdx = 0, pInBool = 0, vHelper = 0;
+	unsigned int vRestEntry = 0, vRestMult = 0, vLo = 0, vHi = 0, cInt64 = 0, cInv2Pow24 = 0, cMaxLen = 0;
+	unsigned int cHashX = 0, cHashY = 0, cHashF = 0, cHash61 = 0, cHash9 = 0, cHashM = 0;
+	unsigned int vOutRes = 0, vResHistory = 0, vResX = 0, vResY = 0, vResOk = 0, vPrevW = 0, vTolW = 0, vRng = 0, vM = 0;
+	unsigned int cMaxM = 0, cRadius = 0, cTwoPi = 0, cNeighbourTol = 0, cLcgA = 0, cLcgC = 0, cMaxMI = 0, cVec4Zero = 0;
 	unsigned int cTaps[4] = { 0, 0, 0, 0 };
 	unsigned int vWorld = 0, vScene = 0, vParams = 0, vHistory = 0, vOutHistory = 0;
 	unsigned int rayQuery = 0, vVisible = 0, vIndex = 0, vHits = 0, vSkyHits = 0;
 	unsigned int vHistVis = 0, vHistLen = 0, vHistSky = 0, vLen = 0, vSky = 0;
 	unsigned int cIdx[34];
-	unsigned int iface[14];
+	unsigned int iface[16];
 	int i, count = 0, push = fog || rt, fogBase = rt ? 1 : 0, fragPos = fog || rt;
 
 	Begin(rt ? SPIRV_1_4 : SPIRV_1_0);
@@ -800,9 +1056,13 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		tIVec3 = Id(); tIntPtr = Id(); tVec4Ptr = Id(); pParamsIntPtr = Id(); pParamsVec4Ptr = Id();
 		cPlastic = Id(); cLightGap = Id(); cLumR = Id(); cLumG = Id(); cLumB = Id(); cLumW = Id(); cIVec3Zero = Id(); cIVec3One = Id();
 		vLj = Id(); vWSum = Id(); vSelF = Id(); vSelW = Id(); vSelPos = Id(); vLightHits = Id(); vSumF = Id();
-		cEighth = Id(); cInvReach2 = Id(); cTiny = Id(); cAlmostOne = Id(); cNegOneF = Id();
+		cEighth = Id(); cInvReach2 = Id(); cTiny = Id(); cAlmostOne = Id(); cNegOneF = Id(); cEightF = Id(); cGodFade = Id();
 		cVec3NegOne = Id(); cVec3Gap = Id(); cFaceBitsLo = Id(); cFaceBitsHi = Id();
-		vU = Id(); vSelMask = Id(); vSelIdx = Id();
+		vU = Id(); vSelMask = Id(); vSelIdx = Id(); pInBool = Id(); vHelper = Id();
+		vRestEntry = Id(); vRestMult = Id(); vLo = Id(); vHi = Id(); cInt64 = Id(); cInv2Pow24 = Id(); cMaxLen = Id();
+		cHashX = Id(); cHashY = Id(); cHashF = Id(); cHash61 = Id(); cHash9 = Id(); cHashM = Id();
+		vOutRes = Id(); vResHistory = Id(); vResX = Id(); vResY = Id(); vResOk = Id(); vPrevW = Id(); vTolW = Id(); vRng = Id(); vM = Id();
+		cMaxM = Id(); cRadius = Id(); cTwoPi = Id(); cNeighbourTol = Id(); cLcgA = Id(); cLcgC = Id(); cMaxMI = Id(); cVec4Zero = Id();
 		for (i = 0; i < 4; i++) cTaps[i] = Id();
 		vWorld = Id(); vScene = Id(); vParams = Id(); vHistory = Id(); vOutHistory = Id();
 		rayQuery = Id(); vVisible = Id(); vIndex = Id(); vHits = Id(); vSkyHits = Id();
@@ -832,15 +1092,22 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		iface[count++] = vHistory;
 		iface[count++] = vGIHistory;
 		iface[count++] = vOutGI;
+		iface[count++] = vResHistory;
+		iface[count++] = vOutRes;
 		iface[count++] = vPush;
 		iface[count++] = vTex;
+		iface[count++] = vHelper;
 	}
 	EntryPoint(MODEL_FRAGMENT, main_, count, iface);
 	Op(OP_EXECUTION_MODE, 2, main_, MODE_ORIGIN_UPPER_LEFT);
+	/* Depth testing before the shader runs, even though it can discard (only used without depth writes, */
+	/*  i.e. after the depth pre-pass, so that hidden faces never run the expensive ray tracing) */
+	if (earlyTests) Op(OP_EXECUTION_MODE, 2, main_, MODE_EARLY_FRAGMENT_TESTS);
 
 	Op(OP_DECORATE, 3, vCol, DECORATION_LOCATION, 0);
 	if (textured) Op(OP_DECORATE, 3, vUV, DECORATION_LOCATION, 1);
 	if (fragPos)  Op(OP_DECORATE, 3, vFragCoord, DECORATION_BUILTIN, BUILTIN_FRAG_COORD);
+	if (rt)       Op(OP_DECORATE, 3, vHelper,    DECORATION_BUILTIN, BUILTIN_HELPER_INVOCATION);
 	Op(OP_DECORATE, 3, vOut, DECORATION_LOCATION, 0);
 	if (textured || rt) {
 		Op(OP_DECORATE, 3, vTex, DECORATION_DESCRIPTOR_SET, 0);
@@ -868,6 +1135,9 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_DECORATE, 3, vGIHistory, DECORATION_DESCRIPTOR_SET, 1);
 		Op(OP_DECORATE, 3, vGIHistory, DECORATION_BINDING, 3);
 		Op(OP_DECORATE, 3, vOutGI, DECORATION_LOCATION, 2);
+		Op(OP_DECORATE, 3, vResHistory, DECORATION_DESCRIPTOR_SET, 1);
+		Op(OP_DECORATE, 3, vResHistory, DECORATION_BINDING, 4);
+		Op(OP_DECORATE, 3, vOutRes, DECORATION_LOCATION, 3);
 		/* Vertices are 24 bytes, so are read as 3 vec2s, with the UV being the 3rd */
 		Op(OP_DECORATE, 3, tUVPtr,    DECORATION_ARRAY_STRIDE, 8);
 		Op(OP_DECORATE, 3, tTablePtr, DECORATION_ARRAY_STRIDE, 8);
@@ -961,6 +1231,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_TYPE_POINTER, 3, pScene,     STORAGE_UNIFORM_CONSTANT, tScene);
 		Op(OP_TYPE_POINTER, 3, pRayQuery,  STORAGE_FUNCTION, tRayQuery);
 		Op(OP_TYPE_POINTER, 3, pInVec3,    STORAGE_INPUT,    tVec3);
+		Op(OP_TYPE_POINTER, 3, pInBool,    STORAGE_INPUT,    tBool);
 		Op(OP_TYPE_POINTER, 3, pFuncFloat, STORAGE_FUNCTION, tFloat);
 		Op(OP_TYPE_POINTER, 3, pFuncInt,   STORAGE_FUNCTION, tInt);
 		Op(OP_TYPE_POINTER, 3, pFuncVec3,  STORAGE_FUNCTION, tVec3);
@@ -1010,6 +1281,24 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_CONSTANT, 3, tFloat, cQuarter,    FLOAT_QUARTER);
 		Op(OP_CONSTANT, 3, tInt,   cFrameMask,  1023);
 		Op(OP_CONSTANT, 3, tUint,  cFlagsOpaque,   RAY_FLAGS_SHADOW_OPAQUE);
+		Op(OP_CONSTANT, 3, tInt,   cInt64,     64);
+		Op(OP_CONSTANT, 3, tFloat, cInv2Pow24, FLOAT_INV_2POW24);
+		Op(OP_CONSTANT, 3, tFloat, cMaxLen,    FLOAT_MAX_LEN);
+		/* (Wang hash, for random numbers) */
+		Op(OP_CONSTANT, 3, tInt, cHashX,  1973);
+		Op(OP_CONSTANT, 3, tInt, cHashY,  9277);
+		Op(OP_CONSTANT, 3, tInt, cHashF,  26699);
+		Op(OP_CONSTANT, 3, tInt, cHash61, 61);
+		Op(OP_CONSTANT, 3, tInt, cHash9,  9);
+		Op(OP_CONSTANT, 3, tInt, cHashM,  0x27D4EB2D);
+		Op(OP_CONSTANT, 3, tInt, cLcgA,   1664525);
+		Op(OP_CONSTANT, 3, tInt, cLcgC,   1013904223);
+		Op(OP_CONSTANT, 3, tInt, cMaxMI,  RESTIR_MAX_M);
+		Op(OP_CONSTANT, 3, tFloat, cMaxM,         FLOAT_RESTIR_MAX_M);
+		Op(OP_CONSTANT, 3, tFloat, cRadius,       FLOAT_RESTIR_RADIUS);
+		Op(OP_CONSTANT, 3, tFloat, cTwoPi,        FLOAT_TWO_PI);
+		Op(OP_CONSTANT, 3, tFloat, cNeighbourTol, FLOAT_NEIGHBOUR_TOL);
+		Op(OP_CONSTANT_COMPOSITE, 6, tVec4, cVec4Zero, cZero, cZero, cZero, cZero);
 		Op(OP_CONSTANT, 3, tFloat, cSeven,         FLOAT_SEVEN);
 		Op(OP_CONSTANT, 3, tFloat, cSkyMarker,     FLOAT_SKY_MARKER);
 		Op(OP_CONSTANT, 3, tFloat, cSkyDist,       FLOAT_SKY_DIST);
@@ -1022,6 +1311,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_CONSTANT, 3, tFloat, cPlastic,   FLOAT_PLASTIC);
 		Op(OP_CONSTANT, 3, tFloat, cLightGap,  FLOAT_LIGHT_GAP);
 		Op(OP_CONSTANT, 3, tFloat, cEighth,    FLOAT_EIGHTH);
+		Op(OP_CONSTANT, 3, tFloat, cEightF,    FLOAT_EIGHT);
+		Op(OP_CONSTANT, 3, tFloat, cGodFade,   FLOAT_GOD_FADE);
 		Op(OP_CONSTANT, 3, tFloat, cInvReach2, FLOAT_INV_REACH2);
 		Op(OP_CONSTANT, 3, tFloat, cTiny,        FLOAT_TINY);
 		Op(OP_CONSTANT, 3, tFloat, cAlmostOne,   FLOAT_ALMOST_ONE);
@@ -1061,12 +1352,15 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 	if (push)     Op(OP_VARIABLE, 3, pPush, vPush, STORAGE_PUSH_CONSTANT);
 	if (rt) {
 		Op(OP_VARIABLE, 3, pInVec3,  vWorld,      STORAGE_INPUT);
+		Op(OP_VARIABLE, 3, pInBool,  vHelper,     STORAGE_INPUT);
 		Op(OP_VARIABLE, 3, pOutVec4, vOutHistory, STORAGE_OUTPUT);
 		Op(OP_VARIABLE, 3, pScene,   vScene,      STORAGE_UNIFORM_CONSTANT);
 		Op(OP_VARIABLE, 3, pParams,  vParams,     STORAGE_UNIFORM);
 		Op(OP_VARIABLE, 3, pSampled, vHistory,    STORAGE_UNIFORM_CONSTANT);
 		Op(OP_VARIABLE, 3, pSampled, vGIHistory,  STORAGE_UNIFORM_CONSTANT);
 		Op(OP_VARIABLE, 3, pOutVec4, vOutGI,      STORAGE_OUTPUT);
+		Op(OP_VARIABLE, 3, pSampled, vResHistory, STORAGE_UNIFORM_CONSTANT);
+		Op(OP_VARIABLE, 3, pOutVec4, vOutRes,     STORAGE_OUTPUT);
 	}
 
 	Op(OP_FUNCTION, 4, tVoid, main_, 0, tFunc);
@@ -1101,6 +1395,17 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_VARIABLE, 3, pFuncFloat, vU,          STORAGE_FUNCTION);
 		Op(OP_VARIABLE, 3, pFuncFloat, vSelMask,    STORAGE_FUNCTION);
 		Op(OP_VARIABLE, 3, pFuncInt,   vSelIdx,     STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncInt,   vRestEntry,  STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncFloat, vRestMult,   STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncInt,   vLo,         STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncInt,   vHi,         STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncInt,   vResX,       STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncInt,   vResY,       STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncInt,   vResOk,      STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncFloat, vPrevW,      STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncFloat, vTolW,       STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncInt,   vRng,        STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncFloat, vM,          STORAGE_FUNCTION);
 	}
 	Op(OP_LOAD,     3, tVec4, col, vCol);
 	vertexCol = col;
@@ -1140,10 +1445,10 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		unsigned int aoStrength, aoRange, temporal, sunCol, giStrength, doAO, doGI, skyFlags;
 		unsigned int godStrength, godDensity, godG, godRange, sunCond, skyCond, doGod, anyA, invLenV, negInvLenV, viewDir;
 		unsigned int scatterCol, caustics, skyDY, skyboxFlag, timeV, wpos;
-		unsigned int gridOrigin, invCell, gridDim, numLights, lightStrength, lightCond, hasLights, anyB, isTemporalEarly;
+		unsigned int gridCells, invCell, numLights, lightStrength, lightCond, hasLights, anyB, isTemporalEarly;
 		unsigned int toCam, crossed, normal, toCamDot, flip, negated, flipped;
 		unsigned int absN, ax, ay, az, bigYZ, big, bigs, isBig, mask, masked, snapped, axisAligned, n;
-		unsigned int ny, nyAbs, nxAbs, isY, isTop, isX, faceY, faceXZ, faceAxis, face, faceDot, faceAxisID, faceID;
+		unsigned int ny, nyAbs, nxAbs, isY, isTop, isX, faceY, faceXZ, faceAxis, face, faceDot, faceAxisID, faceID, faceKey;
 		unsigned int ndl, ndlScaled, directAxis, direct, vertexAlpha, shadedCol, len, inRange, doSun, doSky, anyRay, doRayA, doRay;
 		unsigned int fragPosV, fragW, viewDepth, isTemporal, hasPrevB, useHistory, histLabel, histMerge;
 		unsigned int rayLabel, rayMerge, visible, newLen, sky, history, faceShifted, faceLen, visibleRaw, skyRaw2;
@@ -1178,9 +1483,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsFloat, paramPtr, vParams, cIdx[24]); skyDY        = Id(); Op(OP_LOAD, 3, tFloat, skyDY,        paramPtr);
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsInt,   paramPtr, vParams, cIdx[25]); skyboxFlag   = Id(); Op(OP_LOAD, 3, tInt,   skyboxFlag,   paramPtr);
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsFloat, paramPtr, vParams, cIdx[26]); timeV        = Id(); Op(OP_LOAD, 3, tFloat, timeV,        paramPtr);
-		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsVec3,  paramPtr, vParams, cIdx[29]); gridOrigin   = Id(); Op(OP_LOAD, 3, tVec3,  gridOrigin,   paramPtr);
+		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsVec3,  paramPtr, vParams, cIdx[29]); gridCells    = Id(); Op(OP_LOAD, 3, tVec3,  gridCells,    paramPtr);
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsFloat, paramPtr, vParams, cIdx[30]); invCell      = Id(); Op(OP_LOAD, 3, tFloat, invCell,      paramPtr);
-		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsInt,   paramPtr, vParams, cIdx[31]); gridDim      = Id(); Op(OP_LOAD, 3, tInt,   gridDim,      paramPtr);
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsInt,   paramPtr, vParams, cIdx[32]); numLights    = Id(); Op(OP_LOAD, 3, tInt,   numLights,    paramPtr);
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsFloat, paramPtr, vParams, cIdx[33]); lightStrength = Id(); Op(OP_LOAD, 3, tFloat, lightStrength, paramPtr);
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pPushFloat,   paramPtr, vPush,   cIdx[0]);  temporal     = Id(); Op(OP_LOAD, 3, tFloat, temporal,     paramPtr);
@@ -1274,6 +1578,14 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			Op(OP_FORD_LESS_THAN,    4, tBool, always, cZero, cOne);
 			shadedCol = never; inRange = always;
 		}
+		/* The history also stores whether the point was within the shadow distance (face + 8 when it isn't), */
+		/*  so that points that just moved into it don't keep their unshadowed history */
+		{
+			unsigned int faceOut = Id();
+			faceKey = Id();
+			Op(OP_FADD,   4, tFloat, faceOut, faceID, cEightF);
+			Op(OP_SELECT, 5, tFloat, faceKey, inRange, faceID, faceOut);
+		}
 		Op(OP_FORD_GREATER_THAN, 4, tBool, doSun,   direct, cMinDirect);
 		Op(OP_FORD_GREATER_THAN, 4, tBool, doAO,    aoStrength, cZero);
 		Op(OP_FORD_GREATER_THAN, 4, tBool, doGI,    giStrength, cZero);
@@ -1306,8 +1618,14 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_LOGICAL_OR,  4, tBool, anyB,   anyA, lightCond);
 		Op(OP_LOGICAL_OR,  4, tBool, anyRay, anyB, doGod);
 		/* (the shadow distance is already part of the conditions above) */
-		doRay = anyRay;
-		(void)doRayA;
+		/* Helper invocations (e.g. at the edges of leaves) only exist for derivatives, so they don't trace rays */
+		{
+			unsigned int helper = Id(), notHelper = Id();
+			Op(OP_LOAD, 3, tBool, helper, vHelper);
+			Op(OP_LOGICAL_NOT, 3, tBool, notHelper, helper);
+			Op(OP_LOGICAL_AND, 4, tBool, doRayA, anyRay, notHelper);
+			doRay = doRayA;
+		}
 
 		/* Direction from the camera towards this point */
 		invLenV = Id(); negInvLenV = Id(); viewDir = Id();
@@ -1330,6 +1648,12 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_STORE, 2, vHistSky, cOne);
 		Op(OP_STORE, 2, vHistBounce, cVec3Zero);
 		Op(OP_STORE, 2, vHistGod,    cZero);
+		Op(OP_STORE, 2, vResOk, cInt0);
+		Op(OP_STORE, 2, vResX,  cInt0);
+		Op(OP_STORE, 2, vResY,  cInt0);
+		Op(OP_STORE, 2, vPrevW, cZero);
+		Op(OP_STORE, 2, vTolW,  cZero);
+		Op(OP_STORE, 2, vOutRes, cVec4Zero);
 		Op(OP_FORD_GREATER_THAN, 4, tBool, isTemporal, temporal, cHalf);
 		Op(OP_INOT_EQUAL,        4, tBool, hasPrevB,   hasPrev,  cInt0);
 		Op(OP_LOGICAL_AND,       4, tBool, useHistory, isTemporal, hasPrevB);
@@ -1396,6 +1720,45 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			Op(OP_LOAD, 3, tSampled, giSampled, vGIHistory);
 			Op(OP_IMAGE, 3, tImage, giImage, giSampled);
 
+			/* The previous frame's nearest pixel, and whether it was the same surface (for reusing the block */
+			/*  light it picked, see the block lights below) */
+			{
+				unsigned int posR = Id(), posF = Id(), rI = Id(), rC = Id(), rSame = Id(), rOn = Id(), rh = Id(), rd = Id(), rl = Id();
+				unsigned int rdd = Id(), rdAbs = Id(), rDepth = Id(), rS = Id(), rFace = Id(), rF64 = Id(), rLen = Id(), rfd = Id(), rfAbs = Id();
+				unsigned int rFaceOk = Id(), rLenOk = Id(), rOk1 = Id(), rOk2 = Id(), rOk = Id(), rOkI = Id(), rx = Id(), ry = Id();
+				Op(OP_FADD, 4, tVec2, posR, pos, cVec2Half);
+				Op(OP_EXT_INST, 5, tVec2, posF, ext, GLSL_FLOOR, posR);
+				Op(OP_CONVERT_F_TO_S, 3, tIVec2, rI, posF);
+				Op(OP_EXT_INST, 7, tIVec2, rC, ext, GLSL_SCLAMP, rI, cIVec2Zero, maxI);
+				Op(OP_IEQUAL, 4, tBVec2, rSame, rI, rC);
+				Op(OP_ALL,    3, tBool,  rOn, rSame);
+				Op(OP_IMAGE_FETCH, 6, tVec4, rh, histImage, rC, IMAGE_OPERAND_LOD, cInt0);
+				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, rd, rh, 1);
+				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, rl, rh, 2);
+				Op(OP_FSUB, 4, tFloat, rdd, rd, pwCmp);
+				Op(OP_EXT_INST, 5, tFloat, rdAbs, ext, GLSL_FABS, rdd);
+				Op(OP_FORD_LESS_THAN, 4, tBool, rDepth, rdAbs, tol);
+				Op(OP_FMUL, 4, tFloat, rS, rl, cInv64);
+				Op(OP_EXT_INST, 5, tFloat, rFace, ext, GLSL_FLOOR, rS);
+				Op(OP_FMUL, 4, tFloat, rF64, rFace, cSkyPointsF);
+				Op(OP_FSUB, 4, tFloat, rLen, rl, rF64);
+				Op(OP_FSUB, 4, tFloat, rfd, rFace, faceKey);
+				Op(OP_EXT_INST, 5, tFloat, rfAbs, ext, GLSL_FABS, rfd);
+				Op(OP_FORD_LESS_THAN,    4, tBool, rFaceOk, rfAbs, cHalf);
+				Op(OP_FORD_GREATER_THAN, 4, tBool, rLenOk,  rLen,  cHalf);
+				Op(OP_LOGICAL_AND, 4, tBool, rOk1, rOn, rDepth);
+				Op(OP_LOGICAL_AND, 4, tBool, rOk2, rOk1, rFaceOk);
+				Op(OP_LOGICAL_AND, 4, tBool, rOk,  rOk2, rLenOk);
+				Op(OP_SELECT, 5, tInt, rOkI, rOk, cInt1, cInt0);
+				Op(OP_COMPOSITE_EXTRACT, 4, tInt, rx, rC, 0);
+				Op(OP_COMPOSITE_EXTRACT, 4, tInt, ry, rC, 1);
+				Op(OP_STORE, 2, vResOk, rOkI);
+				Op(OP_STORE, 2, vResX,  rx);
+				Op(OP_STORE, 2, vResY,  ry);
+				Op(OP_STORE, 2, vPrevW, pwCmp);
+				Op(OP_STORE, 2, vTolW,  tol);
+			}
+
 			for (t = 0; t < 4; t++)
 			{
 				unsigned int p = Id(), pc = Id(), h = Id(), hv = Id(), hd = Id(), hl = Id(), hs = Id(), diff = Id(), absDiff = Id(), same = Id();
@@ -1419,7 +1782,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				Op(OP_FSUB, 4, tFloat, diff, hd, pwCmp);
 				Op(OP_EXT_INST, 5, tFloat, absDiff, ext, GLSL_FABS, diff);
 				Op(OP_FORD_LESS_THAN, 4, tBool, same, absDiff, tol);
-				Op(OP_FSUB, 4, tFloat, faceDiff, hFace, faceID);
+				Op(OP_FSUB, 4, tFloat, faceDiff, hFace, faceKey);
 				Op(OP_EXT_INST, 5, tFloat, faceAbs, ext, GLSL_FABS, faceDiff);
 				Op(OP_FORD_LESS_THAN,    4, tBool, sameFace, faceAbs, cHalf);
 				Op(OP_FORD_GREATER_THAN, 4, tBool, hasLen,   hLen,    cHalf);
@@ -1498,7 +1861,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			unsigned int offs, pointRaw, point, pointF, pointH, fracP, r, ang, cosA, sinA, rc, rs, du, dv, dirA, dirB, dir;
 			unsigned int sOffs, sRaw, sPoint, sPointF, sPointH, sFrac, sR, sAng, sCos, sSin, sRc, sRs, sUp1, sUp, sT, sB, sN, sDirA, skyDir;
 			unsigned int hitsEnd, hitsEndF, blockedFrac, raw, skyHitsEnd, skyHitsF, skyBlocked, skyRaw;
-			unsigned int lenA, lenNew, invLen, single, sunWeight, delta, deltaScaled, visNew, skyDelta, skyDeltaScaled, skyNew;
+			unsigned int lenA, lenNew, invLen, invLenB, single, sunWeight, delta, deltaScaled, visNew, skyDelta, skyDeltaScaled, skyNew;
 			unsigned int histBounce, skyHit, skyMerge, giHit, giLabel, giMerge, bounceEnd, bounceRaw, bDelta, bDeltaScaled, bounceNew;
 			unsigned int histGod, godL, godOptical, godExp, godTrans, frameLow, frameLowF, frameSeq, godUa, godU0;
 			unsigned int godHitsF, godVis, godRaw, godDelta, godDeltaScaled, godNew;
@@ -1519,8 +1882,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			trace.cNone = cNone; trace.cCommitted = cCommitted; trace.cZero = cZero; trace.cOne = cOne; trace.cHalf = cHalf;
 			for (i = 0; i < 4; i++) trace.cIdx[i] = cIdx[i];
 
-			/* Only 1 ray of each type per frame is needed once there's enough history */
-			/*  (4 otherwise, so that surfaces that just became visible aren't noisy) */
+			/* Only 1 sun ray per frame is needed once there's enough history (2 otherwise, so that surfaces */
+			/*  that just became visible aren't as noisy, and 4 for translucent faces, which have no history) */
 			histVis = Id(); histLen = Id(); histSky = Id(); enough = Id(); rays = Id(); raysF = Id();
 			samplesF = Id(); step = Id(); skyStep = Id();
 			Op(OP_LOAD, 3, tFloat, histVis, vHistVis);
@@ -1529,8 +1892,13 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			histBounce = Id(); histGod = Id();
 			Op(OP_LOAD, 3, tVec3, histBounce, vHistBounce);
 			Op(OP_LOAD, 3, tFloat, histGod,   vHistGod);
-			Op(OP_FORD_GREATER_EQUAL, 4, tBool, enough, histLen, cFour);
-			Op(OP_SELECT, 5, tInt, rays, enough, cInt1, cIdx[4]);
+			Op(OP_FORD_GREATER_EQUAL, 4, tBool, enough, histLen, cTwo);
+			{
+				/* (translucent faces never have history, so they always get 4) */
+				unsigned int raysLow = Id();
+				Op(OP_SELECT, 5, tInt, raysLow, isTemporal, cInt2, cIdx[4]);
+				Op(OP_SELECT, 5, tInt, rays, enough, cInt1, raysLow);
+			}
 			Op(OP_CONVERT_S_TO_F, 3, tFloat, raysF,    rays);
 			Op(OP_CONVERT_S_TO_F, 3, tFloat, samplesF, samples);
 			/* With 4 rays, points N/4 apart on the spiral would all be in a narrow wedge, so a */
@@ -1892,123 +2260,216 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				}
 			}
 
-			/* Light from light emitting blocks: every light reaching this cell of the grid is weighted by how */
-			/*  much light it would give (ignoring shadows), then one is picked in proportion to that (so the */
-			/*  brightest/closest are picked most), and a ray is traced to check whether it's blocked */
+			/* Light from light emitting blocks, using ReSTIR (like Radiance does): each pixel picks one light from its */
+			/*  cell's list, then combines that with the lights the previous frame picked at this point and at nearby */
+			/*  pixels (so each pixel effectively picks from many more lights, with much less noise), and traces one ray */
+			/*  to the final picked light. Translucent faces have no history, so they just get the light of (up to 64 */
+			/*  of) the cell's lights without shadows instead. See the GLSL above */
 			{
 				unsigned int lightLabel = Id(), lightMerge = Id();
-				unsigned int dimV = Id(), dimM1 = Id(), halfDim = Id(), halfF = Id(), halfW = Id(), halfWV = Id(), halfFV = Id(), center = Id();
-				unsigned int dim2 = Id(), dimCube = Id(), inside = 0, cellIdx = 0, lvl;
-				unsigned int scaleIdx = Id(), scaleP = Id(), scaleBits = Id(), cellScale = Id();
-				unsigned int fq = Id(), fq2 = Id(), fw0 = Id(), fw1 = Id(), fw = Id(), intenW = Id(), wRatio0 = Id();
-				unsigned int levelScales[LIGHT_LEVELS];
+				unsigned int dimV = Id(), dimM1 = Id(), rel = Id(), relF = Id(), cI = Id(), cC = Id(), eq = Id(), inside = Id();
+				unsigned int cx = Id(), cy = Id(), cz = Id(), dx = Id(), dz = Id(), t1 = Id(), t2 = Id(), t3 = Id(), cellIdx = Id();
 				unsigned int gridPP = Id(), grid = Id(), idx2 = Id(), offP = Id(), off = Id(), idx2b = Id(), cntP = Id(), cnt = Id(), cntUse = Id();
 				unsigned int lightsPP = Id(), lights = Id();
+				unsigned int fewer = Id(), kept = Id(), rest = Id(), hasRest = Id(), extra = Id(), loopT = Id();
+				unsigned int fewer64 = Id(), cnt64 = Id(), loopN = Id();
+				unsigned int restLabel = Id(), restMerge = Id();
 				unsigned int lHeader = Id(), lCond = Id(), lBody = Id(), lCont = Id(), lMerge = Id(), j = Id(), go2 = Id(), j2 = Id();
-				unsigned int ei = Id(), eP = Id(), li = Id(), l2 = Id(), p0P = Id(), p0 = Id(), l2b = Id(), p1P = Id(), p1 = Id();
-				unsigned int lpos = Id(), inten = Id(), lcol = Id(), toL = Id(), d2 = Id(), invD = Id(), Ld = Id(), cosR = Id(), cosC = Id();
-				unsigned int d2p = Id(), atten = Id(), kL = Id(), fL = Id(), wL = Id(), ws = Id(), ws2 = Id();
-				unsigned int u = Id(), wsS = Id(), pk = Id(), pkS = Id(), uT = Id(), oneMp = Id(), oneMpS = Id(), uM = Id(), uN = Id(), uSel = Id(), uNew = Id();
-				unsigned int take0 = Id(), wPos = Id(), take = Id(), lmask = Id(), sm = Id(), nm = Id(), cosF = Id(), cosA = Id();
-				unsigned int si = Id(), ni = Id(), selIdx = Id(), sel3 = Id(), sel3b = Id(), p2P = Id(), p2 = Id(), he = Id();
-				unsigned int heOut = Id(), heIn0 = Id(), heIn = Id(), heNeg = Id(), faceDist = Id();
+				unsigned int isRest0 = Id(), isRest = Id(), restE = Id(), restM = Id(), entry = Id(), mult = Id();
+				unsigned int e2 = Id(), ei = Id(), eP = Id(), li = Id(), wC = Id();
+				unsigned int ws = Id(), ws2 = Id(), u = Id(), wsS = Id(), pk = Id(), pkS = Id(), uT = Id(), oneMp = Id(), oneMpS = Id();
+				unsigned int uM = Id(), uN = Id(), uSel = Id(), uNew = Id(), take0 = Id(), wPos = Id(), take = Id();
+				unsigned int sf = Id(), sw = Id(), sp = Id(), sm = Id(), si = Id(), nf = Id(), nw = Id(), np = Id(), nm = Id(), ni = Id();
 				unsigned int idxF = Id(), idxQ = Id(), pf = Id(), ua = Id(), ub = Id(), u0 = Id();
-				unsigned int sf = Id(), sw = Id(), sp = Id(), nf = Id(), nw = Id(), np = Id();
-				unsigned int selW = Id(), have = Id(), wsE = Id(), selF = Id(), selP = Id(), selWSafe = Id(), wRatio = Id(), est = Id();
-				unsigned int dl = Id(), adl = Id(), sc = Id(), off3 = Id(), surf = Id();
-				unsigned int selMaskF = Id(), maskI = Id(), maskV = Id(), negV = Id(), bitsV = Id(), shV = Id(), andV = Id(), openV = Id();
-				unsigned int frontV = Id(), okV = Id(), scoreV = Id(), sx = Id(), sy = Id(), sz = Id(), bestYZ = Id(), best = Id(), faceOk = Id();
-				unsigned int useX = Id(), yOverZ = Id(), notX = Id(), useY = Id(), notY = Id(), useZ = Id(), px = Id(), py = Id(), pz = Id();
-				unsigned int pick = Id(), bestS = Id(), offL = Id(), offC = Id(), sgn = Id(), faceOff = Id(), surfFace = Id();
-				unsigned int seg = Id(), segLen = Id(), segSafe = Id(), invSeg = Id(), dirS = Id(), tmaxA = Id(), tmaxS = Id();
-				unsigned int hitL, lightTraceMerge, visK = Id(), addL = Id(), accL = Id(), accL2 = Id();
+				unsigned int transLabel = Id(), transMerge = Id(), reuseLabel = Id(), reuseMerge = Id(), notTemporal = Id();
+				struct LightRayIds L;
+				struct RestirIds R;
+				struct LightEval ev;
 
 				Op(OP_SELECTION_MERGE,    2, lightMerge, 0);
 				Op(OP_BRANCH_CONDITIONAL, 3, lightCondR, lightLabel, lightMerge);
 				Op(OP_LABEL, 1, lightLabel);
 
-				/* Which cell this point is in. The grid has multiple levels around the camera, with each level's */
-				/*  cells being twice the size of the previous level's (so far away lights are still found, without */
-				/*  needing many more cells), and the finest level that contains this point is used */
-				Op(OP_COMPOSITE_CONSTRUCT, 5, tIVec3, dimV, gridDim, gridDim, gridDim);
+				/* Which cell of the grid this point is in (the grid covers the whole world, in cells of 8x8x8 blocks) */
+				Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, rel, origin, invCell);
+				Op(OP_EXT_INST, 5, tVec3, relF, ext, GLSL_FLOOR, rel);
+				Op(OP_CONVERT_F_TO_S, 3, tIVec3, cI,   relF);
+				Op(OP_CONVERT_F_TO_S, 3, tIVec3, dimV, gridCells);
 				Op(OP_ISUB, 4, tIVec3, dimM1, dimV, cIVec3One);
-				Op(OP_SDIV, 4, tInt, halfDim, gridDim, cInt2);
-				Op(OP_CONVERT_S_TO_F, 3, tFloat, halfF, halfDim);
-				Op(OP_FDIV, 4, tFloat, halfW, halfF, invCell);
-				Op(OP_COMPOSITE_CONSTRUCT, 5, tVec3, halfWV, halfW, halfW, halfW);
-				Op(OP_COMPOSITE_CONSTRUCT, 5, tVec3, halfFV, halfF, halfF, halfF);
-				/* The first level is centred on the camera's cell, and the other levels on the cell containing that */
-				Op(OP_FADD, 4, tVec3, center, gridOrigin, halfWV);
-				Op(OP_IMUL, 4, tInt, dim2,    gridDim, gridDim);
-				Op(OP_IMUL, 4, tInt, dimCube, dim2,    gridDim);
-				levelScales[0] = cOne; levelScales[1] = cHalf; levelScales[2] = cQuarter; levelScales[3] = cEighth;
+				Op(OP_EXT_INST, 7, tIVec3, cC, ext, GLSL_SCLAMP, cI, cIVec3Zero, dimM1);
+				Op(OP_IEQUAL, 4, tBVec3, eq, cI, cC);
+				Op(OP_ALL,    3, tBool,  inside, eq);
+				Op(OP_COMPOSITE_EXTRACT, 4, tInt, cx, cC, 0);
+				Op(OP_COMPOSITE_EXTRACT, 4, tInt, cy, cC, 1);
+				Op(OP_COMPOSITE_EXTRACT, 4, tInt, cz, cC, 2);
+				Op(OP_COMPOSITE_EXTRACT, 4, tInt, dx, dimV, 0);
+				Op(OP_COMPOSITE_EXTRACT, 4, tInt, dz, dimV, 2);
+				Op(OP_IMUL, 4, tInt, t1, cy, dz);
+				Op(OP_IADD, 4, tInt, t2, t1, cz);
+				Op(OP_IMUL, 4, tInt, t3, t2, dx);
+				Op(OP_IADD, 4, tInt, cellIdx, t3, cx);
 
-				for (lvl = LIGHT_LEVELS; lvl-- > 0; )
-				{
-					unsigned int invL, cs = Id(), csF = Id(), pS = Id(), relA = Id(), rel = Id(), relF = Id(), cI = Id(), cC = Id(), eq = Id(), in = Id();
-					unsigned int cx = Id(), cy = Id(), cz = Id(), t1 = Id(), t2 = Id(), t3 = Id(), idx = Id(), lvlOff = Id(), idxL = Id();
-
-					/* Cells of this level are 2^level times the size, and the level's grid starts at */
-					/*  floor(centre / size) * size - half * size, so the cell is floor(p / size - floor(centre / size) + half) */
-					if (lvl) { invL = Id(); Op(OP_FMUL, 4, tFloat, invL, invCell, levelScales[lvl]); }
-					else invL = invCell;
-					Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, cs, center, invL);
-					Op(OP_EXT_INST, 5, tVec3, csF, ext, GLSL_FLOOR, cs);
-					Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, pS, origin, invL);
-					Op(OP_FSUB, 4, tVec3, relA, pS, csF);
-					Op(OP_FADD, 4, tVec3, rel,  relA, halfFV);
-					Op(OP_EXT_INST, 5, tVec3, relF, ext, GLSL_FLOOR, rel);
-					Op(OP_CONVERT_F_TO_S, 3, tIVec3, cI, relF);
-					Op(OP_EXT_INST, 7, tIVec3, cC, ext, GLSL_SCLAMP, cI, cIVec3Zero, dimM1);
-					Op(OP_IEQUAL, 4, tBVec3, eq, cI, cC);
-					Op(OP_ALL,    3, tBool,  in, eq);
-					Op(OP_COMPOSITE_EXTRACT, 4, tInt, cx, cC, 0);
-					Op(OP_COMPOSITE_EXTRACT, 4, tInt, cy, cC, 1);
-					Op(OP_COMPOSITE_EXTRACT, 4, tInt, cz, cC, 2);
-					Op(OP_IMUL, 4, tInt, t1, cy, gridDim);
-					Op(OP_IADD, 4, tInt, t2, t1, cz);
-					Op(OP_IMUL, 4, tInt, t3, t2, gridDim);
-					Op(OP_IADD, 4, tInt, idx, t3, cx);
-					Op(OP_IMUL, 4, tInt, lvlOff, dimCube, cIdx[lvl]);
-					Op(OP_IADD, 4, tInt, idxL, idx, lvlOff);
-
-					/* Levels are checked from coarsest to finest, so finer levels replace coarser ones */
-					if (lvl == LIGHT_LEVELS - 1) {
-						cellIdx = idxL; inside = in;
-					} else {
-						unsigned int selIdx = Id(), anyIn = Id();
-						Op(OP_SELECT,     5, tInt,  selIdx, in, idxL, cellIdx);
-						Op(OP_LOGICAL_OR, 4, tBool, anyIn,  inside, in);
-						cellIdx = selIdx; inside = anyIn;
-					}
-				}
-
+				/* Each cell is (offset, count), and each entry of its list is (light index, running total of importance) */
 				Op(OP_ACCESS_CHAIN, 4, pParamsIntPtr, gridPP, vParams, cIdx[28]);
 				Op(OP_LOAD, 3, tIntPtr, grid, gridPP);
-				Op(OP_IMUL, 4, tInt, idx2, cellIdx, cIdx[3]);
+				Op(OP_IMUL, 4, tInt, idx2, cellIdx, cInt2);
 				Op(OP_PTR_ACCESS_CHAIN, 4, tIntPtr, offP, grid, idx2);
 				Op(OP_LOAD, 5, tInt, off, offP, MEMORY_ALIGNED, 4);
 				Op(OP_IADD, 4, tInt, idx2b, idx2, cInt1);
 				Op(OP_PTR_ACCESS_CHAIN, 4, tIntPtr, cntP, grid, idx2b);
 				Op(OP_LOAD, 5, tInt, cnt, cntP, MEMORY_ALIGNED, 4);
 				Op(OP_SELECT, 5, tInt, cntUse, inside, cnt, cInt0);
-				/* When too many lights reach a cell, it only has some of them, so their light is scaled up to make up for that */
-				Op(OP_IADD, 4, tInt, scaleIdx, idx2, cInt2);
-				Op(OP_PTR_ACCESS_CHAIN, 4, tIntPtr, scaleP, grid, scaleIdx);
-				Op(OP_LOAD, 5, tInt, scaleBits, scaleP, MEMORY_ALIGNED, 4);
-				Op(OP_BITCAST, 3, tFloat, cellScale, scaleBits);
 				Op(OP_ACCESS_CHAIN, 4, pParamsVec4Ptr, lightsPP, vParams, cIdx[27]);
 				Op(OP_LOAD, 3, tVec4Ptr, lights, lightsPP);
 
-				Op(OP_STORE, 2, vLj,     cInt0);
-				Op(OP_STORE, 2, vWSum,   cZero);
-				Op(OP_STORE, 2, vSelW,   cZero);
-				Op(OP_STORE, 2, vSelF,   cVec3Zero);
-				Op(OP_STORE, 2, vSelPos, cVec3Zero);
-				Op(OP_STORE, 2, vSumF,   cVec3Zero);
+				L.ext = ext; L.tInt = tInt; L.tFloat = tFloat; L.tVec3 = tVec3; L.tVec4 = tVec4; L.tIVec3 = tIVec3;
+				L.tBVec3 = tBVec3; L.tBool = tBool; L.tVec4Ptr = tVec4Ptr;
+				L.cZero = cZero; L.cOne = cOne; L.cInt0 = cInt0; L.cInt1 = cInt1; L.cInt2 = cInt2; L.cIdx3 = cIdx[3];
+				L.cTiny = cTiny; L.cMinWeight = cMinWeight; L.cDepthTol = cDepthTol;
+				L.cVec3Zero = cVec3Zero; L.cVec3Gap = cVec3Gap; L.cVec3NegOne = cVec3NegOne;
+				L.cIVec3Zero = cIVec3Zero; L.cIVec3One = cIVec3One; L.cFaceBitsLo = cFaceBitsLo; L.cFaceBitsHi = cFaceBitsHi;
+				L.lights = lights; L.origin = origin; L.lightStrength = lightStrength;
+				L.vBounce = vBounce; L.vLightHits = vLightHits; L.trace = &trace;
+				L.n = n; L.axisAligned = axisAligned; L.cInvReach2 = cInvReach2; L.cLumW = cLumW;
+
+				R.L = &L; R.tInt = tInt; R.tFloat = tFloat; R.tVec3 = tVec3; R.tVec4 = tVec4; R.tIVec2 = tIVec2; R.tBool = tBool;
+				R.cZero = cZero; R.cInt0 = cInt0; R.cIdx8 = cIdx[8]; R.cInv2Pow24 = cInv2Pow24;
+				R.cLcgA = cLcgA; R.cLcgC = cLcgC; R.cMaxM = cMaxM; R.resImage = 0; R.numLights = numLights;
+				R.vRng = vRng; R.vWSum = vWSum; R.vM = vM; R.vSelIdx = vSelIdx; R.vSelF = vSelF; R.vSelW = vSelW;
+				R.vSelPos = vSelPos; R.vSelMask = vSelMask;
+
+				/* Random number state (from a hash of the pixel and frame) */
+				{
+					unsigned int fx = Id(), fy = Id(), hx = Id(), hy = Id(), h0a = Id(), h0b = Id(), h0 = Id(), hfr = Id(), h0c = Id();
+					unsigned int h1a = Id(), h1b = Id(), h1 = Id(), h2 = Id(), h3a = Id(), h3 = Id(), h4 = Id(), h5a = Id(), h5 = Id();
+					Op(OP_COMPOSITE_EXTRACT, 4, tFloat, fx, fragXY, 0);
+					Op(OP_COMPOSITE_EXTRACT, 4, tFloat, fy, fragXY, 1);
+					Op(OP_CONVERT_F_TO_S, 3, tInt, hx, fx);
+					Op(OP_CONVERT_F_TO_S, 3, tInt, hy, fy);
+					Op(OP_IMUL, 4, tInt, h0a, hx, cHashX);
+					Op(OP_IMUL, 4, tInt, h0b, hy, cHashY);
+					Op(OP_IADD, 4, tInt, h0,  h0a, h0b);
+					Op(OP_IMUL, 4, tInt, hfr, frameLow, cHashF);
+					Op(OP_IADD, 4, tInt, h0c, h0, hfr);
+					Op(OP_BITWISE_XOR, 4, tInt, h1a, h0c, cHash61);
+					Op(OP_SHIFT_RIGHT_LOGICAL, 4, tInt, h1b, h0c, cIdx[16]);
+					Op(OP_BITWISE_XOR, 4, tInt, h1, h1a, h1b);
+					Op(OP_IMUL, 4, tInt, h2, h1, cHash9);
+					Op(OP_SHIFT_RIGHT_LOGICAL, 4, tInt, h3a, h2, cIdx[4]);
+					Op(OP_BITWISE_XOR, 4, tInt, h3, h2, h3a);
+					Op(OP_IMUL, 4, tInt, h4, h3, cHashM);
+					Op(OP_SHIFT_RIGHT_LOGICAL, 4, tInt, h5a, h4, cIdx[15]);
+					Op(OP_BITWISE_XOR, 4, tInt, h5, h4, h5a);
+					Op(OP_STORE, 2, vRng, h5);
+				}
+
+				/* Up to the first 16 lights, plus one picked from the rest (64 lights for translucent faces) */
+				Op(OP_SLESS_THAN, 4, tBool, fewer, cntUse, cIdx[LIGHTS_PER_CELL]);
+				Op(OP_SELECT, 5, tInt, kept, fewer, cntUse, cIdx[LIGHTS_PER_CELL]);
+				Op(OP_ISUB, 4, tInt, rest, cntUse, kept);
+				Op(OP_SLESS_THAN, 4, tBool, hasRest, cInt0, rest);
+				Op(OP_SELECT, 5, tInt, extra, hasRest, cInt1, cInt0);
+				Op(OP_IADD, 4, tInt, loopT, kept, extra);
+				Op(OP_SLESS_THAN, 4, tBool, fewer64, cntUse, cInt64);
+				Op(OP_SELECT, 5, tInt, cnt64, fewer64, cntUse, cInt64);
+				Op(OP_SELECT, 5, tInt, loopN, isTemporalEarly, loopT, cnt64);
+
+				/* One of the rest is picked in proportion to its importance to the cell, by finding where a random */
+				/*  number falls in the running total of importance. Its weight is then scaled up by 1 / the probability */
+				/*  of picking it (total importance / its importance), so on average it counts as all of them */
+				Op(OP_STORE, 2, vRestEntry, cIdx[LIGHTS_PER_CELL]);
+				Op(OP_STORE, 2, vRestMult,  cZero);
+				Op(OP_SELECTION_MERGE,    2, restMerge, 0);
+				Op(OP_BRANCH_CONDITIONAL, 3, hasRest, restLabel, restMerge);
+				Op(OP_LABEL, 1, restLabel);
+				{
+					unsigned int ur, last = Id(), last2 = Id(), lastI = Id(), lastI1 = Id(), lastP = Id(), lastBits = Id(), restTotal = Id(), target = Id();
+					unsigned int bHeader = Id(), bCond = Id(), bBody = Id(), bCont = Id(), bMerge = Id();
+					unsigned int lo = Id(), hi = Id(), searching = Id(), sum = Id(), mid = Id(), m2 = Id(), mI0 = Id(), mI = Id(), mP = Id(), mBits = Id();
+					unsigned int mCum = Id(), above = Id(), mid1 = Id(), newLo = Id(), newHi = Id();
+					unsigned int k = Id(), k2 = Id(), kI0 = Id(), kI = Id(), kP = Id(), kBits = Id(), kCum = Id(), isFirst = Id(), kM1 = Id(), kPrev = Id();
+					unsigned int p2 = Id(), pI0 = Id(), pI = Id(), pP = Id(), pBits = Id(), pCum = Id(), prev = Id(), wK = Id(), wKSafe = Id(), rMult = Id();
+
+					ur = EmitRandom(&R);
+					/* Total importance of the rest = running total of the last entry */
+					Op(OP_ISUB, 4, tInt, last, cntUse, cInt1);
+					Op(OP_IMUL, 4, tInt, last2, last, cInt2);
+					Op(OP_IADD, 4, tInt, lastI, off, last2);
+					Op(OP_IADD, 4, tInt, lastI1, lastI, cInt1);
+					Op(OP_PTR_ACCESS_CHAIN, 4, tIntPtr, lastP, grid, lastI1);
+					Op(OP_LOAD, 5, tInt, lastBits, lastP, MEMORY_ALIGNED, 4);
+					Op(OP_BITCAST, 3, tFloat, restTotal, lastBits);
+					Op(OP_FMUL, 4, tFloat, target, ur, restTotal);
+
+					/* Binary search for the first entry whose running total is more than the target */
+					Op(OP_STORE, 2, vLo, cIdx[LIGHTS_PER_CELL]);
+					Op(OP_STORE, 2, vHi, last);
+					Op(OP_BRANCH, 1, bHeader);
+					Op(OP_LABEL,  1, bHeader);
+					Op(OP_LOOP_MERGE, 3, bMerge, bCont, 0);
+					Op(OP_BRANCH, 1, bCond);
+					Op(OP_LABEL,  1, bCond);
+					Op(OP_LOAD, 3, tInt, lo, vLo);
+					Op(OP_LOAD, 3, tInt, hi, vHi);
+					Op(OP_SLESS_THAN, 4, tBool, searching, lo, hi);
+					Op(OP_BRANCH_CONDITIONAL, 3, searching, bBody, bMerge);
+					Op(OP_LABEL, 1, bBody);
+					Op(OP_IADD, 4, tInt, sum, lo, hi);
+					Op(OP_SHIFT_RIGHT_LOGICAL, 4, tInt, mid, sum, cInt1);
+					Op(OP_IMUL, 4, tInt, m2, mid, cInt2);
+					Op(OP_IADD, 4, tInt, mI0, off, m2);
+					Op(OP_IADD, 4, tInt, mI, mI0, cInt1);
+					Op(OP_PTR_ACCESS_CHAIN, 4, tIntPtr, mP, grid, mI);
+					Op(OP_LOAD, 5, tInt, mBits, mP, MEMORY_ALIGNED, 4);
+					Op(OP_BITCAST, 3, tFloat, mCum, mBits);
+					Op(OP_FORD_GREATER_THAN, 4, tBool, above, mCum, target);
+					Op(OP_IADD, 4, tInt, mid1, mid, cInt1);
+					Op(OP_SELECT, 5, tInt, newLo, above, lo, mid1);
+					Op(OP_SELECT, 5, tInt, newHi, above, mid, hi);
+					Op(OP_STORE, 2, vLo, newLo);
+					Op(OP_STORE, 2, vHi, newHi);
+					Op(OP_BRANCH, 1, bCont);
+					Op(OP_LABEL,  1, bCont);
+					Op(OP_BRANCH, 1, bHeader);
+					Op(OP_LABEL,  1, bMerge);
+
+					/* Its importance = its running total - the previous entry's running total */
+					Op(OP_LOAD, 3, tInt, k, vLo);
+					Op(OP_IMUL, 4, tInt, k2, k, cInt2);
+					Op(OP_IADD, 4, tInt, kI0, off, k2);
+					Op(OP_IADD, 4, tInt, kI, kI0, cInt1);
+					Op(OP_PTR_ACCESS_CHAIN, 4, tIntPtr, kP, grid, kI);
+					Op(OP_LOAD, 5, tInt, kBits, kP, MEMORY_ALIGNED, 4);
+					Op(OP_BITCAST, 3, tFloat, kCum, kBits);
+					Op(OP_IEQUAL, 4, tBool, isFirst, k, cIdx[LIGHTS_PER_CELL]);
+					Op(OP_ISUB, 4, tInt, kM1, k, cInt1);
+					Op(OP_SELECT, 5, tInt, kPrev, isFirst, k, kM1);
+					Op(OP_IMUL, 4, tInt, p2, kPrev, cInt2);
+					Op(OP_IADD, 4, tInt, pI0, off, p2);
+					Op(OP_IADD, 4, tInt, pI, pI0, cInt1);
+					Op(OP_PTR_ACCESS_CHAIN, 4, tIntPtr, pP, grid, pI);
+					Op(OP_LOAD, 5, tInt, pBits, pP, MEMORY_ALIGNED, 4);
+					Op(OP_BITCAST, 3, tFloat, pCum, pBits);
+					Op(OP_SELECT, 5, tFloat, prev, isFirst, cZero, pCum);
+					Op(OP_FSUB, 4, tFloat, wK, kCum, prev);
+					Op(OP_EXT_INST, 6, tFloat, wKSafe, ext, GLSL_FMAX, wK, cTiny);
+					Op(OP_FDIV, 4, tFloat, rMult, restTotal, wKSafe);
+					Op(OP_STORE, 2, vRestEntry, k);
+					Op(OP_STORE, 2, vRestMult,  rMult);
+				}
+				Op(OP_BRANCH, 1, restMerge);
+				Op(OP_LABEL,  1, restMerge);
+
+				Op(OP_STORE, 2, vLj,      cInt0);
+				Op(OP_STORE, 2, vWSum,    cZero);
+				Op(OP_STORE, 2, vSelW,    cZero);
+				Op(OP_STORE, 2, vSelF,    cVec3Zero);
+				Op(OP_STORE, 2, vSelPos,  cVec3Zero);
+				Op(OP_STORE, 2, vSumF,    cVec3Zero);
 				Op(OP_STORE, 2, vSelMask, cZero);
 				Op(OP_STORE, 2, vSelIdx,  cInt0);
-				/* Random number for picking a light (different for each of the rays when there are 4) */
+				Op(OP_STORE, 2, vM,       cOne);
+				/* Random number for picking a light (interleaved gradient noise, different each frame) */
 				Op(OP_CONVERT_S_TO_F, 3, tFloat, idxF, index);
 				Op(OP_FMUL, 4, tFloat, idxQ, idxF, cQuarter);
 				Op(OP_FMUL, 4, tFloat, pf, frameLowF, cPlastic);
@@ -2022,52 +2483,27 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				Op(OP_BRANCH, 1, lCond);
 				Op(OP_LABEL,  1, lCond);
 				Op(OP_LOAD, 3, tInt, j, vLj);
-				Op(OP_SLESS_THAN, 4, tBool, go2, j, cntUse);
+				Op(OP_SLESS_THAN, 4, tBool, go2, j, loopN);
 				Op(OP_BRANCH_CONDITIONAL, 3, go2, lBody, lMerge);
 				Op(OP_LABEL, 1, lBody);
 
-				/* Each light is 3 vec4s: centre and intensity, colour and faces, then half size (only used for the picked light) */
-				Op(OP_IADD, 4, tInt, ei, off, j);
+				/* After the first 16 lights comes the one picked from the rest (only for faces with history) */
+				Op(OP_IEQUAL, 4, tBool, isRest0, j, cIdx[LIGHTS_PER_CELL]);
+				Op(OP_LOGICAL_AND, 4, tBool, isRest, isRest0, isTemporalEarly);
+				Op(OP_LOAD, 3, tInt,   restE, vRestEntry);
+				Op(OP_LOAD, 3, tFloat, restM, vRestMult);
+				Op(OP_SELECT, 5, tInt,   entry, isRest, restE, j);
+				Op(OP_SELECT, 5, tFloat, mult,  isRest, restM, cOne);
+				Op(OP_IMUL, 4, tInt, e2, entry, cInt2);
+				Op(OP_IADD, 4, tInt, ei, off, e2);
 				Op(OP_PTR_ACCESS_CHAIN, 4, tIntPtr, eP, grid, ei);
 				Op(OP_LOAD, 5, tInt, li, eP, MEMORY_ALIGNED, 4);
-				Op(OP_IMUL, 4, tInt, l2, li, cIdx[3]);
-				Op(OP_PTR_ACCESS_CHAIN, 4, tVec4Ptr, p0P, lights, l2);
-				Op(OP_LOAD, 5, tVec4, p0, p0P, MEMORY_ALIGNED, 16);
-				Op(OP_IADD, 4, tInt, l2b, l2, cInt1);
-				Op(OP_PTR_ACCESS_CHAIN, 4, tVec4Ptr, p1P, lights, l2b);
-				Op(OP_LOAD, 5, tVec4, p1, p1P, MEMORY_ALIGNED, 16);
-				Op(OP_VECTOR_SHUFFLE, 7, tVec3, lpos, p0, p0, 0, 1, 2);
-				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, inten, p0, 3);
-				Op(OP_VECTOR_SHUFFLE, 7, tVec3, lcol, p1, p1, 0, 1, 2);
-				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, lmask, p1, 3);
-
-				/* Light that would reach this point: colour * intensity * cos * window / (1 + distance^2), where */
-				/*  window = (1 - (distance / reach)^4)^2 smoothly fades the light out to 0 at the edge of its reach */
-				/*  (so that light reaches the same distance no matter which level of the grid the point uses) */
-				Op(OP_FSUB, 4, tVec3, toL, lpos, origin);
-				Op(OP_DOT,  4, tFloat, d2, toL, toL);
-				Op(OP_EXT_INST, 5, tFloat, invD, ext, GLSL_INVERSE_SQRT, d2);
-				Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, Ld, toL, invD);
-				Op(OP_DOT,  4, tFloat, cosR, n, Ld);
-				Op(OP_EXT_INST, 6, tFloat, cosF, ext, GLSL_FMAX, cosR, cZero);
-				Op(OP_EXT_INST, 5, tFloat, cosA, ext, GLSL_FABS, cosR);
-				/* Sprites (e.g. plants) are lit from both sides */
-				Op(OP_SELECT, 5, tFloat, cosC, axisAligned, cosF, cosA);
-				Op(OP_FMUL, 4, tFloat, fq,  d2, cInvReach2);
-				Op(OP_FMUL, 4, tFloat, fq2, fq, fq);
-				Op(OP_FSUB, 4, tFloat, fw0, cOne, fq2);
-				Op(OP_EXT_INST, 6, tFloat, fw1, ext, GLSL_FMAX, fw0, cZero);
-				Op(OP_FMUL, 4, tFloat, fw,     fw1, fw1);
-				Op(OP_FMUL, 4, tFloat, intenW, inten, fw);
-				Op(OP_FADD, 4, tFloat, d2p,   d2, cOne);
-				Op(OP_FDIV, 4, tFloat, atten, intenW, d2p);
-				Op(OP_FMUL, 4, tFloat, kL,    atten, cosC);
-				Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, fL, lcol, kL);
-				Op(OP_DOT,  4, tFloat, wL, fL, cLumW);
+				EmitLightEval(&L, li, &ev);
+				Op(OP_FMUL, 4, tFloat, wC, ev.phat, mult);
 				{
 					unsigned int sumA = Id(), sumB = Id();
 					Op(OP_LOAD, 3, tVec3, sumA, vSumF);
-					Op(OP_FADD, 4, tVec3, sumB, sumA, fL);
+					Op(OP_FADD, 4, tVec3, sumB, sumA, ev.f);
 					Op(OP_STORE, 2, vSumF, sumB);
 				}
 
@@ -2075,13 +2511,13 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				/*  One random number u is reused for every light, by rescaling it to [0, 1) after each decision */
 				/*  (u / p if the light was picked, (u - p) / (1 - p) if not), so every decision is independent */
 				Op(OP_LOAD, 3, tFloat, ws, vWSum);
-				Op(OP_FADD, 4, tFloat, ws2, ws, wL);
+				Op(OP_FADD, 4, tFloat, ws2, ws, wC);
 				Op(OP_STORE, 2, vWSum, ws2);
 				Op(OP_LOAD, 3, tFloat, u, vU);
 				Op(OP_EXT_INST, 6, tFloat, wsS, ext, GLSL_FMAX, ws2, cTiny);
-				Op(OP_FDIV, 4, tFloat, pk, wL, wsS);
+				Op(OP_FDIV, 4, tFloat, pk, wC, wsS);
 				Op(OP_FORD_LESS_THAN,    4, tBool, take0, u, pk);
-				Op(OP_FORD_GREATER_THAN, 4, tBool, wPos,  wL, cZero);
+				Op(OP_FORD_GREATER_THAN, 4, tBool, wPos,  wC, cZero);
 				Op(OP_LOGICAL_AND, 4, tBool, take, take0, wPos);
 				Op(OP_EXT_INST, 6, tFloat, pkS, ext, GLSL_FMAX, pk, cTiny);
 				Op(OP_FDIV, 4, tFloat, uT, u, pkS);
@@ -2097,14 +2533,14 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				Op(OP_LOAD, 3, tVec3,  sp, vSelPos);
 				Op(OP_LOAD, 3, tFloat, sm, vSelMask);
 				Op(OP_LOAD, 3, tInt,   si, vSelIdx);
-				Op(OP_SELECT, 5, tVec3,  nf, take, fL, sf);
-				Op(OP_SELECT, 5, tFloat, nw, take, wL, sw);
-				Op(OP_SELECT, 5, tVec3,  np, take, lpos, sp);
-				Op(OP_SELECT, 5, tFloat, nm, take, lmask, sm);
-				Op(OP_SELECT, 5, tInt,   ni, take, li, si);
-				Op(OP_STORE, 2, vSelF,   nf);
-				Op(OP_STORE, 2, vSelW,   nw);
-				Op(OP_STORE, 2, vSelPos, np);
+				Op(OP_SELECT, 5, tVec3,  nf, take, ev.f,     sf);
+				Op(OP_SELECT, 5, tFloat, nw, take, ev.phat,  sw);
+				Op(OP_SELECT, 5, tVec3,  np, take, ev.lpos,  sp);
+				Op(OP_SELECT, 5, tFloat, nm, take, ev.lmask, sm);
+				Op(OP_SELECT, 5, tInt,   ni, take, li,       si);
+				Op(OP_STORE, 2, vSelF,    nf);
+				Op(OP_STORE, 2, vSelW,    nw);
+				Op(OP_STORE, 2, vSelPos,  np);
 				Op(OP_STORE, 2, vSelMask, nm);
 				Op(OP_STORE, 2, vSelIdx,  ni);
 				Op(OP_BRANCH, 1, lCont);
@@ -2114,107 +2550,139 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				Op(OP_BRANCH, 1, lHeader);
 				Op(OP_LABEL,  1, lMerge);
 
-				/* Estimate = light from the selected light / its probability (weight / total) */
-				Op(OP_LOAD, 3, tFloat, selW, vSelW);
-				Op(OP_FORD_GREATER_THAN, 4, tBool, have, selW, cZero);
-				Op(OP_LOAD, 3, tFloat, wsE,  vWSum);
-				Op(OP_LOAD, 3, tVec3,  selF, vSelF);
-				Op(OP_LOAD, 3, tVec3,  selP, vSelPos);
-				Op(OP_EXT_INST, 6, tFloat, selWSafe, ext, GLSL_FMAX, selW, cTiny);
-				Op(OP_FDIV, 4, tFloat, wRatio0, wsE, selWSafe);
-				Op(OP_FMUL, 4, tFloat, wRatio,  wRatio0, cellScale);
-				Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, est, selF, wRatio);
-
-				/* The picked light's box (half size), e.g. lava is lower than a full block */
-				Op(OP_LOAD, 3, tInt, selIdx, vSelIdx);
-				Op(OP_IMUL, 4, tInt, sel3,  selIdx, cIdx[3]);
-				Op(OP_IADD, 4, tInt, sel3b, sel3, cInt2);
-				Op(OP_PTR_ACCESS_CHAIN, 4, tVec4Ptr, p2P, lights, sel3b);
-				Op(OP_LOAD, 5, tVec4, p2, p2P, MEMORY_ALIGNED, 16);
-				Op(OP_VECTOR_SHUFFLE, 7, tVec3, he, p2, p2, 0, 1, 2);
-				Op(OP_FADD, 4, tVec3, heOut, he, cVec3Gap);
-				Op(OP_FSUB, 4, tVec3, heIn0, he, cVec3Gap);
-				Op(OP_EXT_INST, 6, tVec3, heIn, ext, GLSL_FMAX, heIn0, cVec3Zero);
-				Op(OP_FNEGATE, 3, tVec3, heNeg, heIn);
-
-				/* Ray goes to a face of the light block that light gets out of (i.e. isn't covered by another block) */
-				/*  and that this point is in front of (the one it's furthest in front of), at the point on that */
-				/*  face closest to the line from this point to the light's centre. When there's no such face, this */
-				/*  point is right next to the light (e.g. a wall next to fire, whose light comes from inside its */
-				/*  block), so the ray goes to the light's centre instead (anywhere else, a ray to the centre would */
-				/*  go through the surface of whatever covers the light, so it's still blocked) */
-				Op(OP_FSUB, 4, tVec3, dl, origin, selP);
-				Op(OP_EXT_INST, 5, tVec3, adl, ext, GLSL_FABS, dl);
-				Op(OP_LOAD, 3, tFloat, selMaskF, vSelMask);
-				Op(OP_CONVERT_F_TO_S, 3, tInt, maskI, selMaskF);
-				Op(OP_COMPOSITE_CONSTRUCT, 5, tIVec3, maskV, maskI, maskI, maskI);
-				Op(OP_FORD_LESS_THAN, 4, tBVec3, negV, dl, cVec3Zero);
-				Op(OP_SELECT, 5, tIVec3, bitsV, negV, cFaceBitsLo, cFaceBitsHi);
-				Op(OP_SHIFT_RIGHT_LOGICAL, 4, tIVec3, shV, maskV, bitsV);
-				Op(OP_BITWISE_AND, 4, tIVec3, andV, shV, cIVec3One);
-				Op(OP_INOT_EQUAL, 4, tBVec3, openV, andV, cIVec3Zero);
-				Op(OP_FORD_GREATER_THAN, 4, tBVec3, frontV, adl, he);
-				Op(OP_LOGICAL_AND, 4, tBVec3, okV, openV, frontV);
-				Op(OP_SELECT, 5, tVec3, scoreV, okV, adl, cVec3NegOne);
-				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, sx, scoreV, 0);
-				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, sy, scoreV, 1);
-				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, sz, scoreV, 2);
-				Op(OP_EXT_INST, 6, tFloat, bestYZ, ext, GLSL_FMAX, sy, sz);
-				Op(OP_EXT_INST, 6, tFloat, best,   ext, GLSL_FMAX, sx, bestYZ);
-				Op(OP_FORD_GREATER_THAN, 4, tBool, faceOk, best, cZero);
-				Op(OP_FORD_GREATER_EQUAL, 4, tBool, useX,   sx, best);
-				Op(OP_FORD_GREATER_EQUAL, 4, tBool, yOverZ, sy, sz);
-				Op(OP_LOGICAL_NOT, 3, tBool, notX, useX);
-				Op(OP_LOGICAL_AND, 4, tBool, useY, notX, yOverZ);
-				Op(OP_LOGICAL_NOT, 3, tBool, notY, yOverZ);
-				Op(OP_LOGICAL_AND, 4, tBool, useZ, notX, notY);
-				Op(OP_SELECT, 5, tFloat, px, useX, cOne, cZero);
-				Op(OP_SELECT, 5, tFloat, py, useY, cOne, cZero);
-				Op(OP_SELECT, 5, tFloat, pz, useZ, cOne, cZero);
-				Op(OP_COMPOSITE_CONSTRUCT, 5, tVec3, pick, px, py, pz);
-				Op(OP_EXT_INST, 6, tFloat, bestS, ext, GLSL_FMAX, best, cTiny);
-				Op(OP_DOT,  4, tFloat, faceDist, pick, heOut);
-				Op(OP_FDIV, 4, tFloat, sc, faceDist, bestS);
-				Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, offL, dl, sc);
-				Op(OP_EXT_INST, 7, tVec3, offC, ext, GLSL_FCLAMP, offL, heNeg, heIn);
-				Op(OP_EXT_INST, 5, tVec3, sgn, ext, GLSL_FSIGN, dl);
-				Op(OP_FMUL, 4, tVec3, faceOff, sgn, heOut);
-				Op(OP_EXT_INST, 7, tVec3, off3, ext, GLSL_FMIX, offC, faceOff, pick);
-				Op(OP_FADD, 4, tVec3, surfFace, selP, off3);
-				Op(OP_SELECT, 5, tVec3, surf, faceOk, surfFace, selP);
-				Op(OP_FSUB, 4, tVec3, seg, surf, origin);
-				Op(OP_EXT_INST, 5, tFloat, segLen, ext, GLSL_LENGTH, seg);
-				Op(OP_EXT_INST, 6, tFloat, segSafe, ext, GLSL_FMAX, segLen, cMinWeight);
-				Op(OP_FDIV, 4, tFloat, invSeg, cOne, segSafe);
-				Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, dirS, seg, invSeg);
-				Op(OP_FSUB, 4, tFloat, tmaxA, segLen, cDepthTol);
-				Op(OP_EXT_INST, 6, tFloat, tmaxS, ext, GLSL_FMAX, tmaxA, cMinWeight);
-
-				/* Translucent faces just get the light from every light (no randomness, so no noise) */
+				/* Translucent faces just get the light from the cell's lights (no randomness, so no noise) */
+				Op(OP_LOGICAL_NOT, 3, tBool, notTemporal, isTemporalEarly);
+				Op(OP_SELECTION_MERGE,    2, transMerge, 0);
+				Op(OP_BRANCH_CONDITIONAL, 3, notTemporal, transLabel, transMerge);
+				Op(OP_LABEL, 1, transLabel);
 				{
-					unsigned int sumEnd = Id(), sumK = Id(), sumScaled = Id(), detAdd = Id(), accD = Id(), accD2 = Id(), haveT = Id();
+					unsigned int sumEnd = Id(), sumScaled = Id(), accD = Id(), accD2 = Id();
 					Op(OP_LOAD, 3, tVec3, sumEnd, vSumF);
-					Op(OP_FMUL, 4, tFloat, sumK, lightStrength, cellScale);
-					Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, sumScaled, sumEnd, sumK);
-					Op(OP_SELECT, 5, tVec3, detAdd, isTemporalEarly, cVec3Zero, sumScaled);
+					Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, sumScaled, sumEnd, lightStrength);
 					Op(OP_LOAD, 3, tVec3, accD, vBounce);
-					Op(OP_FADD, 4, tVec3, accD2, accD, detAdd);
+					Op(OP_FADD, 4, tVec3, accD2, accD, sumScaled);
 					Op(OP_STORE, 2, vBounce, accD2);
-					Op(OP_LOGICAL_AND, 4, tBool, haveT, have, isTemporalEarly);
-					have = haveT;
 				}
+				Op(OP_BRANCH, 1, transMerge);
+				Op(OP_LABEL,  1, transMerge);
 
-				Op(OP_STORE, 2, vLightHits, cInt0);
-				hitL = EmitTraceBegin(&trace, have, origin, dirS, tmaxS, trace.cFlags, &lightTraceMerge);
-				Op(OP_SELECT, 5, tFloat, visK, hitL, cZero, lightStrength);
-				Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, addL, est, visK);
-				Op(OP_LOAD, 3, tVec3, accL, vBounce);
-				Op(OP_FADD, 4, tVec3, accL2, accL, addL);
-				Op(OP_STORE, 2, vBounce, accL2);
-				EmitTraceEnd(&trace, hitL, vLightHits, lightTraceMerge);
+				/* Faces with history reuse the lights picked by the previous frame, then trace a ray to the picked light */
+				Op(OP_SELECTION_MERGE,    2, reuseMerge, 0);
+				Op(OP_BRANCH_CONDITIONAL, 3, isTemporalEarly, reuseLabel, reuseMerge);
+				Op(OP_LABEL, 1, reuseLabel);
+				{
+					unsigned int resSampled = Id(), resImage = Id(), histSampled2 = Id(), histImage2 = Id();
+					unsigned int okI = Id(), ok = Id(), rx = Id(), ry = Id(), rpix = Id(), prevW = Id(), hasPrevW = Id();
+					unsigned int sizeI2 = Id(), maxI2 = Id();
+					unsigned int selW = Id(), have = Id(), wsE = Id(), selF = Id(), selP = Id(), selM = Id(), selI = Id(), mEnd = Id();
+					unsigned int den = Id(), denS = Id(), W = Id(), est = Id(), blocked = Id(), WOut = Id(), mOut = Id(), selIF = Id(), res = Id();
+					int k;
+
+					Op(OP_LOAD, 3, tSampled, resSampled, vResHistory);
+					Op(OP_IMAGE, 3, tImage, resImage, resSampled);
+					Op(OP_LOAD, 3, tSampled, histSampled2, vHistory);
+					Op(OP_IMAGE, 3, tImage, histImage2, histSampled2);
+					R.resImage = resImage;
+					Op(OP_CONVERT_F_TO_S, 3, tIVec2, sizeI2, screen);
+					Op(OP_ISUB, 4, tIVec2, maxI2, sizeI2, cIVec2One);
+
+					/* The light the previous frame picked at this point */
+					Op(OP_LOAD, 3, tInt, okI, vResOk);
+					Op(OP_INOT_EQUAL, 4, tBool, ok, okI, cInt0);
+					Op(OP_LOAD, 3, tInt, rx, vResX);
+					Op(OP_LOAD, 3, tInt, ry, vResY);
+					Op(OP_COMPOSITE_CONSTRUCT, 4, tIVec2, rpix, rx, ry);
+					EmitReuse(&R, ok, rpix);
+
+					/* The lights the previous frame picked at 2 random nearby pixels (of the same surface) */
+					Op(OP_LOAD, 3, tFloat, prevW, vPrevW);
+					Op(OP_FORD_GREATER_THAN, 4, tBool, hasPrevW, prevW, cZero);
+					for (k = 0; k < 2; k++)
+					{
+						unsigned int ra, rr, ang = Id(), rad0 = Id(), rad = Id(), ca = Id(), sa = Id(), ox = Id(), oy = Id(), oV = Id(), oVR = Id();
+						unsigned int oI = Id(), q = Id(), qC = Id(), qSame = Id(), qOn = Id(), h = Id(), hd = Id(), hl = Id(), dd = Id(), ddAbs = Id();
+						unsigned int tolN0 = Id(), tolN = Id(), dOk = Id(), hS = Id(), hFace = Id(), hF64 = Id(), hLen = Id(), fd = Id(), fdAbs = Id();
+						unsigned int fOk = Id(), lOk = Id(), q1 = Id(), q2 = Id(), q3 = Id(), q4 = Id(), qOk = Id();
+
+						ra = EmitRandom(&R);
+						rr = EmitRandom(&R);
+						Op(OP_FMUL, 4, tFloat, ang, ra, cTwoPi);
+						Op(OP_FMUL, 4, tFloat, rad0, rr, cRadius);
+						Op(OP_FADD, 4, tFloat, rad, rad0, cOne);
+						Op(OP_EXT_INST, 5, tFloat, ca, ext, GLSL_COS, ang);
+						Op(OP_EXT_INST, 5, tFloat, sa, ext, GLSL_SIN, ang);
+						Op(OP_FMUL, 4, tFloat, ox, ca, rad);
+						Op(OP_FMUL, 4, tFloat, oy, sa, rad);
+						Op(OP_COMPOSITE_CONSTRUCT, 4, tVec2, oV, ox, oy);
+						Op(OP_EXT_INST, 5, tVec2, oVR, ext, GLSL_FLOOR, oV);
+						Op(OP_CONVERT_F_TO_S, 3, tIVec2, oI, oVR);
+						Op(OP_IADD, 4, tIVec2, q, rpix, oI);
+						Op(OP_EXT_INST, 7, tIVec2, qC, ext, GLSL_SCLAMP, q, cIVec2Zero, maxI2);
+						Op(OP_IEQUAL, 4, tBVec2, qSame, q, qC);
+						Op(OP_ALL,    3, tBool,  qOn, qSame);
+
+						/* Same surface = depth within 10% and facing the same way */
+						Op(OP_IMAGE_FETCH, 6, tVec4, h, histImage2, qC, IMAGE_OPERAND_LOD, cInt0);
+						Op(OP_COMPOSITE_EXTRACT, 4, tFloat, hd, h, 1);
+						Op(OP_COMPOSITE_EXTRACT, 4, tFloat, hl, h, 2);
+						Op(OP_FSUB, 4, tFloat, dd, hd, prevW);
+						Op(OP_EXT_INST, 5, tFloat, ddAbs, ext, GLSL_FABS, dd);
+						Op(OP_FMUL, 4, tFloat, tolN0, prevW, cNeighbourTol);
+						Op(OP_FADD, 4, tFloat, tolN, tolN0, cHalf);
+						Op(OP_FORD_LESS_THAN, 4, tBool, dOk, ddAbs, tolN);
+						Op(OP_FMUL, 4, tFloat, hS, hl, cInv64);
+						Op(OP_EXT_INST, 5, tFloat, hFace, ext, GLSL_FLOOR, hS);
+						Op(OP_FMUL, 4, tFloat, hF64, hFace, cSkyPointsF);
+						Op(OP_FSUB, 4, tFloat, hLen, hl, hF64);
+						Op(OP_FSUB, 4, tFloat, fd, hFace, faceKey);
+						Op(OP_EXT_INST, 5, tFloat, fdAbs, ext, GLSL_FABS, fd);
+						Op(OP_FORD_LESS_THAN,    4, tBool, fOk, fdAbs, cHalf);
+						Op(OP_FORD_GREATER_THAN, 4, tBool, lOk, hLen, cHalf);
+						Op(OP_LOGICAL_AND, 4, tBool, q1, hasPrevW, qOn);
+						Op(OP_LOGICAL_AND, 4, tBool, q2, q1, dOk);
+						Op(OP_LOGICAL_AND, 4, tBool, q3, q2, fOk);
+						Op(OP_LOGICAL_AND, 4, tBool, q4, q3, lOk);
+						qOk = q4;
+						EmitReuse(&R, qOk, qC);
+					}
+
+					/* W = total weight / (M * weight of the picked light) */
+					Op(OP_LOAD, 3, tFloat, selW, vSelW);
+					Op(OP_FORD_GREATER_THAN, 4, tBool, have, selW, cZero);
+					Op(OP_LOAD, 3, tFloat, wsE,  vWSum);
+					Op(OP_LOAD, 3, tVec3,  selF, vSelF);
+					Op(OP_LOAD, 3, tVec3,  selP, vSelPos);
+					Op(OP_LOAD, 3, tFloat, selM, vSelMask);
+					Op(OP_LOAD, 3, tInt,   selI, vSelIdx);
+					Op(OP_LOAD, 3, tFloat, mEnd, vM);
+					Op(OP_FMUL, 4, tFloat, den, mEnd, selW);
+					Op(OP_EXT_INST, 6, tFloat, denS, ext, GLSL_FMAX, den, cTiny);
+					Op(OP_FDIV, 4, tFloat, W, wsE, denS);
+					Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, est, selF, W);
+
+					/* Ray to the picked light. If it's blocked, it's not reused by the next frame */
+					Op(OP_STORE, 2, vLightHits, cInt0);
+					Op(OP_STORE, 2, vResOk, cInt1);
+					EmitLightRay(&L, have, selI, selP, selM, est, vResOk);
+					Op(OP_LOAD, 3, tInt, blocked, vResOk);
+					{
+						unsigned int isBlocked = Id(), notHave = Id(), noUse = Id();
+						Op(OP_INOT_EQUAL, 4, tBool, isBlocked, blocked, cInt0);
+						Op(OP_LOGICAL_NOT, 3, tBool, notHave, have);
+						Op(OP_LOGICAL_OR, 4, tBool, noUse, isBlocked, notHave);
+						Op(OP_SELECT, 5, tFloat, WOut, noUse, cZero, W);
+					}
+					Op(OP_EXT_INST, 6, tFloat, mOut, ext, GLSL_FMIN, mEnd, cMaxM);
+					Op(OP_CONVERT_S_TO_F, 3, tFloat, selIF, selI);
+					Op(OP_COMPOSITE_CONSTRUCT, 6, tVec4, res, selIF, WOut, mOut, cZero);
+					Op(OP_STORE, 2, vOutRes, res);
+				}
+				Op(OP_BRANCH, 1, reuseMerge);
+				Op(OP_LABEL,  1, reuseMerge);
 				Op(OP_BRANCH, 1, lightMerge);
 				Op(OP_LABEL,  1, lightMerge);
 			}
+
 
 			Op(OP_BRANCH, 1, outerContinue);
 			Op(OP_LABEL,  1, outerContinue);
@@ -2228,7 +2696,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			/*  When the sun is just a point (samples < 4), every frame gives the same exact result anyway */
 			hitsEnd = Id(); hitsEndF = Id(); blockedFrac = Id(); raw = Id();
 			skyHitsEnd = Id(); skyHitsF = Id(); skyRaw = Id();
-			lenA = Id(); lenNew = Id(); invLen = Id(); single = Id(); sunWeight = Id();
+			lenA = Id(); lenNew = Id(); invLen = Id(); invLenB = Id(); single = Id(); sunWeight = Id();
 			delta = Id(); deltaScaled = Id(); visNew = Id(); skyDelta = Id(); skyDeltaScaled = Id(); skyNew = Id();
 			Op(OP_LOAD, 3, tInt, hitsEnd,    vHits);
 			Op(OP_LOAD, 3, tInt, skyHitsEnd, vSkyHits);
@@ -2239,8 +2707,15 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			Op(OP_FSUB, 4, tFloat, raw,    cOne, blockedFrac);
 			Op(OP_FSUB, 4, tFloat, skyRaw, cOne, skyBlocked);
 			Op(OP_FADD, 4, tFloat, lenA, histLen, cOne);
-			Op(OP_EXT_INST, 6, tFloat, lenNew, ext, GLSL_FMIN, lenA, maxHistory);
-			Op(OP_FDIV, 4, tFloat, invLen, cOne, lenNew);
+			/* Bounced light (incl. block light) is noisier, so it uses up to 63 frames of history, rather */
+			/*  than maxHistory frames like sunlight, sky light and god rays */
+			Op(OP_EXT_INST, 6, tFloat, lenNew, ext, GLSL_FMIN, lenA, cMaxLen);
+			{
+				unsigned int lenCap = Id();
+				Op(OP_EXT_INST, 6, tFloat, lenCap, ext, GLSL_FMIN, lenNew, maxHistory);
+				Op(OP_FDIV, 4, tFloat, invLen, cOne, lenCap);
+				Op(OP_FDIV, 4, tFloat, invLenB, cOne, lenNew);
+			}
 			Op(OP_SLESS_THAN, 4, tBool, single, samples, cIdx[4]);
 			Op(OP_SELECT, 5, tFloat, sunWeight, single, cOne, invLen);
 			Op(OP_FSUB, 4, tFloat, delta, raw, histVis);
@@ -2257,7 +2732,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			Op(OP_LOAD, 3, tVec3, bounceEnd, vBounce);
 			bounceRaw = bounceEnd;
 			Op(OP_FSUB, 4, tVec3, bDelta, bounceRaw, histBounce);
-			Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, bDeltaScaled, bDelta, invLen);
+			Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, bDeltaScaled, bDelta, invLenB);
 			Op(OP_FADD, 4, tVec3, bounceNew, histBounce, bDeltaScaled);
 			Op(OP_STORE,  2, vBounceOut, bounceNew);
 
@@ -2283,7 +2758,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_LOAD, 3, tFloat, skyRaw2, vSky);
 		Op(OP_EXT_INST, 7, tFloat, visible, ext, GLSL_NCLAMP, visibleRaw, cZero, cOne);
 		Op(OP_EXT_INST, 7, tFloat, sky,     ext, GLSL_NCLAMP, skyRaw2,    cZero, cOne);
-		Op(OP_FMUL, 4, tFloat, faceShifted, faceID, cSkyPointsF);
+		Op(OP_FMUL, 4, tFloat, faceShifted, faceKey, cSkyPointsF);
 		Op(OP_FADD, 4, tFloat, faceLen,     faceShifted, newLen);
 		if (skyMode) viewDepth = cSkyMarker;
 		Op(OP_COMPOSITE_CONSTRUCT, 6, tVec4, history, visible, viewDepth, faceLen, sky);
@@ -2349,6 +2824,16 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_FSUB, 4, tFloat, numer,   cOne, gg);
 		Op(OP_FDIV, 4, tFloat, phase,   numer, denom15);
 		Op(OP_FMUL, 4, tFloat, godAmountA, godStrength, phase);
+		/* God rays fade out towards the shadow distance (where they stop), instead of stopping at a hard edge */
+		if (!skyMode) {
+			unsigned int left = Id(), fadeLen = Id(), fadeA = Id(), fade = Id(), faded = Id();
+			Op(OP_FSUB, 4, tFloat, left,    dist, len);
+			Op(OP_FMUL, 4, tFloat, fadeLen, dist, cGodFade);
+			Op(OP_FDIV, 4, tFloat, fadeA,   left, fadeLen);
+			Op(OP_EXT_INST, 7, tFloat, fade, ext, GLSL_FCLAMP, fadeA, cZero, cOne);
+			Op(OP_FMUL, 4, tFloat, faded,   godAmountA, fade);
+			godAmountA = faded;
+		}
 		/* The sky is already bright, and sees the full range of air, so it gets less. It also fades out towards */
 		/*  the horizon, since there's no sky below the edge of the sky plane (which would otherwise be a hard line) */
 		if (skyMode) {
@@ -2449,6 +2934,14 @@ int main(void) {
 	FragmentShader("fs_textured_test_linear_rt",  1, 1, FOG_LINEAR,  1, 0);
 	FragmentShader("fs_textured_density_rt",      1, 0, FOG_DENSITY, 1, 0);
 	FragmentShader("fs_textured_test_density_rt", 1, 1, FOG_DENSITY, 1, 0);
+	printf("\n");
+
+	/* Alpha tested ray traced chunks after the depth pre-pass */
+	earlyTests = 1;
+	FragmentShader("fs_textured_test_early_rt",         1, 1, FOG_NONE,    1, 0);
+	FragmentShader("fs_textured_test_linear_early_rt",  1, 1, FOG_LINEAR,  1, 0);
+	FragmentShader("fs_textured_test_density_early_rt", 1, 1, FOG_DENSITY, 1, 0);
+	earlyTests = 0;
 	printf("\n");
 
 	/* Sky (coloured) and skybox (textured) */

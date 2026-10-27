@@ -659,7 +659,9 @@ void main() {
 
 	float visible = 1.0, len = 0.0, sky = 1.0, god = 0.0; vec3 bounce = vec3(0.0);
 	doSky = doSky || giStrength > 0.0;
-	bool doGod = godStrength > 0.0; (god rays are in the air in front of the face, so apply to every face)
+	bool doGod = godStrength > 0.0 && temporal > 0.5; (god rays are in the air in front of the face, so apply to every face)
+	(translucent faces (temporal == 0) have no history to smooth noise: no sky light/bounce/god rays, and block lights
+	 are the sum of every light in the cell without shadows instead of one randomly picked light)
 	vec3 viewDir = -toCam / length(toCam);
 	if (length(toCam) < shadowDist && ((shaded && (doSun || doSky)) || doGod)) {
 		vec3 origin = in_world + normal * 0.05;
@@ -743,7 +745,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 	unsigned int cCau[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 	unsigned int tIVec3 = 0, tIntPtr = 0, tVec4Ptr = 0, pParamsIntPtr = 0, pParamsVec4Ptr = 0;
 	unsigned int cPlastic = 0, cLightSurf = 0, cLumR = 0, cLumG = 0, cLumB = 0, cLumW = 0, cIVec3Zero = 0, cIVec3One = 0;
-	unsigned int vLj = 0, vWSum = 0, vSelF = 0, vSelW = 0, vSelPos = 0, vLightHits = 0;
+	unsigned int vLj = 0, vWSum = 0, vSelF = 0, vSelW = 0, vSelPos = 0, vLightHits = 0, vSumF = 0;
 	unsigned int cTaps[4] = { 0, 0, 0, 0 };
 	unsigned int vWorld = 0, vScene = 0, vParams = 0, vHistory = 0, vOutHistory = 0;
 	unsigned int rayQuery = 0, vVisible = 0, vIndex = 0, vHits = 0, vSkyHits = 0;
@@ -778,7 +780,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		for (i = 0; i < 8; i++) cCau[i] = Id();
 		tIVec3 = Id(); tIntPtr = Id(); tVec4Ptr = Id(); pParamsIntPtr = Id(); pParamsVec4Ptr = Id();
 		cPlastic = Id(); cLightSurf = Id(); cLumR = Id(); cLumG = Id(); cLumB = Id(); cLumW = Id(); cIVec3Zero = Id(); cIVec3One = Id();
-		vLj = Id(); vWSum = Id(); vSelF = Id(); vSelW = Id(); vSelPos = Id(); vLightHits = Id();
+		vLj = Id(); vWSum = Id(); vSelF = Id(); vSelW = Id(); vSelPos = Id(); vLightHits = Id(); vSumF = Id();
 		for (i = 0; i < 4; i++) cTaps[i] = Id();
 		vWorld = Id(); vScene = Id(); vParams = Id(); vHistory = Id(); vOutHistory = Id();
 		rayQuery = Id(); vVisible = Id(); vIndex = Id(); vHits = Id(); vSkyHits = Id();
@@ -1063,6 +1065,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_VARIABLE, 3, pFuncFloat, vSelW,       STORAGE_FUNCTION);
 		Op(OP_VARIABLE, 3, pFuncVec3,  vSelPos,     STORAGE_FUNCTION);
 		Op(OP_VARIABLE, 3, pFuncInt,   vLightHits,  STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncVec3,  vSumF,       STORAGE_FUNCTION);
 	}
 	Op(OP_LOAD,     3, tVec4, col, vCol);
 	vertexCol = col;
@@ -1102,7 +1105,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		unsigned int aoStrength, aoRange, temporal, sunCol, giStrength, doAO, doGI, skyFlags;
 		unsigned int godStrength, godDensity, godG, godRange, sunCond, skyCond, doGod, anyA, invLenV, negInvLenV, viewDir;
 		unsigned int scatterCol, caustics, skyDY, skyboxFlag, timeV, wpos;
-		unsigned int gridOrigin, invCell, gridDim, numLights, lightStrength, lightCond, hasLights, anyB;
+		unsigned int gridOrigin, invCell, gridDim, numLights, lightStrength, lightCond, hasLights, anyB, isTemporalEarly;
 		unsigned int toCam, crossed, normal, toCamDot, flip, negated, flipped;
 		unsigned int absN, ax, ay, az, bigYZ, big, bigs, isBig, mask, masked, snapped, axisAligned, n;
 		unsigned int ny, nyAbs, nxAbs, isY, isTop, isX, faceY, faceXZ, faceAxis, face, faceDot, faceAxisID, faceID;
@@ -1244,9 +1247,18 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_SELECT, 5, tUint, skyFlags, doGI, cNone, cFlags);
 		/* God rays are about the air in front of the face, so apply to every face (e.g. fully bright ones too) */
 		sunCond = Id(); skyCond = Id(); doGod = Id(); anyA = Id();
+		/* Translucent faces (e.g. water) have no history to smooth out noise, so they don't get sky light, */
+		/*  bounced light or god rays (the faces behind them do), and block lights are calculated without shadows */
+		{
+			unsigned int temporalB = Id(), skyCond0 = Id(), doGod0 = Id();
+			Op(OP_FORD_GREATER_THAN, 4, tBool, temporalB, temporal, cHalf);
+			isTemporalEarly = temporalB;
+			Op(OP_LOGICAL_AND, 4, tBool, skyCond0, shadedCol, doSky);
+			Op(OP_LOGICAL_AND, 4, tBool, skyCond,  skyCond0, temporalB);
+			Op(OP_FORD_GREATER_THAN, 4, tBool, doGod0, godStrength, cZero);
+			Op(OP_LOGICAL_AND, 4, tBool, doGod,    doGod0, temporalB);
+		}
 		Op(OP_LOGICAL_AND, 4, tBool, sunCond, shadedCol, doSun);
-		Op(OP_LOGICAL_AND, 4, tBool, skyCond, shadedCol, doSky);
-		Op(OP_FORD_GREATER_THAN, 4, tBool, doGod, godStrength, cZero);
 		/* Light from light emitting blocks only applies to shaded faces */
 		hasLights = Id(); lightCond = Id(); anyB = Id();
 		Op(OP_INOT_EQUAL,  4, tBool, hasLights, numLights, cInt0);
@@ -1876,6 +1888,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				Op(OP_STORE, 2, vSelW,   cZero);
 				Op(OP_STORE, 2, vSelF,   cVec3Zero);
 				Op(OP_STORE, 2, vSelPos, cVec3Zero);
+				Op(OP_STORE, 2, vSumF,   cVec3Zero);
 				Op(OP_BRANCH, 1, lHeader);
 				Op(OP_LABEL,  1, lHeader);
 				Op(OP_LOOP_MERGE, 3, lMerge, lCont, 0);
@@ -1912,6 +1925,12 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				Op(OP_FMUL, 4, tFloat, kL,    atten, cosC);
 				Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, fL, lcol, kL);
 				Op(OP_DOT,  4, tFloat, wL, fL, cLumW);
+				{
+					unsigned int sumA = Id(), sumB = Id();
+					Op(OP_LOAD, 3, tVec3, sumA, vSumF);
+					Op(OP_FADD, 4, tVec3, sumB, sumA, fL);
+					Op(OP_STORE, 2, vSumF, sumB);
+				}
 
 				/* Weighted reservoir sampling: replace the selected light with probability weight / total */
 				Op(OP_LOAD, 3, tFloat, ws, vWSum);
@@ -1972,6 +1991,19 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, dirS, seg, invSeg);
 				Op(OP_FSUB, 4, tFloat, tmaxA, segLen, cDepthTol);
 				Op(OP_EXT_INST, 6, tFloat, tmaxS, ext, GLSL_FMAX, tmaxA, cMinWeight);
+
+				/* Translucent faces just get the light from every light (no randomness, so no noise) */
+				{
+					unsigned int sumEnd = Id(), sumScaled = Id(), detAdd = Id(), accD = Id(), accD2 = Id(), haveT = Id();
+					Op(OP_LOAD, 3, tVec3, sumEnd, vSumF);
+					Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, sumScaled, sumEnd, lightStrength);
+					Op(OP_SELECT, 5, tVec3, detAdd, isTemporalEarly, cVec3Zero, sumScaled);
+					Op(OP_LOAD, 3, tVec3, accD, vBounce);
+					Op(OP_FADD, 4, tVec3, accD2, accD, detAdd);
+					Op(OP_STORE, 2, vBounce, accD2);
+					Op(OP_LOGICAL_AND, 4, tBool, haveT, have, isTemporalEarly);
+					have = haveT;
+				}
 
 				Op(OP_STORE, 2, vLightHits, cInt0);
 				hitL = EmitTraceBegin(&trace, have, origin, dirS, tmaxS, trace.cFlags, &lightTraceMerge);

@@ -155,7 +155,10 @@
 #define FLOAT_FOUR        0x40800000u /* 4.0 */
 /* Number of points in the hemisphere that sky light rays cycle through */
 #define SKY_POINTS        64
-#define FLOAT_SKY_POINTS  0x42800000u /* 64.0 */
+#define FLOAT_SKY_POINTS  0x42800000u /* 64.0 (also used for packing face direction with history length) */
+#define FLOAT_TWO         0x40000000u /* 2.0 */
+#define FLOAT_THREE       0x40400000u /* 3.0 */
+#define FLOAT_INV_64      0x3C800000u /* 1/64 */
 #define FLOAT_GOLDEN_RATIO_FRAC 0x3F1E377Au /* 0.618034 */
 #define FLOAT_NEG_HALF    0xBF000000u /* -0.5 */
 #define FLOAT_DEPTH_TOLERANCE 0x3CA3D70Au /* 0.02 */
@@ -509,7 +512,7 @@ layout(set = 1, binding = 1) uniform Params {
 };
 layout(set = 1, binding = 2) uniform sampler2D history; (previous frame's out_history)
 layout(location = 2) in vec3 in_world;
-layout(location = 1) out vec4 out_history;            (sun visibility, view depth, history length, sky visibility)
+layout(location = 1) out vec4 out_history;            (sun visibility, view depth, face * 64 + history length, sky visibility)
 
 bool Blocked(vec3 origin, vec3 dir, float tMax) {
 	rayQueryEXT rq;
@@ -547,6 +550,7 @@ void main() {
 	if (axis) normal = sign(normal * vec3(greaterThanEqual(a, vec3(big))));
 
 	float face   = !axis ? 1.0 : (abs(normal.y) > 0.5 ? (normal.y > 0.5 ? 1.0 : 0.5) : (abs(normal.x) > 0.5 ? 0.6 : 0.8));
+	float faceID = !axis ? 3.0 : dot(normal, vec3(1, 2, 3)) + 3.0; (0-6, which way the face points)
 	float direct = !axis ? 1.0 : clamp(dot(normal, sunDir) * diffuseScale, 0.0, 1.0);
 	bool shaded  = in_col.a > 0.998; (alpha 254 = fully bright)
 	bool doSun   = direct > 0.01, doSky = aoStrength > 0.0;
@@ -560,9 +564,11 @@ void main() {
 		float wSum = 0.0, vSum = 0.0, lSum = 0.0, sSum = 0.0;
 		for (tap in (0,0), (1,0), (0,1), (1,1)) {
 			vec4 h  = texelFetch(history, clamp(ivec2(floor(pos)) + tap, ivec2(0), ivec2(screenSize) - 1), 0);
+			float hFace = floor(h.z / 64.0), hLen = h.z - hFace * 64.0;
 			float w = (tap.x ? f.x : 1.0 - f.x) * (tap.y ? f.y : 1.0 - f.y);
-			if (abs(h.y - prev.w) >= prev.w * 0.02 + 0.05) w = 0.0;
-			wSum += w; vSum += w * h.x; lSum += w * h.z; sSum += w * h.w;
+			(only use history of the same surface, i.e. same depth and same face direction, that has history)
+			if (abs(h.y - prev.w) >= prev.w * 0.02 + 0.05 || abs(hFace - faceID) > 0.5 || hLen < 0.5) w = 0.0;
+			wSum += w; vSum += w * h.x; lSum += w * hLen; sSum += w * h.w;
 		}
 		if (wSum > 0.001) { histVis = vSum / wSum; histLen = lSum / wSum; histSky = sSum / wSum; }
 	}
@@ -591,7 +597,7 @@ void main() {
 		visible = histVis + ((1.0 - float(sunHits) / float(rays)) - histVis) * (samples < 4 ? 1.0 : 1.0 / len);
 		sky     = histSky + ((1.0 - float(skyHits) / float(rays)) - histSky) / len;
 	}
-	out_history = vec4(visible, depth, len, sky);
+	out_history = vec4(visible, depth, faceID * 64.0 + len, sky);
 
 	float ambient = 1.0 - aoStrength * (1.0 - sky);
 	vec3 light    = shadowRatio * ambient + (1.0 - shadowRatio) * (direct * visible / face);
@@ -619,7 +625,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 	unsigned int cFaceX = 0, cFaceZ = 0, cGolden = 0, cVec3Zero = 0, cVec3One = 0, cVec3X = 0, cVec3Y = 0;
 	unsigned int cFour = 0, cDepthTol = 0, cMinWeight = 0, cNegHalf = 0, cIgnX = 0, cIgnY = 0, cIgnScale = 0;
 	unsigned int cNdcScale = 0, cVec2Half = 0, cIgnDir = 0, cIVec2Zero = 0, cIVec2One = 0;
-	unsigned int cSkyPoints = 0, cSkyPointsF = 0, cGoldenFrac = 0;
+	unsigned int cSkyPoints = 0, cSkyPointsF = 0, cGoldenFrac = 0, cFaceWeights = 0, cTwo = 0, cThree = 0, cInv64 = 0;
 	unsigned int cTaps[4] = { 0, 0, 0, 0 };
 	unsigned int vWorld = 0, vScene = 0, vParams = 0, vHistory = 0, vOutHistory = 0;
 	unsigned int rayQuery = 0, vVisible = 0, vIndex = 0, vHits = 0, vSkyHits = 0;
@@ -646,7 +652,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		cFaceX = Id(); cFaceZ = Id(); cGolden = Id(); cVec3Zero = Id(); cVec3One = Id(); cVec3X = Id(); cVec3Y = Id();
 		cFour  = Id(); cDepthTol = Id(); cMinWeight = Id(); cNegHalf = Id(); cIgnX = Id(); cIgnY = Id(); cIgnScale = Id();
 		cNdcScale = Id(); cVec2Half = Id(); cIgnDir = Id(); cIVec2Zero = Id(); cIVec2One = Id();
-		cSkyPoints = Id(); cSkyPointsF = Id(); cGoldenFrac = Id();
+		cSkyPoints = Id(); cSkyPointsF = Id(); cGoldenFrac = Id(); cFaceWeights = Id(); cTwo = Id(); cThree = Id(); cInv64 = Id();
 		for (i = 0; i < 4; i++) cTaps[i] = Id();
 		vWorld = Id(); vScene = Id(); vParams = Id(); vHistory = Id(); vOutHistory = Id();
 		rayQuery = Id(); vVisible = Id(); vIndex = Id(); vHits = Id(); vSkyHits = Id();
@@ -813,10 +819,14 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_CONSTANT, 3, tInt,   cSkyPoints,  SKY_POINTS);
 		Op(OP_CONSTANT, 3, tFloat, cSkyPointsF, FLOAT_SKY_POINTS);
 		Op(OP_CONSTANT, 3, tFloat, cGoldenFrac, FLOAT_GOLDEN_RATIO_FRAC);
+		Op(OP_CONSTANT, 3, tFloat, cTwo,        FLOAT_TWO);
+		Op(OP_CONSTANT, 3, tFloat, cThree,      FLOAT_THREE);
+		Op(OP_CONSTANT, 3, tFloat, cInv64,      FLOAT_INV_64);
 		Op(OP_CONSTANT_COMPOSITE, 5, tVec3, cVec3Zero, cZero, cZero, cZero);
 		Op(OP_CONSTANT_COMPOSITE, 5, tVec3, cVec3One,  cOne,  cOne,  cOne);
 		Op(OP_CONSTANT_COMPOSITE, 5, tVec3, cVec3X,    cOne,  cZero, cZero);
 		Op(OP_CONSTANT_COMPOSITE, 5, tVec3, cVec3Y,    cZero, cOne,  cZero);
+		Op(OP_CONSTANT_COMPOSITE, 5, tVec3, cFaceWeights, cOne, cTwo, cThree);
 		Op(OP_CONSTANT_COMPOSITE, 4, tVec2, cNdcScale, cHalf, cNegHalf);
 		Op(OP_CONSTANT_COMPOSITE, 4, tVec2, cVec2Half, cHalf, cHalf);
 		Op(OP_CONSTANT_COMPOSITE, 4, tVec2, cIgnDir,   cIgnX, cIgnY);
@@ -895,10 +905,10 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		unsigned int aoStrength, aoRange, temporal;
 		unsigned int toCam, crossed, normal, toCamDot, flip, negated, flipped;
 		unsigned int absN, ax, ay, az, bigYZ, big, bigs, isBig, mask, masked, snapped, axisAligned, n;
-		unsigned int ny, nyAbs, nxAbs, isY, isTop, isX, faceY, faceXZ, faceAxis, face;
+		unsigned int ny, nyAbs, nxAbs, isY, isTop, isX, faceY, faceXZ, faceAxis, face, faceDot, faceAxisID, faceID;
 		unsigned int ndl, ndlScaled, directAxis, direct, vertexAlpha, shadedCol, len, inRange, doSun, doSky, anyRay, doRayA, doRay;
 		unsigned int fragPosV, fragW, viewDepth, isTemporal, hasPrevB, useHistory, histLabel, histMerge;
-		unsigned int rayLabel, rayMerge, visible, newLen, sky, history;
+		unsigned int rayLabel, rayMerge, visible, newLen, sky, history, faceShifted, faceLen;
 		unsigned int skyLost, skyScaled, ambient, ambientRatio, oneMinus, lightK1, lightK, lightAdd, light, rgbCol, lit, litRgb, litCol;
 		struct TraceIds trace;
 
@@ -961,6 +971,12 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_SELECT, 5, tFloat, faceXZ,   isX,   cFaceX, cFaceZ);
 		Op(OP_SELECT, 5, tFloat, faceAxis, isY,   faceY,  faceXZ);
 		Op(OP_SELECT, 5, tFloat, face,     axisAligned, faceAxis, cOne);
+
+		/* Which way the face points (0 to 6, 3 for sprites), so the history of other faces is ignored */
+		faceDot = Id(); faceAxisID = Id(); faceID = Id();
+		Op(OP_DOT,    4, tFloat, faceDot,    n, cFaceWeights);
+		Op(OP_FADD,   4, tFloat, faceAxisID, faceDot, cThree);
+		Op(OP_SELECT, 5, tFloat, faceID,     axisAligned, faceAxisID, cThree);
 
 		/* How directly sunlight hits the face, scaled so the face most towards the sun gets full sunlight */
 		/*  (sprites are lit the same from both sides) */
@@ -1040,6 +1056,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			{
 				unsigned int p = Id(), pc = Id(), h = Id(), hv = Id(), hd = Id(), hl = Id(), hs = Id(), diff = Id(), absDiff = Id(), same = Id();
 				unsigned int wb = Id(), wt = Id(), wSum2 = Id(), wv = Id(), vSum2 = Id(), wl = Id(), lSum2 = Id(), ws = Id(), sSum2 = Id();
+				unsigned int hScaled = Id(), hFace = Id(), hFace64 = Id(), hLen = Id(), faceDiff = Id(), faceAbs = Id(), sameFace = Id();
+				unsigned int hasLen = Id(), sameDepthFace = Id(), useTap = Id();
 				Op(OP_IADD, 4, tIVec2, p, baseI, cTaps[t]);
 				Op(OP_EXT_INST, 7, tIVec2, pc, ext, GLSL_SCLAMP, p, cIVec2Zero, maxI);
 				Op(OP_IMAGE_FETCH, 6, tVec4, h, histImage, pc, IMAGE_OPERAND_LOD, cInt0);
@@ -1047,15 +1065,26 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, hd, h, 1);
 				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, hl, h, 2);
 				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, hs, h, 3);
+				/* Only use history of the same surface (i.e. same depth and same face direction) that has history */
+				Op(OP_FMUL, 4, tFloat, hScaled, hl, cInv64);
+				Op(OP_EXT_INST, 5, tFloat, hFace, ext, GLSL_FLOOR, hScaled);
+				Op(OP_FMUL, 4, tFloat, hFace64, hFace, cSkyPointsF);
+				Op(OP_FSUB, 4, tFloat, hLen, hl, hFace64);
 				Op(OP_FSUB, 4, tFloat, diff, hd, pw);
 				Op(OP_EXT_INST, 5, tFloat, absDiff, ext, GLSL_FABS, diff);
 				Op(OP_FORD_LESS_THAN, 4, tBool, same, absDiff, tol);
+				Op(OP_FSUB, 4, tFloat, faceDiff, hFace, faceID);
+				Op(OP_EXT_INST, 5, tFloat, faceAbs, ext, GLSL_FABS, faceDiff);
+				Op(OP_FORD_LESS_THAN,    4, tBool, sameFace, faceAbs, cHalf);
+				Op(OP_FORD_GREATER_THAN, 4, tBool, hasLen,   hLen,    cHalf);
+				Op(OP_LOGICAL_AND, 4, tBool, sameDepthFace, same, sameFace);
+				Op(OP_LOGICAL_AND, 4, tBool, useTap,        sameDepthFace, hasLen);
 				Op(OP_FMUL, 4, tFloat, wb, (t & 1) ? fx : gx, (t >> 1) ? fy : gy);
-				Op(OP_SELECT, 5, tFloat, wt, same, wb, cZero);
+				Op(OP_SELECT, 5, tFloat, wt, useTap, wb, cZero);
 				Op(OP_FADD, 4, tFloat, wSum2, wSum, wt);
 				Op(OP_FMUL, 4, tFloat, wv, wt, hv);
 				Op(OP_FADD, 4, tFloat, vSum2, vSum, wv);
-				Op(OP_FMUL, 4, tFloat, wl, wt, hl);
+				Op(OP_FMUL, 4, tFloat, wl, wt, hLen);
 				Op(OP_FADD, 4, tFloat, lSum2, lSum, wl);
 				Op(OP_FMUL, 4, tFloat, ws, wt, hs);
 				Op(OP_FADD, 4, tFloat, sSum2, sSum, ws);
@@ -1255,11 +1284,13 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		}
 		Op(OP_LABEL, 1, rayMerge);
 
-		visible = Id(); newLen = Id(); sky = Id(); history = Id();
+		visible = Id(); newLen = Id(); sky = Id(); history = Id(); faceShifted = Id(); faceLen = Id();
 		Op(OP_LOAD, 3, tFloat, visible, vVisible);
 		Op(OP_LOAD, 3, tFloat, newLen,  vLen);
 		Op(OP_LOAD, 3, tFloat, sky,     vSky);
-		Op(OP_COMPOSITE_CONSTRUCT, 6, tVec4, history, visible, viewDepth, newLen, sky);
+		Op(OP_FMUL, 4, tFloat, faceShifted, faceID, cSkyPointsF);
+		Op(OP_FADD, 4, tFloat, faceLen,     faceShifted, newLen);
+		Op(OP_COMPOSITE_CONSTRUCT, 6, tVec4, history, visible, viewDepth, faceLen, sky);
 		Op(OP_STORE, 2, vOutHistory, history);
 
 		/* light = shadowCol * face * ambient + (sunCol - shadowCol) * direct * visible, but divided by */

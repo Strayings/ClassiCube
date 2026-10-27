@@ -70,7 +70,8 @@ struct Builder1DPart {
 };
 
 #ifdef BUILDER_SHADOW_CASTERS
-/* Light emitting blocks in the chunk being built (x, y, z, block), for ray traced block lighting */
+/* Light emitting blocks in the chunk being built (x, y, z, block | faces light gets out of << 16), */
+/*  for ray traced block lighting */
 #define BUILDER_MAX_LIGHTS 1024
 static int Builder_Lights[BUILDER_MAX_LIGHTS * 4];
 static int Builder_NumLights;
@@ -87,6 +88,50 @@ static int Builder_CasterType(BlockID block) {
 	if (draw == DRAW_TRANSLUCENT) return CASTER_NONE;
 	return Blocks.BlocksLight[block] ? CASTER_OPAQUE : CASTER_NONE;
 }
+
+/* Whether light can get out of a face of a light emitting block (i.e. the face isn't hidden, and also isn't */
+/*  covered by a solid block, e.g. lava's top face is lower than a full block so it's never hidden) */
+static cc_bool Builder_LightFaceOpen(int tileIdx, int cIndex, int faceBit) {
+	BlockID other = Builder_Chunk[cIndex];
+	return !(Blocks.Hidden[tileIdx + other] & faceBit) && !Blocks.FullOpaque[other];
+}
+
+/* Which faces of a light emitting block light gets out of (none for blocks completely surrounded by other */
+/*  blocks, e.g. lava under other lava). Outside the map counts as covered where the map's sides and bottom */
+/*  are drawn, same as in Builder_Stretch */
+static int Builder_LightFaces(BlockID b, int cIndex, int x, int y, int z) {
+	int tileIdx  = b * BLOCK_COUNT, faces = 0;
+	cc_bool edge = y < Builder_SidesLevel || (b >= BLOCK_WATER && b <= BLOCK_STILL_LAVA && y < Builder_EdgeLevel);
+
+	if (x == 0          ? !edge : Builder_LightFaceOpen(tileIdx, cIndex - 1,             FACE_BIT_XMIN)) faces |= FACE_BIT_XMIN;
+	if (x == World.MaxX ? !edge : Builder_LightFaceOpen(tileIdx, cIndex + 1,             FACE_BIT_XMAX)) faces |= FACE_BIT_XMAX;
+	if (z == 0          ? !edge : Builder_LightFaceOpen(tileIdx, cIndex - EXTCHUNK_SIZE, FACE_BIT_ZMIN)) faces |= FACE_BIT_ZMIN;
+	if (z == World.MaxZ ? !edge : Builder_LightFaceOpen(tileIdx, cIndex + EXTCHUNK_SIZE, FACE_BIT_ZMAX)) faces |= FACE_BIT_ZMAX;
+	if (y != 0 && Builder_LightFaceOpen(tileIdx, cIndex - EXTCHUNK_SIZE_2, FACE_BIT_YMIN)) faces |= FACE_BIT_YMIN;
+	if (Builder_LightFaceOpen(tileIdx, cIndex + EXTCHUNK_SIZE_2, FACE_BIT_YMAX))            faces |= FACE_BIT_YMAX;
+	return faces;
+}
+
+/* Faces between two of the same cutout block (e.g. between leaves) are still drawn, but don't cast shadows. */
+/*  Rays then only go through the outer faces of e.g. a tree's leaves instead of every layer of them, so */
+/*  there are gaps that light gets through, and rays don't have to alpha test many faces (which is slow) */
+static int Builder_FaceCasterType(BlockID block, int cIndex, Face face) {
+	int type = Builder_CasterType(block);
+	if (type == CASTER_CUTOUT && Builder_Chunk[cIndex + Builder_Offsets[face]] == block) return CASTER_NONE;
+	return type;
+}
+
+static int Builder_InnerFaces(BlockID block, int cIndex) {
+	int face, faces = 0;
+	for (face = 0; face < FACE_COUNT; face++)
+	{
+		if (Builder_FaceCasterType(block, cIndex, face) == CASTER_NONE) faces |= 1 << face;
+	}
+	return faces;
+}
+
+/* Index in the chunk of the block that the faces currently being stretched start at */
+static int Builder_StartIndex;
 #endif
 
 /* Part builder data, for both normal and translucent parts.
@@ -128,8 +173,8 @@ static int Builder1DPart_CalcOffsets(struct Builder1DPart* part, int offset) {
 }
 
 #ifdef BUILDER_SHADOW_CASTERS
-/* Swaps the vertex write positions between faces of opaque casters and the given type of caster */
-static void Builder_SwapCasterType(int type) {
+/* Swaps the vertex write positions of the given faces between the current type of caster and the given type */
+static void Builder_SwapCasterFaces(int type, int faces) {
 	struct Builder1DPart* part;
 	struct VertexTextured* tmp;
 	int i, j, face;
@@ -141,6 +186,7 @@ static void Builder_SwapCasterType(int type) {
 			part = &Builder_Parts[i + j * ATLAS1D_MAX_ATLASES];
 			for (face = 0; face < FACE_COUNT; face++)
 			{
+				if (!(faces & (1 << face))) continue;
 				tmp = part->faces.vertices[face];
 				part->faces.vertices[face]       = part->typeVertices[type][face];
 				part->typeVertices[type][face] = tmp;
@@ -148,6 +194,9 @@ static void Builder_SwapCasterType(int type) {
 		}
 	}
 }
+
+/* Swaps the vertex write positions between faces of opaque casters and the given type of caster */
+static void Builder_SwapCasterType(int type) { Builder_SwapCasterFaces(type, (1 << FACE_COUNT) - 1); }
 
 static int Builder_CasterRanges[2 * ATLAS1D_MAX_ATLASES * 2 * FACE_COUNT * 2];
 /* Tells the graphics backend which ranges of vertices in the chunk's VB cast shadows */
@@ -214,7 +263,7 @@ static void AddVertices(BlockID block, Face face) {
 	struct Builder1DPart* part = &Builder_Parts[baseOffset + i];
 	part->faces.count[face] += 4;
 #ifdef BUILDER_SHADOW_CASTERS
-	part->typeCount[Builder_CasterType(block)][face] += 4;
+	part->typeCount[Builder_FaceCasterType(block, Builder_StartIndex, face)][face] += 4;
 #endif
 }
 
@@ -299,6 +348,9 @@ static void PrepareChunk(int x1, int y1, int z1) {
 				if (Blocks.Draw[b] == DRAW_SPRITE) { AddSpriteVertices(b); continue; }
 
 				Builder_X = x; Builder_Y = y; Builder_Z = z;
+#ifdef BUILDER_SHADOW_CASTERS
+				Builder_StartIndex = cIndex;
+#endif
 				Builder_FullBright = Blocks.Brightness[b];
 				tileIdx = b * BLOCK_COUNT;
 				/* All of these function calls are inlined as they can be called tens of millions to hundreds of millions of times. */
@@ -497,7 +549,7 @@ cc_bool Builder_MakeChunk(struct ChunkInfo* info) {
 	int cIndex, index;
 	int x, y, z, xx, yy, zz;
 #ifdef BUILDER_SHADOW_CASTERS
-	int casterType;
+	int casterType, innerFaces, lightFaces;
 #endif
 	int x1 = info->centreX - HALF_CHUNK_SIZE;
 	int y1 = info->centreY - HALF_CHUNK_SIZE;
@@ -567,9 +619,10 @@ cc_bool Builder_MakeChunk(struct ChunkInfo* info) {
 				Builder_Block = chunk[cIndex];
 				if (Blocks.Draw[Builder_Block] == DRAW_GAS) continue;
 #ifdef BUILDER_SHADOW_CASTERS
-				if (Blocks.Brightness[Builder_Block] && Builder_NumLights < BUILDER_MAX_LIGHTS) {
+				if (Blocks.Brightness[Builder_Block] && Builder_NumLights < BUILDER_MAX_LIGHTS
+						&& (lightFaces = Builder_LightFaces(Builder_Block, cIndex, x, y, z))) {
 					int* light = &Builder_Lights[Builder_NumLights++ * 4];
-					light[0] = x; light[1] = y; light[2] = z; light[3] = Builder_Block;
+					light[0] = x; light[1] = y; light[2] = z; light[3] = Builder_Block | (lightFaces << 16);
 				}
 #endif
 
@@ -578,8 +631,11 @@ cc_bool Builder_MakeChunk(struct ChunkInfo* info) {
 #ifdef BUILDER_SHADOW_CASTERS
 				casterType = Builder_CasterType(Builder_Block);
 				if (casterType != CASTER_OPAQUE) {
+					innerFaces = casterType == CASTER_CUTOUT ? Builder_InnerFaces(Builder_Block, cIndex) : 0;
 					Builder_SwapCasterType(casterType);
+					if (innerFaces) Builder_SwapCasterFaces(CASTER_NONE, innerFaces);
 					Builder_RenderBlock(index, x, y, z);
+					if (innerFaces) Builder_SwapCasterFaces(CASTER_NONE, innerFaces);
 					Builder_SwapCasterType(casterType);
 					continue;
 				}
@@ -733,6 +789,10 @@ static cc_bool Normal_CanStretch(BlockID initial, int chunkIndex, int x, int y, 
 	BlockID cur = Builder_Chunk[chunkIndex];
 
 	if (cur != initial || Block_IsFaceHidden(cur, Builder_Chunk[chunkIndex + Builder_Offsets[face]], face)) return false;
+#ifdef BUILDER_SHADOW_CASTERS
+	/* Faces that cast shadows can't be merged with faces that don't */
+	if (Builder_FaceCasterType(initial, Builder_StartIndex, face) != Builder_FaceCasterType(cur, chunkIndex, face)) return false;
+#endif
 	if (Builder_FullBright) return true;
 
 	return Normal_LightColor(Builder_X, Builder_Y, Builder_Z, face, initial) == Normal_LightColor(x, y, z, face, cur);
@@ -1032,6 +1092,10 @@ static int adv_masks[FACE_COUNT] = {
 static cc_bool Adv_CanStretch(BlockID initial, int chunkIndex, int x, int y, int z, Face face) {
 	BlockID cur = Builder_Chunk[chunkIndex];
 	adv_bitFlags[chunkIndex] = Adv_ComputeLightFlags(x, y, z, chunkIndex);
+#ifdef BUILDER_SHADOW_CASTERS
+	/* Faces that cast shadows can't be merged with faces that don't */
+	if (cur == initial && Builder_FaceCasterType(initial, Builder_StartIndex, face) != Builder_FaceCasterType(cur, chunkIndex, face)) return false;
+#endif
 
 	return cur == initial
 		&& !Block_IsFaceHidden(cur, Builder_Chunk[chunkIndex + Builder_Offsets[face]], face)

@@ -102,7 +102,8 @@ struct ChunkRT {
 	/* Ranges of cutout vertices (e.g. leaves) come first, then ranges of opaque vertices */
 	int* ranges;
 	int numRanges, numCutout, numGeoms, listIndex;
-	/* Light emitting blocks in the chunk (x, y, z, block) */
+	/* Light emitting blocks in the chunk (x, y, z, block | faces light gets out of << 16) */
+	/*  (chunks with lights but no shadow casters, e.g. just a light sprite, only have the lights) */
 	int* lights;
 	int numLights;
 	cc_bool built;
@@ -152,8 +153,8 @@ struct RTParams {
 	float godStrength, godDensity, godG, godRange; /* God rays (sunlight scattered by the air) */
 	float scatterR, scatterG, scatterB, caustics;   /* Colour of scattered light, and caustics under water */
 	float skyDY; int skybox; float time, _pad4;      /* See EnvRenderer_RenderSky/RenderSkybox */
-	/* Light emitting blocks near the camera (2 vec4s each: position + intensity, colour), and a grid */
-	/*  of cells around the camera (offset + count, into the list of light indices after the cells) */
+	/* Light emitting blocks near the camera (2 vec4s each: position + intensity, colour + faces light gets out of), */
+	/*  and a grid of cells around the camera (offset + count + scale, offset being into the light indices after the cells) */
 	VkDeviceAddress lights, lightGrid;
 	float gridX, gridY, gridZ, invCellSize;
 	int gridDim, numLights; float lightStrength, _pad5;
@@ -255,6 +256,8 @@ static cc_bool rtSkyDraw;
 /* Chunks waiting for their BLAS to be built, and chunks which have a BLAS */
 static struct ChunkRT** rtPending;
 static struct ChunkRT** rtChunks;
+static struct ChunkRT** rtLightOnly;
+static int numRtLightOnly, maxRtLightOnly;
 static int numRtPending, maxRtPending, numRtChunks, maxRtChunks;
 
 static VkDeviceAddress (VKAPI_PTR *vkGetBufferDeviceAddressKHR)(VkDevice device, const VkBufferDeviceAddressInfo* pInfo);
@@ -2391,8 +2394,10 @@ static cc_bool PrepareDraw(cc_bool lines, cc_bool terrain) {
 	temporal = (rt && !gfx_alphaBlend) ? 1.0f : 0.0f;
 	if (temporal != pc.rtTemporal) { pc.rtTemporal = temporal; dirtyConstants = true; }
 	if (rt) rtDrawn = true;
-	/* The sky is drawn with a different view matrix (e.g. skybox is centred on the camera) */
+	/* The sky is drawn with a different view matrix (e.g. skybox is centred on the camera), so the */
+	/*  camera's actual view is used instead (in case nothing but the sky is drawn this frame) */
 	if (rt && !sky) rtFrameMVP = pc.mvp;
+	if (rt &&  sky) Matrix_Mul(&rtFrameMVP, &Gfx.View, &_proj);
 	if (key != boundPipeline) {
 		if (!pipelines[key]) pipelines[key] = CreatePipeline(key);
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[key]);
@@ -2428,7 +2433,8 @@ static cc_bool PrepareDraw(cc_bool lines, cc_bool terrain) {
 		dirtyTexture = false;
 	} else if (rt && !textured) {
 		/* Ray traced shaders always use the texture (for alpha testing), even for the coloured sky */
-		tex = (struct VulkanTexture*)white_square;
+		/*  (which uses the terrain atlas, so that e.g. leaves are alpha tested by god rays from the sky) */
+		tex = (struct VulkanTexture*)(Atlas1D.TexIds[0] ? Atlas1D.TexIds[0] : white_square);
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
 								0, 1, &tex->sets[mipmapsOn], 0, NULL);
 		dirtyTexture = true;
@@ -2736,7 +2742,9 @@ static void RT_ListRemove(struct ChunkRT** list, int* count, struct ChunkRT* rt)
 static void RT_Unlink(struct ChunkRT* rt) {
 	if (rt->listIndex < 0) return;
 
-	if (rt->built) {
+	if (!rt->numRanges) {
+		RT_ListRemove(rtLightOnly, &numRtLightOnly, rt);
+	} else if (rt->built) {
 		RT_ListRemove(rtChunks,  &numRtChunks,  rt);
 	} else {
 		RT_ListRemove(rtPending, &numRtPending, rt);
@@ -2756,11 +2764,14 @@ static void RT_FreeChunk(struct ChunkRT* rt) {
 static void RT_FreeAll(void) {
 	while (numRtChunks)  { RT_FreeChunk(rtChunks[--numRtChunks]);   }
 	while (numRtPending) { RT_FreeChunk(rtPending[--numRtPending]); }
+	while (numRtLightOnly) { RT_FreeChunk(rtLightOnly[--numRtLightOnly]); }
 
 	Mem_Free(rtChunks);
 	Mem_Free(rtPending);
-	rtChunks  = NULL; maxRtChunks  = 0;
-	rtPending = NULL; maxRtPending = 0;
+	Mem_Free(rtLightOnly);
+	rtChunks    = NULL; maxRtChunks    = 0;
+	rtPending   = NULL; maxRtPending   = 0;
+	rtLightOnly = NULL; maxRtLightOnly = 0;
 }
 
 void Gfx_SetSkyRendering(cc_bool enabled) { rtSkyDraw = enabled; }
@@ -2770,12 +2781,30 @@ void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, in
 	struct MemAlloc* alloc = (struct MemAlloc*)vb;
 	int i, numRanges = numOpaque + numCutout;
 	struct ChunkRT* rt;
-	if (!rtActive || !alloc || !numRanges) return;
+	if (!rtActive || !alloc || (!numRanges && !numLights)) return;
 
 	rt = (struct ChunkRT*)Mem_TryAllocCleared(1, sizeof(struct ChunkRT));
 	if (!rt) return;
+	rt->vb = alloc;
+
+	if (numLights) {
+		rt->lights = (int*)Mem_TryAlloc(numLights * 4, sizeof(int));
+		if (rt->lights) {
+			Mem_Copy(rt->lights, lights, numLights * 4 * sizeof(int));
+			rt->numLights = numLights;
+		}
+	}
+
+	/* Chunk only has lights (e.g. just a light sprite), so it has no BLAS */
+	if (!numRanges) {
+		if (!rt->lights) { Mem_Free(rt); return; }
+		alloc->rt = rt;
+		RT_ListAdd(&rtLightOnly, &numRtLightOnly, &maxRtLightOnly, rt);
+		return;
+	}
+
 	rt->ranges = (int*)Mem_TryAlloc(numRanges * 2, sizeof(int));
-	if (!rt->ranges) { Mem_Free(rt); return; }
+	if (!rt->ranges) { Mem_Free(rt->lights); Mem_Free(rt); return; }
 
 	/* Cutout ranges go first, so their geometries are the first geometries in the BLAS */
 	Mem_Copy(rt->ranges,                 ranges + numOpaque * 2, numCutout * 2 * sizeof(int));
@@ -2787,15 +2816,6 @@ void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, in
 
 	rt->numRanges = numRanges;
 	rt->numCutout = numCutout;
-	rt->vb        = alloc;
-
-	if (numLights) {
-		rt->lights = (int*)Mem_TryAlloc(numLights * 4, sizeof(int));
-		if (rt->lights) {
-			Mem_Copy(rt->lights, lights, numLights * 4 * sizeof(int));
-			rt->numLights = numLights;
-		}
-	}
 	alloc->rt     = rt;
 	RT_ListAdd(&rtPending, &numRtPending, &maxRtPending, rt);
 }
@@ -3092,48 +3112,147 @@ static PackedCol RT_LightColor(BlockID block) {
 		RT_AddTileColor(Block_Tex(block, FACE_XMAX), sums);
 	}
 	maxC = max(sums[0], max(sums[1], sums[2]));
-	rtLightCols[block] = maxC ? PackedCol_Make(sums[0] * 255 / maxC, sums[1] * 255 / maxC, sums[2] * 255 / maxC, 255) : PACKEDCOL_WHITE;
+	rtLightCols[block] = maxC ? PackedCol_Make((int)(sums[0] * 255.0f / maxC), (int)(sums[1] * 255.0f / maxC),
+												(int)(sums[2] * 255.0f / maxC), 255) : PACKEDCOL_WHITE;
 	rtLightColsValid[block] = true;
 	return rtLightCols[block];
 }
 
-/* Lights within this many blocks of the camera (along each axis) are used, nearest first */
-#define RT_LIGHT_GRID      12   /* Cells along each axis of the grid around the camera */
-#define RT_LIGHT_CELL      8    /* Size of each cell in blocks */
-#define RT_LIGHT_REACH     16   /* How far light from a block reaches */
+/* Lights within this many blocks of the camera (along each axis) are used, nearest first. Like the grids */
+/*  big games use for lots of lights (e.g. clipmaps, or RTXDI's "onion" grid), the grid around the camera */
+/*  has multiple levels, with each level's cells being twice the size of the previous level's, so far away */
+/*  lights are still used without needing many more cells (and each point still only traces one light ray) */
+#define RT_LIGHT_GRID      12   /* Cells along each axis of each level of the grid */
+#define RT_LIGHT_CELL      8    /* Size of each cell of the first level in blocks */
+#define RT_LIGHT_LEVELS    4    /* NOTE: Must match LIGHT_LEVELS in misc/vulkan/VulkanShaderGen.c */
+#define RT_LIGHT_REACH     16   /* How far light from a block reaches (NOTE: must match FLOAT_INV_REACH2) */
 #define RT_LIGHTS_PER_CELL 16
-#define RT_MAX_LIGHTS      2048
-#define RT_LIGHT_RANGE     (RT_LIGHT_GRID * RT_LIGHT_CELL / 2 + RT_LIGHT_REACH)
+#define RT_MAX_LIGHTS      4096
+#define RT_LIGHT_MAX_CELL  (RT_LIGHT_CELL << (RT_LIGHT_LEVELS - 1))
+#define RT_LIGHT_RANGE     ((RT_LIGHT_GRID / 2 + 1) * RT_LIGHT_MAX_CELL + RT_LIGHT_REACH)
 #define RT_LIGHT_CELLS     (RT_LIGHT_GRID * RT_LIGHT_GRID * RT_LIGHT_GRID)
+#define RT_LIGHT_ALL_CELLS (RT_LIGHT_CELLS * RT_LIGHT_LEVELS)
+#define RT_CELL_HEADER     3    /* Offset, count, scale */
 
-static int rtLightCands[RT_MAX_LIGHTS * 4];
+/* Where a level of the grid starts, the size of its cells, and the range of its cells along each axis */
+/*  that are entirely inside the previous level (which are never used, since points there use that level) */
+struct RTLightLevel { int origin[3], size, innerLo[3], innerHi[3]; };
+
 static int rtLightSorted[RT_MAX_LIGHTS * 4];
+static float rtLightPower[RT_MAX_LIGHTS];
 static int rtLightBuckets[RT_LIGHT_RANGE + 2];
-static int rtCellCounts[RT_LIGHT_CELLS];
+/* The most important lights reaching each cell (in no particular order), and their importance */
+static int   rtCellLights[RT_LIGHT_ALL_CELLS * RT_LIGHTS_PER_CELL];
+static float rtCellWeights[RT_LIGHT_ALL_CELLS * RT_LIGHTS_PER_CELL];
+static int   rtCellCounts[RT_LIGHT_ALL_CELLS];
+static float rtCellTotals[RT_LIGHT_ALL_CELLS];
 
-/* Finds the cells of the grid that a light at x/y/z reaches */
-static void RT_LightCells(const int* light, const int* origin, int* lo, int* hi) {
-	int i;
+static int RT_LightDistance(const int* light, const int* cam) {
+	return max(Math_AbsI(light[0] - cam[0]), max(Math_AbsI(light[1] - cam[1]), Math_AbsI(light[2] - cam[2])));
+}
+
+/* Whether any lights of a chunk might be near the camera (a chunk's lights are all in the same 16x16x16 area) */
+static cc_bool RT_ChunkLightsInRange(const struct ChunkRT* rt, const int* cam) {
+	int i, min, d = 0;
+	if (!rt->numLights) return false;
+
 	for (i = 0; i < 3; i++)
 	{
-		lo[i] = (light[i] - RT_LIGHT_REACH     - origin[i]) / RT_LIGHT_CELL;
-		hi[i] = (light[i] + RT_LIGHT_REACH + 1 - origin[i]) / RT_LIGHT_CELL;
-		if (light[i] - RT_LIGHT_REACH - origin[i] < 0) lo[i] = 0;
-		lo[i] = max(lo[i], 0); hi[i] = min(hi[i], RT_LIGHT_GRID - 1);
+		min = rt->lights[i] & ~(CHUNK_SIZE - 1);
+		d   = max(d, max(min - cam[i], cam[i] - (min + CHUNK_SIZE - 1)));
+	}
+	return d <= RT_LIGHT_RANGE;
+}
+
+/* Finds the cells of a level of the grid that a light at x/y/z reaches */
+static cc_bool RT_LightCells(const int* light, const struct RTLightLevel* l, int* lo, int* hi) {
+	int i, lowE, highE;
+	for (i = 0; i < 3; i++)
+	{
+		lowE  = light[i] - RT_LIGHT_REACH     - l->origin[i];
+		highE = light[i] + RT_LIGHT_REACH + 1 - l->origin[i];
+		if (highE < 0 || lowE >= RT_LIGHT_GRID * l->size) return false;
+
+		lo[i] = lowE < 0 ? 0 : lowE / l->size;
+		hi[i] = min(highE / l->size, RT_LIGHT_GRID - 1);
+	}
+	return true;
+}
+
+/* Distance along an axis from p to the range min to min + size */
+static float RT_AxisDistance(float p, int min, int size) {
+	if (p < min)        return min - p;
+	if (p > min + size) return p - (min + size);
+	return 0.0f;
+}
+
+/* Keeps the light if it's one of the most important lights reaching the cell */
+static void RT_KeepLight(int cell, int index, float weight) {
+	int* lights    = &rtCellLights[cell * RT_LIGHTS_PER_CELL];
+	float* weights = &rtCellWeights[cell * RT_LIGHTS_PER_CELL];
+	int i, n = rtCellCounts[cell], least = 0;
+
+	rtCellTotals[cell] += weight;
+	if (n < RT_LIGHTS_PER_CELL) {
+		lights[n] = index; weights[n] = weight;
+		rtCellCounts[cell]++; return;
+	}
+
+	/* Replace the least important light, if this light is more important than it */
+	for (i = 1; i < RT_LIGHTS_PER_CELL; i++)
+	{
+		if (weights[i] < weights[least]) least = i;
+	}
+	if (weight <= weights[least]) return;
+	lights[least] = index; weights[least] = weight;
+}
+
+/* Adds the light to every cell (of every level) it reaches, weighted by how important it is to the cell */
+/*  (i.e. brightness / (1 + distance to the cell^2)). Cells entirely inside the previous level are skipped */
+static void RT_AddLightToCells(int index, const int* light, const struct RTLightLevel* levels) {
+	const struct RTLightLevel* l;
+	int lo[3], hi[3], x, y, z, L, cell;
+	float dx, dy, dz, power = rtLightPower[index];
+	cc_bool innerYZ;
+
+	for (L = 0; L < RT_LIGHT_LEVELS; L++)
+	{
+		l = &levels[L];
+		if (!RT_LightCells(light, l, lo, hi)) continue;
+
+		for (y = lo[1]; y <= hi[1]; y++)
+		{
+			dy = RT_AxisDistance(light[1] + 0.5f, l->origin[1] + y * l->size, l->size);
+			for (z = lo[2]; z <= hi[2]; z++)
+			{
+				dz = RT_AxisDistance(light[2] + 0.5f, l->origin[2] + z * l->size, l->size);
+				innerYZ = y >= l->innerLo[1] && y <= l->innerHi[1] && z >= l->innerLo[2] && z <= l->innerHi[2];
+
+				for (x = lo[0]; x <= hi[0]; x++)
+				{
+					if (innerYZ && x >= l->innerLo[0] && x <= l->innerHi[0]) continue;
+					dx   = RT_AxisDistance(light[0] + 0.5f, l->origin[0] + x * l->size, l->size);
+					cell = L * RT_LIGHT_CELLS + (y * RT_LIGHT_GRID + z) * RT_LIGHT_GRID + x;
+					RT_KeepLight(cell, index, power / (1.0f + dx * dx + dy * dy + dz * dz));
+				}
+			}
+		}
 	}
 }
 
 /* Gathers the light emitting blocks near the camera, and which lights reach each cell of the grid */
 static void RT_BuildLights(struct RTParams* p, cc_uint32 count) {
-	int origin[3], lo[3], hi[3], cam[3];
-	int i, j, x, y, z, d, numCands = 0, numLights = 0, total, cell;
+	struct RTLightLevel levels[RT_LIGHT_LEVELS];
+	struct RTLightLevel* l;
+	int cam[3], i, j, L, d, numLights, total, cell, n;
 	struct ChunkRT* rt;
 	VkDeviceAddress lightsAddr, gridAddr;
 	float* lights;
 	int* grid;
 	int* light;
+	BlockID block;
 	PackedCol col;
-	float intensity;
+	float intensity, kept;
 
 	p->numLights = 0;
 	if (!rtBlockLights) return;
@@ -3141,62 +3260,69 @@ static void RT_BuildLights(struct RTParams* p, cc_uint32 count) {
 	cam[0] = (int)Math_Floor(Camera.CurrentPos.x);
 	cam[1] = (int)Math_Floor(Camera.CurrentPos.y);
 	cam[2] = (int)Math_Floor(Camera.CurrentPos.z);
-	for (i = 0; i < 3; i++)
-	{
-		origin[i] = (int)Math_Floor((float)cam[i] / RT_LIGHT_CELL) * RT_LIGHT_CELL - (RT_LIGHT_GRID / 2) * RT_LIGHT_CELL;
-	}
 
-	/* Gather lights near the camera, counted by distance (so the nearest are kept when there are too many) */
-	Mem_Set(rtLightBuckets, 0, sizeof(rtLightBuckets));
-	for (i = 0; i < (int)count && numCands < RT_MAX_LIGHTS; i++)
+	/* Each level is centred on the cell (of that level) containing the camera */
+	/* NOTE: The shader works out where each level starts the same way */
+	for (L = 0; L < RT_LIGHT_LEVELS; L++)
 	{
-		rt = rtChunks[i];
-		for (j = 0; j < rt->numLights && numCands < RT_MAX_LIGHTS; j++)
+		l       = &levels[L];
+		l->size = RT_LIGHT_CELL << L;
+
+		for (i = 0; i < 3; i++)
 		{
-			light = &rt->lights[j * 4];
-			d = max(Math_AbsI(light[0] - cam[0]), max(Math_AbsI(light[1] - cam[1]), Math_AbsI(light[2] - cam[2])));
-			if (d > RT_LIGHT_RANGE) continue;
+			l->origin[i] = (int)Math_Floor((float)cam[i] / l->size) * l->size - (RT_LIGHT_GRID / 2) * l->size;
+			if (!L) { l->innerLo[i] = 1; l->innerHi[i] = 0; continue; }
 
-			Mem_Copy(&rtLightCands[numCands * 4], light, 4 * sizeof(int));
-			rtLightBuckets[d + 1]++;
-			numCands++;
+			d = levels[L - 1].origin[i] - l->origin[i];
+			l->innerLo[i] = (d + l->size - 1) / l->size;
+			l->innerHi[i] = (d + RT_LIGHT_GRID * levels[L - 1].size) / l->size - 1;
 		}
 	}
-	if (!numCands) return;
+
+	/* Sort lights near the camera by distance (so the nearest are kept when there are too many) */
+	/*  (chunks with only lights are after the chunks in the TLAS) */
+	Mem_Set(rtLightBuckets, 0, sizeof(rtLightBuckets));
+	for (i = 0; i < (int)count + numRtLightOnly; i++)
+	{
+		rt = i < (int)count ? rtChunks[i] : rtLightOnly[i - count];
+		if (!RT_ChunkLightsInRange(rt, cam)) continue;
+
+		for (j = 0; j < rt->numLights; j++)
+		{
+			d = RT_LightDistance(&rt->lights[j * 4], cam);
+			if (d <= RT_LIGHT_RANGE) rtLightBuckets[d + 1]++;
+		}
+	}
 
 	for (d = 1; d < RT_LIGHT_RANGE + 2; d++) rtLightBuckets[d] += rtLightBuckets[d - 1];
-	for (i = 0; i < numCands; i++)
-	{
-		light = &rtLightCands[i * 4];
-		d = max(Math_AbsI(light[0] - cam[0]), max(Math_AbsI(light[1] - cam[1]), Math_AbsI(light[2] - cam[2])));
-		Mem_Copy(&rtLightSorted[rtLightBuckets[d]++ * 4], light, 4 * sizeof(int));
-	}
-	numLights = numCands;
+	numLights = min(rtLightBuckets[RT_LIGHT_RANGE + 1], RT_MAX_LIGHTS);
+	if (!numLights) return;
 
-	/* Count how many lights reach each cell (capped, nearest lights first) */
-	Mem_Set(rtCellCounts, 0, sizeof(rtCellCounts));
-	total = 0;
-	for (i = 0; i < numLights; i++)
+	for (i = 0; i < (int)count + numRtLightOnly; i++)
 	{
-		RT_LightCells(&rtLightSorted[i * 4], origin, lo, hi);
-		for (y = lo[1]; y <= hi[1]; y++)
-			for (z = lo[2]; z <= hi[2]; z++)
-				for (x = lo[0]; x <= hi[0]; x++)
-				{
-					cell = (y * RT_LIGHT_GRID + z) * RT_LIGHT_GRID + x;
-					if (rtCellCounts[cell] < RT_LIGHTS_PER_CELL) { rtCellCounts[cell]++; total++; }
-				}
+		rt = i < (int)count ? rtChunks[i] : rtLightOnly[i - count];
+		if (!RT_ChunkLightsInRange(rt, cam)) continue;
+
+		for (j = 0; j < rt->numLights; j++)
+		{
+			light = &rt->lights[j * 4];
+			d     = RT_LightDistance(light, cam);
+			if (d > RT_LIGHT_RANGE) continue;
+
+			total = rtLightBuckets[d]++;
+			if (total < RT_MAX_LIGHTS) Mem_Copy(&rtLightSorted[total * 4], light, 4 * sizeof(int));
+		}
 	}
 
 	lights = (float*)Ring_AllocAddress(numLights * 8 * sizeof(float), &lightsAddr);
-	grid   = (int*)Ring_AllocAddress((RT_LIGHT_CELLS * 2 + total) * sizeof(int), &gridAddr);
-	if (!lights || !grid) return;
+	if (!lights) return;
 
 	for (i = 0; i < numLights; i++)
 	{
 		light     = &rtLightSorted[i * 4];
-		col       = RT_LightColor((BlockID)light[3]);
-		intensity = max(Blocks.Brightness[light[3]] & 0x0F, Blocks.Brightness[light[3]] >> 4) / 15.0f;
+		block     = (BlockID)(light[3] & 0xFFFF);
+		col       = RT_LightColor(block);
+		intensity = max(Blocks.Brightness[block] & 0x0F, Blocks.Brightness[block] >> 4) / 15.0f;
 
 		lights[i * 8 + 0] = light[0] + 0.5f;
 		lights[i * 8 + 1] = light[1] + 0.5f;
@@ -3205,36 +3331,51 @@ static void RT_BuildLights(struct RTParams* p, cc_uint32 count) {
 		lights[i * 8 + 4] = PackedCol_R(col) / 255.0f;
 		lights[i * 8 + 5] = PackedCol_G(col) / 255.0f;
 		lights[i * 8 + 6] = PackedCol_B(col) / 255.0f;
-		lights[i * 8 + 7] = 0.0f;
+		lights[i * 8 + 7] = (float)(light[3] >> 16); /* Faces light gets out of (see Builder_LightFaces) */
+
+		/* How bright the light is overall */
+		rtLightPower[i] = intensity * (0.2126f * lights[i * 8 + 4] + 0.7152f * lights[i * 8 + 5] + 0.0722f * lights[i * 8 + 6]);
 	}
 
-	/* Each cell is (offset, count), with the offsets being into the light indices after the cells */
-	total = RT_LIGHT_CELLS * 2;
-	for (cell = 0; cell < RT_LIGHT_CELLS; cell++)
-	{
-		grid[cell * 2]     = total;
-		grid[cell * 2 + 1] = 0;
-		total += rtCellCounts[cell];
-	}
+	/* Each cell has the most important lights reaching it, and when there are too many lights, their light */
+	/*  is scaled up by (total importance of all lights / total importance of the kept lights). This is the */
+	/*  same every frame (unlike e.g. picking a random subset of the lights), so there's no flickering */
+	Mem_Set(rtCellCounts, 0, sizeof(rtCellCounts));
+	Mem_Set(rtCellTotals, 0, sizeof(rtCellTotals));
 	for (i = 0; i < numLights; i++)
 	{
-		RT_LightCells(&rtLightSorted[i * 4], origin, lo, hi);
-		for (y = lo[1]; y <= hi[1]; y++)
-			for (z = lo[2]; z <= hi[2]; z++)
-				for (x = lo[0]; x <= hi[0]; x++)
-				{
-					cell = (y * RT_LIGHT_GRID + z) * RT_LIGHT_GRID + x;
-					if (grid[cell * 2 + 1] >= rtCellCounts[cell]) continue;
-					grid[grid[cell * 2] + grid[cell * 2 + 1]] = i;
-					grid[cell * 2 + 1]++;
-				}
+		RT_AddLightToCells(i, &rtLightSorted[i * 4], levels);
+	}
+
+	total = RT_LIGHT_ALL_CELLS * RT_CELL_HEADER;
+	for (cell = 0; cell < RT_LIGHT_ALL_CELLS; cell++) { total += rtCellCounts[cell]; }
+
+	grid = (int*)Ring_AllocAddress(total * sizeof(int), &gridAddr);
+	if (!grid) return;
+
+	/* Each cell is (offset, count, scale), with the offsets being into the light indices after the cells */
+	total = RT_LIGHT_ALL_CELLS * RT_CELL_HEADER;
+	for (cell = 0; cell < RT_LIGHT_ALL_CELLS; cell++)
+	{
+		n    = rtCellCounts[cell];
+		kept = 0.0f;
+		for (i = 0; i < n; i++)
+		{
+			grid[total + i] = rtCellLights[cell * RT_LIGHTS_PER_CELL + i];
+			kept += rtCellWeights[cell * RT_LIGHTS_PER_CELL + i];
+		}
+
+		grid[cell * RT_CELL_HEADER]     = total;
+		grid[cell * RT_CELL_HEADER + 1] = n;
+		((float*)grid)[cell * RT_CELL_HEADER + 2] = kept > 0.0f ? rtCellTotals[cell] / kept : 1.0f;
+		total += n;
 	}
 
 	p->lights      = lightsAddr;
 	p->lightGrid   = gridAddr;
-	p->gridX       = (float)origin[0];
-	p->gridY       = (float)origin[1];
-	p->gridZ       = (float)origin[2];
+	p->gridX       = (float)levels[0].origin[0];
+	p->gridY       = (float)levels[0].origin[1];
+	p->gridZ       = (float)levels[0].origin[2];
 	p->invCellSize = 1.0f / RT_LIGHT_CELL;
 	p->gridDim     = RT_LIGHT_GRID;
 	p->numLights   = numLights;
@@ -3372,6 +3513,7 @@ static void RT_UpdateWater(struct RTParams* p) {
 }
 
 /* Called at the start of the frame (the GPU has already finished with this frame's parameters) */
+#define RT_TIME_WRAP (200.0 * 3.14159265358979)
 static void RT_UpdateConstants(void) {
 	struct RTParams* p = RT_FrameParams();
 	float angle  = rtSunAngle_Degrees[rtSunAngle] * MATH_DEG2RAD;
@@ -3445,7 +3587,8 @@ static void RT_UpdateConstants(void) {
 	/* Sky is moved up to stay above the camera (see EnvRenderer_RenderSky) */
 	p->skyDY  = max(Camera.CurrentPos.y + 8.0f, (float)World.Height + 8.0f) - ((float)World.Height + 8.0f);
 	p->skybox = EnvRenderer_ShouldRenderSkybox();
-	p->time   = (float)(Game.Time - 3600.0 * (int)(Game.Time / 3600.0));
+	/* Wrapped at a multiple of 20 pi, so the caustics (whose speeds are multiples of 0.1) don't jump */
+	p->time   = (float)(Game.Time - RT_TIME_WRAP * (int)(Game.Time / RT_TIME_WRAP));
 }
 
 /* The shadow history written this frame is only usable next frame if chunks were drawn this frame */

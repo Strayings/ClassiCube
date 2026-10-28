@@ -160,7 +160,7 @@ struct RTParams {
 	/*  the block's box + unused), and a grid of cells covering the world (offset + count, see RT_BuildLights) */
 	VkDeviceAddress lights, lightGrid;
 	float gridW, gridH, gridL, invCellSize; /* Number of cells along each axis */
-	int _pad6, numLights; float lightStrength, _pad5;
+	int lightsGen, numLights; float lightStrength, _pad5; /* (lightsGen changes whenever light indices do) */
 };
 
 static VkInstance instance;
@@ -3276,7 +3276,7 @@ static PackedCol RT_LightColor(BlockID block) {
 #define RT_LIGHT_CELL      8    /* Size of each cell in blocks */
 #define RT_LIGHT_REACH     16   /* How far light from a block reaches (NOTE: must match FLOAT_INV_REACH2) */
 #define RT_LIGHTS_PER_CELL 16   /* NOTE: Must match LIGHTS_PER_CELL in misc/vulkan/VulkanShaderGen.c */
-#define RT_MAX_LIGHTS      65536 /* (when there are more, the lights nearest to the camera are used) */
+#define RT_MAX_LIGHTS      65536 /* (when there are more, the lights nearest to the camera are used) NOTE: the shader packs light indices into 16 bits */
 #define RT_MAX_LIGHT_ENTRIES (16 * 1024 * 1024)
 /* After lights change, the grid is rebuilt after waiting at least this many seconds (and 10 times as long as */
 /*  the last rebuild took), so that e.g. loading lots of chunks or flowing lava doesn't rebuild it every frame */
@@ -3287,6 +3287,7 @@ static PackedCol RT_LightColor(BlockID block) {
 static struct RingChunk* rtLightData; /* Lights, then the grid */
 static VkDeviceSize rtLightGridOffset;
 static int rtNumLights, rtGridCells[3]; /* Cells along each axis of the grid in rtLightData */
+static int rtLightsGen;                 /* Number of times rtLightData was rebuilt */
 static int rtLightCells[3];             /* Cells along each axis of the grid being built */
 static cc_bool rtLightsDirty = true, rtLightsCapped;
 static double rtLightsChangedTime, rtLightsDelay = RT_LIGHTS_DELAY;
@@ -3627,6 +3628,7 @@ static void RT_RebuildLights(void) {
 	rtLightData       = data;
 	rtLightGridOffset = lightsSize;
 	rtNumLights       = numLights;
+	rtLightsGen++;
 	Mem_Copy(rtGridCells, rtLightCells, sizeof(rtGridCells));
 }
 
@@ -3667,6 +3669,8 @@ static void RT_BuildLights(struct RTParams* p) {
 	p->gridL       = (float)rtGridCells[2];
 	p->invCellSize = 1.0f / RT_LIGHT_CELL;
 	p->numLights   = rtNumLights;
+	/* The shader packs this with light indices (which are below 65536) into a float, so it must be below 256 */
+	p->lightsGen   = rtLightsGen & 0xFF;
 }
 
 static void RT_BuildTLAS(VkCommandBuffer cmd) {

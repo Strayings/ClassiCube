@@ -218,6 +218,8 @@ typedef void (VKAPI_PTR *PFN_vkVoidFunction)(void);
 #define VK_COMPARE_OP_NEVER            0
 #define VK_COMPARE_OP_EQUAL            2
 #define VK_COMPARE_OP_GREATER_OR_EQUAL 6
+#define VK_BLEND_FACTOR_ZERO                0
+#define VK_BLEND_FACTOR_ONE                 1
 #define VK_BLEND_FACTOR_SRC_ALPHA           6
 #define VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA 7
 #define VK_BLEND_OP_ADD 0

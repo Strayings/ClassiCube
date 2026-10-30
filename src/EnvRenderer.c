@@ -193,6 +193,8 @@ static CC_NOINLINE void BuildClouds(void) {
 	Gfx_UnlockVb(clouds_vb);
 }
 
+GfxResourceID EnvRenderer_CloudsTexture(void) { return clouds_tex; }
+
 void EnvRenderer_RenderClouds(void) {
 	float offset;
 	if (Env.CloudsHeight < -2000 || !clouds_tex) return;

@@ -379,10 +379,12 @@ CC_API void Gfx_SetDynamicVbData(GfxResourceID vb, void* vertices, int vCount);
 #if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
 /* Sets which vertices of a chunk's vertex buffer cast shadows (used for ray traced shadows) */
 /*  ranges contains pairs of first vertex and number of vertices, with the ranges of opaque vertices first, */
-/*  followed by the ranges of vertices which only cast shadows where their texture isn't transparent */
-/*  lights contains the x, y, z and block of each light emitting block in the chunk */
-void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, int numCutout,
-						const int* lights, int numLights);
+/*  followed by the ranges of vertices which only cast shadows where their texture isn't transparent, then */
+/*  the ranges of translucent vertices (e.g. water) and then sprite vertices (e.g. fire), which don't cast */
+/*  shadows, but are seen in reflections */
+/*  lights contains the x, y, z and block | (faces light gets out of << 16) of each light emitting block in the chunk */
+void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, int numCutout, int numTranslucent,
+						int numSprites, const int* lights, int numLights);
 /* Sets whether the sky is being drawn (the sky has god rays when using ray traced shadows) */
 void Gfx_SetSkyRendering(cc_bool enabled);
 #endif

@@ -101,10 +101,16 @@ struct ChunkRT {
 	VkAccelerationStructureKHR blas;
 	struct MemAlloc blasAlloc;
 	VkDeviceAddress address;
+	/* Translucent faces (e.g. water) and sprites (e.g. fire) are in a separate BLAS, which only reflection rays */
+	/*  see (see RT_BuildTLAS) */
+	VkAccelerationStructureKHR waterBlas;
+	struct MemAlloc waterAlloc;
+	VkDeviceAddress waterAddress;
 	struct MemAlloc* vb;
-	/* Ranges of cutout vertices (e.g. leaves) come first, then ranges of opaque vertices */
+	/* Ranges of cutout vertices (e.g. leaves) come first, then ranges of opaque vertices, then (numWater) */
+	/*  ranges of translucent vertices, the last numSprites of which are sprites */
 	int* ranges;
-	int numRanges, numCutout, numGeoms, listIndex;
+	int numRanges, numCutout, numGeoms, listIndex, numWater, numWaterGeoms, numSprites;
 	/* Light emitting blocks in the chunk (x, y, z, block | faces light gets out of << 16) */
 	/*  (chunks with lights but no shadow casters, e.g. just a light sprite, only have the lights) */
 	int* lights;
@@ -143,7 +149,7 @@ static struct PushConstants {
 /* Per frame constants for ray traced shadows (uniform buffer in descriptor set 1) */
 /* NOTE: Layout must match the Params uniform block in misc/vulkan/VulkanShaderGen.c (std140 rules) */
 struct RTParams {
-	VkDeviceAddress table; float _pad0[2]; /* Table of cutout geometry vertices */
+	VkDeviceAddress table; float _pad0[2]; /* Table of geometry vertices (see RT_FillTable) */
 	float camX, camY, camZ, shadowDist;
 	float sunX, sunY, sunZ, diffuseScale;
 	float ratioR, ratioG, ratioB; int samples;
@@ -161,6 +167,9 @@ struct RTParams {
 	VkDeviceAddress lights, lightGrid;
 	float gridW, gridH, gridL, invCellSize; /* Number of cells along each axis */
 	int lightsGen, numLights; float lightStrength, _pad5; /* (lightsGen changes whenever light indices do) */
+	float skyR, skyG, skyB, _pad7; /* Colour of the sky (seen in reflections) */
+	float cloudsR, cloudsG, cloudsB, cloudsY; /* Clouds (seen in reflections), see EnvRenderer_RenderClouds */
+	float cloudsOffset, cloudsDist, cloudsOn, tableValid;
 };
 
 static VkInstance instance;
@@ -177,6 +186,8 @@ static VkColorSpaceKHR colorSpace;
 /* resumePass keeps existing contents, for continuing a frame after taking a screenshot */
 /* noHistoryPass is used instead of renderPass when ray traced shadows are supported but turned off */
 static VkRenderPass renderPass, resumePass, noHistoryPass;
+/* Continues a frame after denoising the light of opaque faces, clearing out_mod and out_light (see RT_DenoiseNow) */
+static VkRenderPass denoiseResumePass;
 
 static VkSwapchainKHR swapchain;
 static VkExtent2D swapExtent;
@@ -189,16 +200,49 @@ static VkSemaphore renderSems[MAX_SWAP_IMAGES];
 static VkImage depthImage;
 static VkImageView depthView;
 static struct MemAlloc depthAlloc;
-/* Ray traced shadows/sky light (0) and bounced light (1) of each pixel, which are blended over */
-/*  multiple frames to give smooth results (frame slot i writes to history images [x][i], and reads */
-/*  the previous frame's history images). These are colour attachments 2 and 3 of the render pass */
-/* Shadow history, bounced light/god ray history, and picked block light (ReSTIR) */
+/* Ray traced shadows/sky light (0), bounced light/god rays (1) and picked block light (2, ReSTIR) of each pixel, */
+/*  which are blended over multiple frames to give smooth results (frame slot i writes to history images [x][i], */
+/*  and reads the previous frame's history images). These are colour attachments 2, 3 and 4 of the render pass */
 #define HISTORY_IMAGES 3
 static VkImage historyImages[HISTORY_IMAGES][FRAMES_IN_FLIGHT];
 /* Whether the history images were just created, and so still need to be transitioned to the right layout */
 static cc_bool historyFresh;
 static VkImageView historyViews[HISTORY_IMAGES][FRAMES_IN_FLIGHT];
 static struct MemAlloc historyAllocs[HISTORY_IMAGES][FRAMES_IN_FLIGHT];
+
+/* Denoised light of opaque faces (see RT_Denoise): two images for the passes in between, then the result (which the */
+/*  composite pass then adds to the colour), for each frame slot */
+#define DENOISE_IMAGES 3
+#define DENOISE_PASSES 5
+static VkImage denoiseImages[DENOISE_IMAGES][FRAMES_IN_FLIGHT];
+static VkImageView denoiseViews[DENOISE_IMAGES][FRAMES_IN_FLIGHT];
+static struct MemAlloc denoiseAllocs[DENOISE_IMAGES][FRAMES_IN_FLIGHT];
+static VkFramebuffer denoiseFramebuffers[DENOISE_IMAGES][FRAMES_IN_FLIGHT];
+static VkDescriptorSet denoiseSets[DENOISE_PASSES][FRAMES_IN_FLIGHT];
+static VkRenderPass denoisePass;
+static VkDescriptorSetLayout denoiseSetLayout;
+static VkDescriptorPool denoisePool;
+static VkPipelineLayout denoiseLayout;
+static VkPipeline denoisePipeline;
+static VkShaderModule denoiseModules[2];
+/* What the denoised light is multiplied by before it's added to the colour (out_mod, see RT_DenoiseNow) */
+/* NOTE: With out_light, this makes 6 colour attachments, which every GPU that supports ray queries does (they all */
+/*  support 8) */
+static VkImage modImages[FRAMES_IN_FLIGHT];
+static VkImageView modViews[FRAMES_IN_FLIGHT];
+static struct MemAlloc modAllocs[FRAMES_IN_FLIGHT];
+/* All the light of those faces, which is denoised before being multiplied by out_mod (out_light) */
+static VkImage lightImages[FRAMES_IN_FLIGHT];
+static VkImageView lightViews[FRAMES_IN_FLIGHT];
+static struct MemAlloc lightAllocs[FRAMES_IN_FLIGHT];
+static VkFramebuffer compositeFramebuffers[MAX_SWAP_IMAGES];
+static VkDescriptorSet compositeSets[FRAMES_IN_FLIGHT];
+static VkRenderPass compositePass;
+static VkDescriptorSetLayout compositeSetLayout;
+static VkDescriptorPool compositePool;
+static VkPipelineLayout compositeLayout;
+static VkPipeline compositePipelines[16]; /* (one for each colour write mask) */
+static VkShaderModule compositeModule;
 #define HISTORY_FORMAT VK_FORMAT_R16G16B16A16_SFLOAT
 /* Picked block light needs 32 bit floats, since it includes the light's index */
 #define HistoryFormat(i) ((i) == 2 ? VK_FORMAT_R32G32B32A32_SFLOAT : HISTORY_FORMAT)
@@ -232,6 +276,7 @@ static VkDeviceSize vbOffset, ibOffset;
 static struct VulkanTexture* curTex;
 static int boundPipeline;
 static void FlushDeferredDraws(void);
+static void RT_DenoiseNow(int colorMask);
 static cc_bool dirtyViewport, dirtyScissor, dirtyConstants, dirtyTexture, dirtyVb, dirtyIb, dirtyCull;
 static struct Matrix _view, _proj;
 
@@ -1026,14 +1071,15 @@ static void ChooseFormats(void) {
 
 /* Normal render pass doesn't load existing contents, since Gfx_ClearBuffers is always called first */
 /*  Resume render pass loads existing contents, for continuing a frame after taking a screenshot */
-/* When ray traced shadows are supported, there's also a 2nd colour attachment for the shadow history */
-/*  (which is cleared at the start of each frame, unless history is false) */
-static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
-	VkAttachmentDescription attachments[5] = { { 0 } };
-	VkSubpassDependency deps[2]       = { { 0 } };
+/* When ray traced shadows are supported, there are also colour attachments for the 3 history images, out_mod and */
+/*  out_light (which are cleared at the start of each frame, unless history is false). clearMod clears out_mod and */
+/*  out_light even when resuming (after the light they had was added, see RT_DenoiseNow) */
+static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history, cc_bool clearMod) {
+	VkAttachmentDescription attachments[7] = { { 0 } };
+	VkSubpassDependency deps[3]       = { { 0 } };
 	VkSubpassDescription subpass      = { 0 };
 	VkRenderPassCreateInfo info       = { 0 };
-	VkAttachmentReference colorRefs[4], depthRef;
+	VkAttachmentReference colorRefs[6], depthRef;
 	VkRenderPass pass;
 	VkResult res;
 
@@ -1067,6 +1113,12 @@ static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
 	attachments[3] = attachments[2];
 	attachments[4] = attachments[2];
 	attachments[4].format = HistoryFormat(2);
+	/* out_mod is only used within a frame (see RT_DenoiseNow) */
+	attachments[5] = attachments[2];
+	attachments[5].loadOp = (resume && !clearMod) ? VK_ATTACHMENT_LOAD_OP_LOAD :
+							(history ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE);
+	/* (as is out_light) */
+	attachments[6] = attachments[5];
 
 	colorRefs[0].attachment = 0;
 	colorRefs[0].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1076,11 +1128,15 @@ static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
 	colorRefs[2].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	colorRefs[3].attachment = 4;
 	colorRefs[3].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	colorRefs[4].attachment = 5;
+	colorRefs[4].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	colorRefs[5].attachment = 6;
+	colorRefs[5].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	depthRef.attachment     = 1;
 	depthRef.layout         = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
 	subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	subpass.colorAttachmentCount    = rtSupported ? 4 : 1;
+	subpass.colorAttachmentCount    = rtSupported ? 6 : 1;
 	subpass.pColorAttachments       = colorRefs;
 	subpass.pDepthStencilAttachment = &depthRef;
 
@@ -1105,12 +1161,20 @@ static VkRenderPass CreateRenderPass(cc_bool resume, cc_bool history) {
 	deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 	deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
+	/* History written this frame is read by the denoise passes afterwards (see RT_Denoise) */
+	deps[2].srcSubpass    = 0;
+	deps[2].dstSubpass    = VK_SUBPASS_EXTERNAL;
+	deps[2].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	deps[2].dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	deps[2].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	deps[2].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
 	info.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-	info.attachmentCount = rtSupported ? 5 : 2;
+	info.attachmentCount = rtSupported ? 7 : 2;
 	info.pAttachments    = attachments;
 	info.subpassCount    = 1;
 	info.pSubpasses      = &subpass;
-	info.dependencyCount = 2;
+	info.dependencyCount = 3;
 	info.pDependencies   = deps;
 
 	res = vkCreateRenderPass(device, &info, NULL, &pass);
@@ -1191,6 +1255,8 @@ static void DestroySwapchainResources(void) {
 			if (framebuffers[i][j]) vkDestroyFramebuffer(device, framebuffers[i][j], NULL);
 			framebuffers[i][j] = 0;
 		}
+		if (compositeFramebuffers[i]) vkDestroyFramebuffer(device, compositeFramebuffers[i], NULL);
+		compositeFramebuffers[i] = 0;
 		vkDestroyImageView(device, swapViews[i], NULL);
 		vkDestroySemaphore(device, renderSems[i], NULL);
 	}
@@ -1205,6 +1271,34 @@ static void DestroySwapchainResources(void) {
 			MemAlloc_Free(&imagePool, &historyAllocs[i][j]);
 			historyViews[i][j]  = 0;
 			historyImages[i][j] = 0;
+		}
+	}
+
+	for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+	{
+		if (modViews[j])  vkDestroyImageView(device, modViews[j], NULL);
+		if (modImages[j]) vkDestroyImage(device, modImages[j], NULL);
+		MemAlloc_Free(&imagePool, &modAllocs[j]);
+		modViews[j]  = 0;
+		modImages[j] = 0;
+
+		if (lightViews[j])  vkDestroyImageView(device, lightViews[j], NULL);
+		if (lightImages[j]) vkDestroyImage(device, lightImages[j], NULL);
+		MemAlloc_Free(&imagePool, &lightAllocs[j]);
+		lightViews[j]  = 0;
+		lightImages[j] = 0;
+	}
+	for (i = 0; i < DENOISE_IMAGES; i++)
+	{
+		for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+		{
+			if (denoiseFramebuffers[i][j]) vkDestroyFramebuffer(device, denoiseFramebuffers[i][j], NULL);
+			if (denoiseViews[i][j])  vkDestroyImageView(device, denoiseViews[i][j], NULL);
+			if (denoiseImages[i][j]) vkDestroyImage(device, denoiseImages[i][j], NULL);
+			MemAlloc_Free(&imagePool, &denoiseAllocs[i][j]);
+			denoiseFramebuffers[i][j] = 0;
+			denoiseViews[i][j]  = 0;
+			denoiseImages[i][j] = 0;
 		}
 	}
 
@@ -1271,6 +1365,127 @@ static void CreateDepthBuffer(void) {
 
 	res = vkCreateImageView(device, &viewInfo, NULL, &depthView);
 	if (res) Process_Abort2(res, "Failed to create Vulkan depth buffer view");
+}
+
+/* Images that the light of opaque faces is denoised into (see RT_Denoise), and the descriptor sets that read them */
+static void CreateDenoiseImages(void) {
+	static const int inputs[DENOISE_PASSES] = { -1, 0, 1, 0, 1 }; /* (-1 = this frame's out_light) */
+	VkImageCreateInfo info         = { 0 };
+	VkImageViewCreateInfo viewInfo = { 0 };
+	VkFramebufferCreateInfo fbInfo = { 0 };
+	VkWriteDescriptorSet writes[3] = { { 0 } };
+	VkDescriptorImageInfo images[3];
+	VkMemoryRequirements reqs;
+	VkResult res;
+	int i, j, k;
+
+	info.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	info.imageType     = VK_IMAGE_TYPE_2D;
+	info.format        = HISTORY_FORMAT;
+	info.extent.width  = swapExtent.width;
+	info.extent.height = swapExtent.height;
+	info.extent.depth  = 1;
+	info.mipLevels     = 1;
+	info.arrayLayers   = 1;
+	info.samples       = VK_SAMPLE_COUNT_1_BIT;
+	info.tiling        = VK_IMAGE_TILING_OPTIMAL;
+	info.usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+	info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	viewInfo.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format   = HISTORY_FORMAT;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = 1;
+
+	fbInfo.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	fbInfo.renderPass      = denoisePass;
+	fbInfo.attachmentCount = 1;
+	fbInfo.width           = swapExtent.width;
+	fbInfo.height          = swapExtent.height;
+	fbInfo.layers          = 1;
+
+	for (i = 0; i < DENOISE_IMAGES; i++)
+	{
+		for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+		{
+			res = vkCreateImage(device, &info, NULL, &denoiseImages[i][j]);
+			if (res) Process_Abort2(res, "Failed to create Vulkan denoise image");
+
+			vkGetImageMemoryRequirements(device, denoiseImages[i][j], &reqs);
+			if (!AllocMemory(&imagePool, &reqs, &denoiseAllocs[i][j])) Process_Abort("Out of video memory! (allocating denoise images)");
+			vkBindImageMemory(device, denoiseImages[i][j], denoiseAllocs[i][j].block->memory, denoiseAllocs[i][j].offset);
+
+			viewInfo.image = denoiseImages[i][j];
+			res = vkCreateImageView(device, &viewInfo, NULL, &denoiseViews[i][j]);
+			if (res) Process_Abort2(res, "Failed to create Vulkan denoise view");
+
+			fbInfo.pAttachments = &denoiseViews[i][j];
+			res = vkCreateFramebuffer(device, &fbInfo, NULL, &denoiseFramebuffers[i][j]);
+			if (res) Process_Abort2(res, "Failed to create Vulkan denoise framebuffer");
+		}
+	}
+
+	for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+	{
+		res = vkCreateImage(device, &info, NULL, &modImages[j]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan out_mod image");
+
+		vkGetImageMemoryRequirements(device, modImages[j], &reqs);
+		if (!AllocMemory(&imagePool, &reqs, &modAllocs[j])) Process_Abort("Out of video memory! (allocating denoise images)");
+		vkBindImageMemory(device, modImages[j], modAllocs[j].block->memory, modAllocs[j].offset);
+
+		viewInfo.image = modImages[j];
+		res = vkCreateImageView(device, &viewInfo, NULL, &modViews[j]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan out_mod view");
+
+		res = vkCreateImage(device, &info, NULL, &lightImages[j]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan out_light image");
+
+		vkGetImageMemoryRequirements(device, lightImages[j], &reqs);
+		if (!AllocMemory(&imagePool, &reqs, &lightAllocs[j])) Process_Abort("Out of video memory! (allocating denoise images)");
+		vkBindImageMemory(device, lightImages[j], lightAllocs[j].block->memory, lightAllocs[j].offset);
+
+		viewInfo.image = lightImages[j];
+		res = vkCreateImageView(device, &viewInfo, NULL, &lightViews[j]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan out_light view");
+	}
+
+	/* Each pass reads the previous pass's output, plus this frame's history (which pixels are the same surface) */
+	/*  and picked block light (the plane of each pixel) */
+	for (k = 0; k < 3; k++)
+	{
+		images[k].sampler      = samplers[0];
+		images[k].imageLayout  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		writes[k].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[k].dstBinding      = k;
+		writes[k].descriptorCount = 1;
+		writes[k].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		writes[k].pImageInfo      = &images[k];
+	}
+	for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+	{
+		for (i = 0; i < DENOISE_PASSES; i++)
+		{
+			images[0].imageView = inputs[i] < 0 ? lightViews[j] : denoiseViews[inputs[i]][j];
+			images[1].imageView = historyViews[0][j];
+			images[2].imageView = historyViews[2][j];
+			for (k = 0; k < 3; k++) writes[k].dstSet = denoiseSets[i][j];
+			vkUpdateDescriptorSets(device, 3, writes, 0, NULL);
+		}
+	}
+
+	/* The composite pass reads out_mod and the denoised light */
+	for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+	{
+		images[0].imageView = modViews[j];
+		images[1].imageView = denoiseViews[DENOISE_IMAGES - 1][j];
+		writes[0].dstSet    = compositeSets[j];
+		writes[1].dstSet    = compositeSets[j];
+		vkUpdateDescriptorSets(device, 2, writes, 0, NULL);
+	}
 }
 
 /* Each frame slot's ray tracing descriptor set reads the previous frame's history images */
@@ -1346,6 +1561,8 @@ static void CreateHistoryImages(void) {
 			vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
 		}
 	}
+	CreateDenoiseImages();
+
 	/* Previous frame's history is gone, including for the frame currently being recorded */
 	/*  (whose parameters were already set in RT_BeginFrame, but haven't been used by the GPU yet) */
 	rtPrevDrawn = false;
@@ -1365,7 +1582,7 @@ static void CreateSwapchain(void) {
 	VkSemaphoreCreateInfo semInfo  = { 0 };
 	VkSwapchainKHR old = swapchain;
 	VkSurfaceCapabilitiesKHR caps;
-	VkImageView attachments[5];
+	VkImageView attachments[7];
 	cc_uint32 i, j, count;
 	VkResult res;
 
@@ -1433,7 +1650,7 @@ static void CreateSwapchain(void) {
 
 	fbInfo.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
 	fbInfo.renderPass      = renderPass;
-	fbInfo.attachmentCount = rtSupported ? 5 : 2;
+	fbInfo.attachmentCount = rtSupported ? 7 : 2;
 	fbInfo.pAttachments    = attachments;
 	fbInfo.width           = swapExtent.width;
 	fbInfo.height          = swapExtent.height;
@@ -1454,8 +1671,20 @@ static void CreateSwapchain(void) {
 			attachments[2] = historyViews[0][j];
 			attachments[3] = historyViews[1][j];
 			attachments[4] = historyViews[2][j];
+			attachments[5] = modViews[j];
+			attachments[6] = lightViews[j];
 			res = vkCreateFramebuffer(device, &fbInfo, NULL, &framebuffers[i][j]);
 			if (res) Process_Abort2(res, "Failed to create Vulkan framebuffer");
+		}
+
+		/* Denoised light is added to the colour of the swapchain image (see RT_DenoiseNow) */
+		if (rtSupported) {
+			VkFramebufferCreateInfo compInfo = fbInfo;
+			compInfo.renderPass      = compositePass;
+			compInfo.attachmentCount = 1;
+			compInfo.pAttachments    = &swapViews[i];
+			res = vkCreateFramebuffer(device, &compInfo, NULL, &compositeFramebuffers[i]);
+			if (res) Process_Abort2(res, "Failed to create Vulkan composite framebuffer");
 		}
 
 		res = vkCreateSemaphore(device, &semInfo, NULL, &renderSems[i]);
@@ -1522,6 +1751,12 @@ static const struct ShaderDesc vs_rt_descs[] = {
 	{ vs_textured_rt, sizeof(vs_textured_rt) },
 };
 
+static const struct ShaderDesc denoise_descs[] = {
+	{ vs_fullscreen, sizeof(vs_fullscreen) },
+	{ fs_denoise,    sizeof(fs_denoise)    },
+};
+static const struct ShaderDesc composite_desc = { fs_composite, sizeof(fs_composite) };
+
 static VkShaderModule CreateShader(const struct ShaderDesc* desc) {
 	VkShaderModuleCreateInfo info = { 0 };
 	VkShaderModule module;
@@ -1536,10 +1771,260 @@ static VkShaderModule CreateShader(const struct ShaderDesc* desc) {
 	return module;
 }
 
+/* Render pass, descriptor sets and pipeline for denoising the light of opaque faces (see RT_Denoise) */
+static void CreateDenoiseObjects(void) {
+	static const VkDynamicState dynamics[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkAttachmentDescription attachment       = { 0 };
+	VkAttachmentReference colorRef;
+	VkSubpassDescription subpass             = { 0 };
+	VkSubpassDependency deps[2]              = { { 0 } };
+	VkRenderPassCreateInfo passInfo          = { 0 };
+	VkDescriptorSetLayoutBinding bindings[3] = { { 0 } };
+	VkDescriptorSetLayoutCreateInfo setInfo  = { 0 };
+	VkDescriptorPoolSize size;
+	VkDescriptorPoolCreateInfo poolInfo      = { 0 };
+	VkDescriptorSetLayout layouts[DENOISE_PASSES * FRAMES_IN_FLIGHT];
+	VkDescriptorSet sets[DENOISE_PASSES * FRAMES_IN_FLIGHT];
+	VkDescriptorSetAllocateInfo allocInfo    = { 0 };
+	VkPushConstantRange range;
+	VkPipelineLayoutCreateInfo layoutInfo    = { 0 };
+	VkPipelineShaderStageCreateInfo stages[2]            = { { 0 } };
+	VkPipelineVertexInputStateCreateInfo vertexInput     = { 0 };
+	VkPipelineInputAssemblyStateCreateInfo inputAssembly = { 0 };
+	VkPipelineViewportStateCreateInfo viewportState      = { 0 };
+	VkPipelineRasterizationStateCreateInfo raster        = { 0 };
+	VkPipelineMultisampleStateCreateInfo multisample     = { 0 };
+	VkPipelineColorBlendAttachmentState blendAttachment  = { 0 };
+	VkPipelineColorBlendStateCreateInfo blend            = { 0 };
+	VkPipelineDynamicStateCreateInfo dynamic             = { 0 };
+	VkGraphicsPipelineCreateInfo info                    = { 0 };
+	VkResult res;
+	int i;
+
+	/* One colour attachment, whose previous contents don't matter */
+	attachment.format         = HISTORY_FORMAT;
+	attachment.samples        = VK_SAMPLE_COUNT_1_BIT;
+	attachment.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachment.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+	attachment.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	attachment.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+	attachment.finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	colorRef.attachment = 0;
+	colorRef.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	subpass.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments    = &colorRef;
+
+	/* The previous pass's output is read by this pass, and earlier reads of this pass's output must finish first */
+	deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
+	deps[0].dstSubpass    = 0;
+	deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	deps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+	/* This pass's output is read by the next pass (or the composite pass) */
+	deps[1].srcSubpass    = 0;
+	deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
+	deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	deps[1].dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+	passInfo.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	passInfo.attachmentCount = 1;
+	passInfo.pAttachments    = &attachment;
+	passInfo.subpassCount    = 1;
+	passInfo.pSubpasses      = &subpass;
+	passInfo.dependencyCount = 2;
+	passInfo.pDependencies   = deps;
+
+	res = vkCreateRenderPass(device, &passInfo, NULL, &denoisePass);
+	if (res) Process_Abort2(res, "Failed to create Vulkan denoise render pass");
+
+	/* The image being blurred, then this frame's history and picked block light images */
+	for (i = 0; i < 3; i++)
+	{
+		bindings[i].binding         = i;
+		bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		bindings[i].descriptorCount = 1;
+		bindings[i].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+	}
+	setInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	setInfo.bindingCount = 3;
+	setInfo.pBindings    = bindings;
+
+	res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &denoiseSetLayout);
+	if (res) Process_Abort2(res, "Failed to create Vulkan denoise descriptor set layout");
+
+	size.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	size.descriptorCount = 3 * DENOISE_PASSES * FRAMES_IN_FLIGHT;
+	poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets       = DENOISE_PASSES * FRAMES_IN_FLIGHT;
+	poolInfo.poolSizeCount = 1;
+	poolInfo.pPoolSizes    = &size;
+
+	res = vkCreateDescriptorPool(device, &poolInfo, NULL, &denoisePool);
+	if (res) Process_Abort2(res, "Failed to create Vulkan denoise descriptor pool");
+
+	for (i = 0; i < DENOISE_PASSES * FRAMES_IN_FLIGHT; i++) layouts[i] = denoiseSetLayout;
+	allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	allocInfo.descriptorPool     = denoisePool;
+	allocInfo.descriptorSetCount = DENOISE_PASSES * FRAMES_IN_FLIGHT;
+	allocInfo.pSetLayouts        = layouts;
+
+	res = vkAllocateDescriptorSets(device, &allocInfo, sets);
+	if (res) Process_Abort2(res, "Failed to allocate Vulkan denoise descriptor sets");
+	for (i = 0; i < DENOISE_PASSES * FRAMES_IN_FLIGHT; i++) denoiseSets[i % DENOISE_PASSES][i / DENOISE_PASSES] = sets[i];
+
+	/* (maximum pixel x and y, and how many pixels apart the pixels that are blurred together are) */
+	range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	range.offset     = 0;
+	range.size       = 3 * sizeof(int);
+
+	layoutInfo.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	layoutInfo.setLayoutCount         = 1;
+	layoutInfo.pSetLayouts            = &denoiseSetLayout;
+	layoutInfo.pushConstantRangeCount = 1;
+	layoutInfo.pPushConstantRanges    = &range;
+
+	res = vkCreatePipelineLayout(device, &layoutInfo, NULL, &denoiseLayout);
+	if (res) Process_Abort2(res, "Failed to create Vulkan denoise pipeline layout");
+
+	for (i = 0; i < 2; i++) denoiseModules[i] = CreateShader(&denoise_descs[i]);
+	stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+	stages[0].module = denoiseModules[0];
+	stages[0].pName  = "main";
+	stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+	stages[1].module = denoiseModules[1];
+	stages[1].pName  = "main";
+
+	/* A single triangle covering the whole screen, with no vertex buffer (see FullscreenVertexShader) */
+	vertexInput.sType      = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	inputAssembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	viewportState.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewportState.viewportCount = 1;
+	viewportState.scissorCount  = 1;
+
+	raster.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	raster.cullMode    = VK_CULL_MODE_NONE;
+	raster.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth   = 1.0f;
+
+	multisample.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+	blendAttachment.colorWriteMask = 0x0F;
+	blend.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	blend.attachmentCount = 1;
+	blend.pAttachments    = &blendAttachment;
+
+	dynamic.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dynamic.dynamicStateCount = Array_Elems(dynamics);
+	dynamic.pDynamicStates    = dynamics;
+
+	info.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	info.stageCount          = 2;
+	info.pStages             = stages;
+	info.pVertexInputState   = &vertexInput;
+	info.pInputAssemblyState = &inputAssembly;
+	info.pViewportState      = &viewportState;
+	info.pRasterizationState = &raster;
+	info.pMultisampleState   = &multisample;
+	info.pColorBlendState    = &blend;
+	info.pDynamicState       = &dynamic;
+	info.layout              = denoiseLayout;
+	info.renderPass          = denoisePass;
+	info.basePipelineIndex   = -1;
+
+	res = vkCreateGraphicsPipelines(device, 0, 1, &info, NULL, &denoisePipeline);
+	if (res) Process_Abort2(res, "Failed to create Vulkan denoise pipeline");
+
+	/* ---- Composite: adds out_mod * denoised light to the swapchain image (see RT_DenoiseNow) ---- */
+	attachment.format         = colorFormat;
+	attachment.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
+	/* (the main render pass leaves it ready for presenting, and the resumed main render pass expects it as a */
+	/*  colour attachment) */
+	attachment.initialLayout  = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	attachment.finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	deps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+	deps[1].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	deps[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+	res = vkCreateRenderPass(device, &passInfo, NULL, &compositePass);
+	if (res) Process_Abort2(res, "Failed to create Vulkan composite render pass");
+
+	setInfo.bindingCount = 2;
+	res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &compositeSetLayout);
+	if (res) Process_Abort2(res, "Failed to create Vulkan composite descriptor set layout");
+
+	size.descriptorCount = 2 * FRAMES_IN_FLIGHT;
+	poolInfo.maxSets     = FRAMES_IN_FLIGHT;
+	res = vkCreateDescriptorPool(device, &poolInfo, NULL, &compositePool);
+	if (res) Process_Abort2(res, "Failed to create Vulkan composite descriptor pool");
+
+	for (i = 0; i < FRAMES_IN_FLIGHT; i++) layouts[i] = compositeSetLayout;
+	allocInfo.descriptorPool     = compositePool;
+	allocInfo.descriptorSetCount = FRAMES_IN_FLIGHT;
+	res = vkAllocateDescriptorSets(device, &allocInfo, compositeSets);
+	if (res) Process_Abort2(res, "Failed to allocate Vulkan composite descriptor sets");
+
+	layoutInfo.pSetLayouts            = &compositeSetLayout;
+	layoutInfo.pushConstantRangeCount = 0;
+	res = vkCreatePipelineLayout(device, &layoutInfo, NULL, &compositeLayout);
+	if (res) Process_Abort2(res, "Failed to create Vulkan composite pipeline layout");
+
+	compositeModule  = CreateShader(&composite_desc);
+	stages[1].module = compositeModule;
+	/* Added to the existing colour */
+	blendAttachment.blendEnable         = true;
+	blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAttachment.colorBlendOp        = VK_BLEND_OP_ADD;
+	blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+	blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAttachment.alphaBlendOp        = VK_BLEND_OP_ADD;
+	info.layout     = compositeLayout;
+	info.renderPass = compositePass;
+	for (i = 1; i < 16; i++)
+	{
+		blendAttachment.colorWriteMask = i;
+		res = vkCreateGraphicsPipelines(device, 0, 1, &info, NULL, &compositePipelines[i]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan composite pipeline");
+	}
+}
+
+static void DestroyDenoiseObjects(void) {
+	int i;
+	vkDestroyPipeline(device, denoisePipeline, NULL);
+	vkDestroyPipelineLayout(device, denoiseLayout, NULL);
+	for (i = 0; i < 2; i++) vkDestroyShaderModule(device, denoiseModules[i], NULL);
+	vkDestroyDescriptorPool(device, denoisePool, NULL);
+	vkDestroyDescriptorSetLayout(device, denoiseSetLayout, NULL);
+	vkDestroyRenderPass(device, denoisePass, NULL);
+
+	for (i = 1; i < 16; i++) vkDestroyPipeline(device, compositePipelines[i], NULL);
+	vkDestroyPipelineLayout(device, compositeLayout, NULL);
+	vkDestroyShaderModule(device, compositeModule, NULL);
+	vkDestroyDescriptorPool(device, compositePool, NULL);
+	vkDestroyDescriptorSetLayout(device, compositeSetLayout, NULL);
+	vkDestroyRenderPass(device, compositePass, NULL);
+}
+
 /* Set 1 contains the top level acceleration structure for ray traced shadows (binding 0), */
-/*  struct RTParams (binding 1), and the previous frame's history images (bindings 2 and 3) */
+/*  struct RTParams (binding 1), the previous frame's history images (bindings 2, 3 and 4), and the clouds */
+/*  texture (binding 5) */
 static void CreateRTDescriptors(void) {
-	VkDescriptorSetLayoutBinding bindings[5] = { { 0 } };
+	VkDescriptorSetLayoutBinding bindings[6] = { { 0 } };
 	VkDescriptorSetLayoutCreateInfo setInfo  = { 0 };
 	VkDescriptorPoolCreateInfo poolInfo      = { 0 };
 	VkDescriptorSetAllocateInfo allocInfo    = { 0 };
@@ -1565,9 +2050,11 @@ static void CreateRTDescriptors(void) {
 	bindings[3].binding         = 3;
 	bindings[4] = bindings[2];
 	bindings[4].binding         = 4;
+	bindings[5] = bindings[2]; /* Clouds texture (see RT_UpdateClouds) */
+	bindings[5].binding         = 5;
 
 	setInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	setInfo.bindingCount = 5;
+	setInfo.bindingCount = 6;
 	setInfo.pBindings    = bindings;
 
 	res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &rtSetLayout);
@@ -1578,7 +2065,7 @@ static void CreateRTDescriptors(void) {
 	sizes[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	sizes[1].descriptorCount = FRAMES_IN_FLIGHT;
 	sizes[2].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	sizes[2].descriptorCount = FRAMES_IN_FLIGHT * HISTORY_IMAGES;
+	sizes[2].descriptorCount = FRAMES_IN_FLIGHT * (HISTORY_IMAGES + 1);
 
 	poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets       = FRAMES_IN_FLIGHT;
@@ -1619,6 +2106,7 @@ static void CreateRTDescriptors(void) {
 	for (i = 0; i < Array_Elems(fsRtModules);  i++) fsRtModules[i]  = CreateShader(&fs_rt_descs[i]);
 	for (i = 0; i < Array_Elems(fsSkyModules); i++) fsSkyModules[i] = CreateShader(&fs_sky_descs[i]);
 	for (i = 0; i < Array_Elems(fsEarlyModules); i++) fsEarlyModules[i] = CreateShader(&fs_early_descs[i]);
+	CreateDenoiseObjects();
 }
 
 static void CreatePipelineObjects(void) {
@@ -1707,6 +2195,7 @@ static void DestroyPipelineObjects(void) {
 	for (i = 0; i < Array_Elems(fsRtModules);  i++) vkDestroyShaderModule(device, fsRtModules[i],  NULL);
 	for (i = 0; i < Array_Elems(fsEarlyModules); i++) vkDestroyShaderModule(device, fsEarlyModules[i], NULL);
 	for (i = 0; i < Array_Elems(fsSkyModules); i++) vkDestroyShaderModule(device, fsSkyModules[i], NULL);
+	DestroyDenoiseObjects();
 	vkDestroyDescriptorPool(device, rtDescPool, NULL);
 	vkDestroyDescriptorSetLayout(device, rtSetLayout, NULL);
 	RingChunk_Destroy(&rtParams);
@@ -1724,7 +2213,7 @@ static VkPipeline CreatePipeline(int key) {
 	VkPipelineRasterizationStateCreateInfo raster        = { 0 };
 	VkPipelineMultisampleStateCreateInfo multisample     = { 0 };
 	VkPipelineDepthStencilStateCreateInfo depth          = { 0 };
-	VkPipelineColorBlendAttachmentState blendAttachments[4] = { { 0 } };
+	VkPipelineColorBlendAttachmentState blendAttachments[6] = { { 0 } };
 	VkPipelineColorBlendStateCreateInfo blend            = { 0 };
 	VkPipelineDynamicStateCreateInfo dynamic             = { 0 };
 	VkGraphicsPipelineCreateInfo info                    = { 0 };
@@ -1804,16 +2293,19 @@ static VkPipeline CreatePipeline(int key) {
 	blendAttachments[0].alphaBlendOp        = VK_BLEND_OP_ADD;
 	blendAttachments[0].colorWriteMask      = (key >> 5) & 0x0F;
 
-	/* Only opaque chunk faces write to the history images (see PrepareDraw) */
+	/* Only opaque ray traced faces (chunks and the sky) write to the history images, out_mod and out_light */
+	/*  (see PrepareDraw) */
 	if (rt && !prepass && !blendAttachments[0].blendEnable && blendAttachments[0].colorWriteMask) {
 		blendAttachments[1].colorWriteMask = 0x0F;
 		blendAttachments[2].colorWriteMask = 0x0F;
 		blendAttachments[3].colorWriteMask = 0x0F;
+		blendAttachments[4].colorWriteMask = 0x0F;
+		blendAttachments[5].colorWriteMask = 0x0F;
 	}
 	if (prepass) blendAttachments[0].colorWriteMask = 0;
 
 	blend.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-	blend.attachmentCount = rtSupported ? 4 : 1;
+	blend.attachmentCount = rtSupported ? 6 : 1;
 	blend.pAttachments    = blendAttachments;
 
 	dynamic.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
@@ -1852,9 +2344,10 @@ void Gfx_Create(void) {
 	CreateDevice();
 	ChooseFormats();
 
-	renderPass    = CreateRenderPass(false, true);
-	resumePass    = CreateRenderPass(true,  true);
-	noHistoryPass = CreateRenderPass(false, false);
+	renderPass    = CreateRenderPass(false, true,  false);
+	resumePass    = CreateRenderPass(true,  true,  false);
+	noHistoryPass = CreateRenderPass(false, false, false);
+	denoiseResumePass = CreateRenderPass(true, true, true);
 	CreateFrames();
 	CreatePipelineObjects();
 
@@ -1888,6 +2381,7 @@ void Gfx_Free(void) {
 	vkDestroyRenderPass(device, renderPass, NULL);
 	vkDestroyRenderPass(device, resumePass, NULL);
 	vkDestroyRenderPass(device, noHistoryPass, NULL);
+	vkDestroyRenderPass(device, denoiseResumePass, NULL);
 	MemPool_Destroy(&bufferPool);
 	MemPool_Destroy(&imagePool);
 	MemPool_Destroy(&asPool);
@@ -2389,13 +2883,10 @@ static void FlushDeferredDraws(void) {
 	}
 	numDeferred = 0;
 
-	/* The state above has replaced whatever was bound before */
-	boundPipeline  = -1;
-	dirtyConstants = true;
-	dirtyTexture   = true;
-	dirtyVb        = true;
-	dirtyIb        = true;
-	dirtyCull      = true;
+	/* Ray traced chunk faces are only deferred when ray tracing is active */
+	/*  (the denoised light is added with the same colour write mask they were drawn with) */
+	/*  (this also marks everything bound above as replaced) */
+	RT_DenoiseNow((prev->key >> 5) & 0x0F);
 }
 
 /* Bound state is lost when starting a new command buffer */
@@ -2414,7 +2905,7 @@ static void InvalidateState(void) {
 
 static void BeginRenderPass(VkRenderPass pass) {
 	VkRenderPassBeginInfo info = { 0 };
-	VkClearValue clears[5]     = { { { { 0 } } } };
+	VkClearValue clears[7]     = { { { { 0 } } } };
 	BeginCmd(frame->drawCmd);
 	drawBegun = true;
 	InvalidateState();
@@ -2427,7 +2918,7 @@ static void BeginRenderPass(VkRenderPass pass) {
 	info.renderPass        = pass;
 	info.framebuffer       = framebuffers[imageIndex][rtSupported ? frameIndex : 0];
 	info.renderArea.extent = swapExtent;
-	info.clearValueCount   = rtSupported ? 5 : 0;
+	info.clearValueCount   = rtSupported ? 7 : 0;
 	info.pClearValues      = clears;
 
 	/* Swapchain recreation happens before this (see AcquireImage), so the images can't be destroyed */
@@ -2441,6 +2932,21 @@ static void BeginRenderPass(VkRenderPass pass) {
 				ImageBarrier(frame->drawCmd, historyImages[i][j], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 							VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 			}
+		}
+		for (i = 0; i < DENOISE_IMAGES; i++)
+		{
+			for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+			{
+				ImageBarrier(frame->drawCmd, denoiseImages[i][j], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+							VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+			}
+		}
+		for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+		{
+			ImageBarrier(frame->drawCmd, modImages[j], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+						VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+			ImageBarrier(frame->drawCmd, lightImages[j], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+						VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 		}
 		historyFresh = false;
 	}
@@ -2891,7 +3397,7 @@ static void RT_Unlink(struct ChunkRT* rt) {
 	if (rt->listIndex < 0) return;
 	if (rt->numLights) RT_LightsChanged();
 
-	if (!rt->numRanges) {
+	if (!rt->numRanges && !rt->numWater) {
 		RT_ListRemove(rtLightOnly, &numRtLightOnly, rt);
 	} else if (rt->built) {
 		RT_ListRemove(rtChunks,  &numRtChunks,  rt);
@@ -2903,6 +3409,8 @@ static void RT_Unlink(struct ChunkRT* rt) {
 static void RT_FreeChunk(struct ChunkRT* rt) {
 	if (rt->blas) vkDestroyAccelerationStructureKHR(device, rt->blas, NULL);
 	MemAlloc_Free(&asPool, &rt->blasAlloc);
+	if (rt->waterBlas) vkDestroyAccelerationStructureKHR(device, rt->waterBlas, NULL);
+	MemAlloc_Free(&asPool, &rt->waterAlloc);
 	rt->vb->rt = NULL;
 
 	Mem_Free(rt->ranges);
@@ -2926,12 +3434,14 @@ static void RT_FreeAll(void) {
 
 void Gfx_SetSkyRendering(cc_bool enabled) { rtSkyDraw = enabled; }
 
-void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, int numCutout,
-						const int* lights, int numLights) {
+void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, int numCutout, int numTranslucent,
+						int numSprites, const int* lights, int numLights) {
 	struct MemAlloc* alloc = (struct MemAlloc*)vb;
 	int i, numRanges = numOpaque + numCutout;
 	struct ChunkRT* rt;
-	if (!rtActive || !alloc || (!numRanges && !numLights)) return;
+	/* (sprites are in the same BLAS as translucent faces, after them) */
+	numTranslucent += numSprites;
+	if (!rtActive || !alloc || (!numRanges && !numTranslucent && !numLights)) return;
 
 	rt = (struct ChunkRT*)Mem_TryAllocCleared(1, sizeof(struct ChunkRT));
 	if (!rt) return;
@@ -2947,26 +3457,33 @@ void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, in
 	}
 
 	/* Chunk only has lights (e.g. just a light sprite), so it has no BLAS */
-	if (!numRanges) {
+	if (!numRanges && !numTranslucent) {
 		if (!rt->lights) { Mem_Free(rt); return; }
 		alloc->rt = rt;
 		RT_ListAdd(&rtLightOnly, &numRtLightOnly, &maxRtLightOnly, rt);
 		return;
 	}
 
-	rt->ranges = (int*)Mem_TryAlloc(numRanges * 2, sizeof(int));
+	rt->ranges = (int*)Mem_TryAlloc((numRanges + numTranslucent) * 2, sizeof(int));
 	if (!rt->ranges) { Mem_Free(rt->lights); Mem_Free(rt); return; }
 
 	/* Cutout ranges go first, so their geometries are the first geometries in the BLAS */
 	Mem_Copy(rt->ranges,                 ranges + numOpaque * 2, numCutout * 2 * sizeof(int));
 	Mem_Copy(rt->ranges + numCutout * 2, ranges,                 numOpaque * 2 * sizeof(int));
+	Mem_Copy(rt->ranges + numRanges * 2, ranges + numRanges * 2, numTranslucent * 2 * sizeof(int));
 	for (i = 0; i < numRanges; i++)
 	{
 		rt->numGeoms += RT_GeometryCount(rt->ranges[i * 2 + 1]);
 	}
+	for (i = numRanges; i < numRanges + numTranslucent; i++)
+	{
+		rt->numWaterGeoms += RT_GeometryCount(rt->ranges[i * 2 + 1]);
+	}
 
 	rt->numRanges = numRanges;
 	rt->numCutout = numCutout;
+	rt->numWater  = numTranslucent;
+	rt->numSprites = numSprites;
 	alloc->rt     = rt;
 	RT_ListAdd(&rtPending, &numRtPending, &maxRtPending, rt);
 }
@@ -3034,8 +3551,13 @@ static void RT_EnsureTLAS(struct Frame* f) {
 	VkAccelerationStructureBuildSizesInfoKHR sizes    = { 0 };
 	VkWriteDescriptorSetAccelerationStructureKHR tlasWrite = { 0 };
 	VkWriteDescriptorSet write = { 0 };
-	cc_uint32 capacity = numRtChunks + RT_TLAS_SLACK;
+	cc_uint32 i, capacity = RT_TLAS_SLACK;
 
+	/* Each chunk has an instance for each of its BLASes */
+	for (i = 0; i < (cc_uint32)numRtChunks; i++)
+	{
+		capacity += (rtChunks[i]->blas != 0) + (rtChunks[i]->waterBlas != 0);
+	}
 	if (f->tlas && f->tlasCapacity >= capacity) return;
 	RT_FreeTLAS(f);
 	capacity = max(capacity * 2, 4096);
@@ -3069,24 +3591,19 @@ static void RT_EnsureTLAS(struct Frame* f) {
 	vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
 }
 
-static int RT_CountGeometries(struct ChunkRT* rt) {
-	int i, count = 0;
-	for (i = 0; i < rt->numRanges; i++)
-	{
-		count += RT_GeometryCount(rt->ranges[i * 2 + 1]);
-	}
-	return count;
-}
+static int RT_CountGeometries(struct ChunkRT* rt) { return rt->numGeoms + rt->numWaterGeoms; }
 
 /* Chunk vertices are quads, so they're drawn as triangles using the default index buffer */
-static int RT_FillGeometries(struct ChunkRT* rt, VkAccelerationStructureGeometryKHR* geoms,
+/*  (water = the translucent faces, otherwise the shadow casting faces) */
+static int RT_FillGeometries(struct ChunkRT* rt, cc_bool water, VkAccelerationStructureGeometryKHR* geoms,
 							VkAccelerationStructureBuildRangeInfoKHR* ranges, cc_uint32* primCounts) {
 	struct MemAlloc* vb = rt->vb;
 	struct MemAlloc* ib = (struct MemAlloc*)Gfx.DefaultIb;
 	VkAccelerationStructureGeometryTrianglesDataKHR* tris;
 	int i, first, count, vertices, n = 0;
+	int beg = water ? rt->numRanges : 0, end = water ? rt->numRanges + rt->numWater : rt->numRanges;
 
-	for (i = 0; i < rt->numRanges; i++)
+	for (i = beg; i < end; i++)
 	{
 		first = rt->ranges[i * 2];
 		count = rt->ranges[i * 2 + 1];
@@ -3098,8 +3615,8 @@ static int RT_FillGeometries(struct ChunkRT* rt, VkAccelerationStructureGeometry
 
 			geoms[n].sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
 			geoms[n].geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-			/* Cutout geometry isn't opaque, so the shader can check the texture alpha when it's hit */
-			geoms[n].flags        = i < rt->numCutout ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR;
+			/* Cutout geometry and sprites aren't opaque, so the shader can check the texture alpha when they're hit */
+			geoms[n].flags        = (!water && i < rt->numCutout) || (water && i >= end - rt->numSprites) ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR;
 
 			tris = &geoms[n].geometry.triangles;
 			tris->sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
@@ -3120,7 +3637,8 @@ static int RT_FillGeometries(struct ChunkRT* rt, VkAccelerationStructureGeometry
 	return n;
 }
 
-static cc_bool RT_PrepareChunk(struct ChunkRT* rt, VkAccelerationStructureBuildGeometryInfoKHR* build, cc_uint32* primCounts) {
+static cc_bool RT_PrepareBLAS(VkAccelerationStructureKHR* blas, struct MemAlloc* alloc, VkDeviceAddress* address,
+							VkAccelerationStructureBuildGeometryInfoKHR* build, cc_uint32* primCounts) {
 	VkAccelerationStructureBuildSizesInfoKHR sizes = { 0 };
 	VkAccelerationStructureDeviceAddressInfoKHR addressInfo = { 0 };
 	struct MemAlloc* scratch;
@@ -3137,15 +3655,15 @@ static cc_bool RT_PrepareChunk(struct ChunkRT* rt, VkAccelerationStructureBuildG
 	/* Scratch memory is only needed until the build has finished on the GPU */
 	Garbage_Add(GARBAGE_SCRATCH, scratch);
 
-	if (!RT_Alloc(&asPool, &rt->blasAlloc, sizes.accelerationStructureSize, 256)) return false;
-	rt->blas = RT_CreateAS(&rt->blasAlloc, sizes.accelerationStructureSize, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
-	if (!rt->blas) return false;
+	if (!RT_Alloc(&asPool, alloc, sizes.accelerationStructureSize, 256)) return false;
+	*blas = RT_CreateAS(alloc, sizes.accelerationStructureSize, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+	if (!(*blas)) return false;
 
 	addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-	addressInfo.accelerationStructure = rt->blas;
-	rt->address = vkGetAccelerationStructureDeviceAddressKHR(device, &addressInfo);
+	addressInfo.accelerationStructure = *blas;
+	*address = vkGetAccelerationStructureDeviceAddressKHR(device, &addressInfo);
 
-	build->dstAccelerationStructure = rt->blas;
+	build->dstAccelerationStructure = *blas;
 	build->scratchData.deviceAddress = RT_ScratchAddress(scratch);
 	return true;
 }
@@ -3157,13 +3675,15 @@ static void RT_BuildChunks(VkCommandBuffer cmd) {
 	VkAccelerationStructureBuildRangeInfoKHR* ranges;
 	cc_uint32* primCounts;
 	struct ChunkRT* rt;
-	int i, n, numGeoms = 0, numBuilds = 0, maxGeoms = 0;
+	int i, n, water, numGeoms = 0, numBuilds = 0, maxGeoms = 0;
+	cc_bool ok;
 
 	if (!numRtPending) return;
 	for (i = 0; i < numRtPending; i++) { maxGeoms += RT_CountGeometries(rtPending[i]); }
 
-	builds      = (VkAccelerationStructureBuildGeometryInfoKHR*)Mem_Alloc(numRtPending, sizeof(*builds), "Vulkan BLAS builds");
-	buildRanges = (const VkAccelerationStructureBuildRangeInfoKHR**)Mem_Alloc(numRtPending, sizeof(*buildRanges), "Vulkan BLAS builds");
+	/* (each chunk has up to 2 BLASes, see struct ChunkRT) */
+	builds      = (VkAccelerationStructureBuildGeometryInfoKHR*)Mem_Alloc(numRtPending * 2, sizeof(*builds), "Vulkan BLAS builds");
+	buildRanges = (const VkAccelerationStructureBuildRangeInfoKHR**)Mem_Alloc(numRtPending * 2, sizeof(*buildRanges), "Vulkan BLAS builds");
 	geoms       = (VkAccelerationStructureGeometryKHR*)Mem_Alloc(maxGeoms, sizeof(*geoms), "Vulkan BLAS geometry");
 	ranges      = (VkAccelerationStructureBuildRangeInfoKHR*)Mem_Alloc(maxGeoms, sizeof(*ranges), "Vulkan BLAS geometry");
 	primCounts  = (cc_uint32*)Mem_Alloc(maxGeoms, sizeof(*primCounts), "Vulkan BLAS geometry");
@@ -3172,22 +3692,30 @@ static void RT_BuildChunks(VkCommandBuffer cmd) {
 	{
 		rt = rtPending[i];
 		rt->listIndex = -1;
-		n  = RT_FillGeometries(rt, &geoms[numGeoms], &ranges[numGeoms], &primCounts[numGeoms]);
 
-		Mem_Set(&builds[numBuilds], 0, sizeof(builds[numBuilds]));
-		builds[numBuilds].sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
-		builds[numBuilds].type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-		builds[numBuilds].flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
-		builds[numBuilds].mode          = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-		builds[numBuilds].geometryCount = n;
-		builds[numBuilds].pGeometries   = &geoms[numGeoms];
+		for (water = 0; water < 2; water++)
+		{
+			if (!(water ? rt->numWater : rt->numRanges)) continue;
+			n = RT_FillGeometries(rt, water, &geoms[numGeoms], &ranges[numGeoms], &primCounts[numGeoms]);
 
-		/* If out of memory, the chunk just won't cast shadows */
-		if (!RT_PrepareChunk(rt, &builds[numBuilds], &primCounts[numGeoms])) continue;
+			Mem_Set(&builds[numBuilds], 0, sizeof(builds[numBuilds]));
+			builds[numBuilds].sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+			builds[numBuilds].type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+			builds[numBuilds].flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+			builds[numBuilds].mode          = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+			builds[numBuilds].geometryCount = n;
+			builds[numBuilds].pGeometries   = &geoms[numGeoms];
 
-		buildRanges[numBuilds] = &ranges[numGeoms];
-		numGeoms  += n;
-		numBuilds++;
+			ok = water ? RT_PrepareBLAS(&rt->waterBlas, &rt->waterAlloc, &rt->waterAddress, &builds[numBuilds], &primCounts[numGeoms])
+					   : RT_PrepareBLAS(&rt->blas,      &rt->blasAlloc,  &rt->address,      &builds[numBuilds], &primCounts[numGeoms]);
+			/* If out of memory, the chunk just won't cast shadows (or won't be seen in reflections) */
+			if (!ok) continue;
+
+			buildRanges[numBuilds] = &ranges[numGeoms];
+			numGeoms  += n;
+			numBuilds++;
+		}
+		if (!rt->blas && !rt->waterBlas) continue;
 
 		rt->built = true;
 		RT_ListAdd(&rtChunks, &numRtChunks, &maxRtChunks, rt);
@@ -3204,12 +3732,13 @@ static void RT_BuildChunks(VkCommandBuffer cmd) {
 }
 
 /* Each geometry's entry in the table is the address of the geometry's first vertex */
-/*  (used for alpha testing cutout geometry, and for finding what bounced light hit) */
-static int RT_FillTable(struct ChunkRT* rt, VkDeviceAddress* table) {
+/*  (used for alpha testing cutout geometry and sprites, and for finding what bounced light and reflections hit) */
+static int RT_FillTable(struct ChunkRT* rt, cc_bool water, VkDeviceAddress* table) {
 	VkDeviceAddress vb = MemAlloc_Address(rt->vb);
 	int i, first, count, vertices, n = 0;
+	int beg = water ? rt->numRanges : 0, end = water ? rt->numRanges + rt->numWater : rt->numRanges;
 
-	for (i = 0; i < rt->numRanges; i++)
+	for (i = beg; i < end; i++)
 	{
 		first = rt->ranges[i * 2];
 		count = rt->ranges[i * 2 + 1];
@@ -3682,44 +4211,55 @@ static void RT_BuildTLAS(VkCommandBuffer cmd) {
 	VkDeviceAddress* table;
 	VkDeviceAddress address, tableAddress = 0;
 	struct ChunkRT* rt;
-	cc_uint32 i, flags, base = 0, numGeoms = 0, count = min((cc_uint32)numRtChunks, frame->tlasCapacity);
+	cc_uint32 i, flags, mask, base = 0, numGeoms = 0, count = 0, capacity = frame->tlasCapacity;
 	cc_bool inTable, overflow = false;
+	int water;
 
-	for (i = 0; i < count; i++) { numGeoms += rtChunks[i]->numGeoms; }
+	for (i = 0; i < (cc_uint32)numRtChunks; i++) { numGeoms += rtChunks[i]->numGeoms + rtChunks[i]->numWaterGeoms; }
 	table = (VkDeviceAddress*)Ring_AllocAddress(max(numGeoms, 1) * sizeof(VkDeviceAddress), &tableAddress);
 
 	instances = (VkAccelerationStructureInstanceKHR*)Ring_AllocAddress(
-					max(count, 1) * sizeof(VkAccelerationStructureInstanceKHR), &address);
+					max(capacity, 1) * sizeof(VkAccelerationStructureInstanceKHR), &address);
 	/* Still have to build an empty TLAS, since draws using it have already been recorded */
-	if (!instances) { count = 0; address = 0; }
+	if (!instances) { capacity = 0; address = 0; }
 
 	/* Chunk vertices are already in world space, so every instance just uses an identity transform */
-	for (i = 0; i < count; i++)
+	/* Shadow casting faces have mask 1, which every ray sees. Translucent faces (e.g. water) have mask 2, */
+	/*  which only reflection rays see (see EmitReflection in misc/vulkan/VulkanShaderGen.c) */
+	for (i = 0; i < (cc_uint32)numRtChunks && count < capacity; i++)
 	{
 		rt = rtChunks[i];
-		Mem_Set(&instances[i], 0, sizeof(instances[i]));
-		instances[i].matrix[0][0] = 1.0f;
-		instances[i].matrix[1][1] = 1.0f;
-		instances[i].matrix[2][2] = 1.0f;
-		flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+		for (water = 0; water < 2 && count < capacity; water++)
+		{
+			if (!(water ? rt->waterBlas : rt->blas)) continue;
+			Mem_Set(&instances[count], 0, sizeof(instances[count]));
+			instances[count].matrix[0][0] = 1.0f;
+			instances[count].matrix[1][1] = 1.0f;
+			instances[count].matrix[2][2] = 1.0f;
+			flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+			mask  = water ? 0x02 : 0x01;
 
-		/* The custom index is where the instance's geometries start in the table */
-		/*  (if there's no room in the table, cutout geometries are just treated as opaque) */
-		inTable = table && base < (1u << 24);
-		if (inTable) {
-			instances[i].customIndexAndMask = base | (0xFFu << 24);
-			base += RT_FillTable(rt, table + base);
-		} else {
-			instances[i].customIndexAndMask = 0xFFu << 24;
-			overflow = true;
+			/* The custom index is where the instance's geometries start in the table */
+			/*  (if there's no room in the table, cutout geometries are just treated as opaque) */
+			inTable = table && base < (1u << 24);
+			if (inTable) {
+				instances[count].customIndexAndMask = base | (mask << 24);
+				base += RT_FillTable(rt, water, table + base);
+			} else {
+				instances[count].customIndexAndMask = mask << 24;
+				overflow = true;
+			}
+			if (!inTable || !(water ? rt->numSprites : rt->numCutout)) flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+			instances[count].sbtOffsetAndFlags = flags << 24;
+			instances[count].accelerationStructureReference = water ? rt->waterAddress : rt->address;
+			count++;
 		}
-		if (!rt->numCutout || !inTable) flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
-		instances[i].sbtOffsetAndFlags = flags << 24;
-		instances[i].accelerationStructureReference = rt->address;
 	}
 	RT_FrameParams()->table = table ? tableAddress : 0;
 	/* Bounced light needs the table to find what was hit */
 	if (!table || overflow) RT_FrameParams()->giStrength = 0.0f;
+	/* As do reflections */
+	RT_FrameParams()->tableValid = (table && !overflow) ? 1.0f : 0.0f;
 	RT_BuildLights(RT_FrameParams());
 
 	RT_InitTLASGeometry(&geometry, &build);
@@ -3804,6 +4344,36 @@ static void RT_UpdateWater(struct RTParams* p) {
 	p->scatterB     = p->sunB * (0.3f + 0.7f * b / maxC);
 }
 
+/* Clouds are seen in reflections, the same as in EnvRenderer_RenderClouds. The texture is set every frame, */
+/*  since it might have been replaced (e.g. by a new texture pack) */
+static void RT_UpdateClouds(struct RTParams* p) {
+	GfxResourceID tex = EnvRenderer_CloudsTexture();
+	struct VulkanTexture* vkTex = (struct VulkanTexture*)(tex ? tex : white_square);
+	VkDescriptorImageInfo imageInfo;
+	VkWriteDescriptorSet write = { 0 };
+
+	p->cloudsR      = PackedCol_R(Env.CloudsCol) / 255.0f;
+	p->cloudsG      = PackedCol_G(Env.CloudsCol) / 255.0f;
+	p->cloudsB      = PackedCol_B(Env.CloudsCol) / 255.0f;
+	p->cloudsY      = Env.CloudsHeight + 0.1f;
+	p->cloudsOffset = (float)(Game.Time / 2048.0f * 0.6f * Env.CloudsSpeed);
+	p->cloudsDist   = (float)Game_ViewDistance;
+	p->cloudsOn     = (Env.CloudsHeight >= -2000 && tex && !EnvRenderer_Minimal) ? 1.0f : 0.0f;
+	if (!vkTex) return;
+
+	imageInfo.sampler     = samplers[0];
+	imageInfo.imageView   = vkTex->view;
+	imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	write.dstSet          = frame->rtSet;
+	write.dstBinding      = 5;
+	write.descriptorCount = 1;
+	write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	write.pImageInfo      = &imageInfo;
+	vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+}
+
 /* Called at the start of the frame (the GPU has already finished with this frame's parameters) */
 #define RT_TIME_WRAP (200.0 * 3.14159265358979)
 static void RT_UpdateConstants(void) {
@@ -3859,11 +4429,15 @@ static void RT_UpdateConstants(void) {
 	p->aoStrength = rtAO_Strength[rtAO];
 	p->aoRange    = RT_AO_RANGE;
 
-	/* Bounced light is relative to sunlight, since vertex colours include the sun colour */
+	/* (the colour of the sun's glint in reflections) */
 	p->sunR = PackedCol_R(Env.SunCol) / 255.0f;
 	p->sunG = PackedCol_G(Env.SunCol) / 255.0f;
 	p->sunB = PackedCol_B(Env.SunCol) / 255.0f;
 	p->giStrength = rtGI ? 1.0f : 0.0f;
+	p->skyR = PackedCol_R(Env.SkyCol) / 255.0f;
+	p->skyG = PackedCol_G(Env.SkyCol) / 255.0f;
+	p->skyB = PackedCol_B(Env.SkyCol) / 255.0f;
+	RT_UpdateClouds(p);
 
 	p->lightStrength = rtBlockLights_Strength[rtBlockLights];
 	p->godStrength = rtGodRays_Strength[rtGodRays];
@@ -3881,6 +4455,94 @@ static void RT_UpdateConstants(void) {
 	p->skybox = EnvRenderer_ShouldRenderSkybox();
 	/* Wrapped at a multiple of 20 pi, so the caustics (whose speeds are multiples of 0.1) don't jump */
 	p->time   = (float)(Game.Time - RT_TIME_WRAP * (int)(Game.Time / RT_TIME_WRAP));
+}
+
+/* The light of opaque faces (sunlight, sky light, bounced light and block light) is noisy, so like Radiance's */
+/*  SVGF denoiser, it's blurred by an edge-aware a-trous filter (5 passes of 3x3 pixels, 1, 2, 4, 8 and 16 pixels */
+/*  apart, so it reaches 31 pixels like Radiance's largest blur radius of 30, see DenoiseFragmentShader in */
+/*  misc/vulkan/VulkanShaderGen.c), only between pixels of the same surface (see RT_DenoiseNow) */
+static void RT_Denoise(VkCommandBuffer cmd) {
+	static const int outputs[DENOISE_PASSES] = { 0, 1, 0, 1, DENOISE_IMAGES - 1 };
+	VkRenderPassBeginInfo info = { 0 };
+	VkViewport viewport = { 0 };
+	VkRect2D scissor    = { { 0 } };
+	int i, push[3];
+
+	viewport.width    = (float)swapExtent.width;
+	viewport.height   = (float)swapExtent.height;
+	viewport.maxDepth = 1.0f;
+	scissor.extent    = swapExtent;
+	push[0] = (int)swapExtent.width  - 1;
+	push[1] = (int)swapExtent.height - 1;
+
+	info.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	info.renderPass        = denoisePass;
+	info.renderArea.extent = swapExtent;
+
+	for (i = 0; i < DENOISE_PASSES; i++)
+	{
+		info.framebuffer = denoiseFramebuffers[outputs[i]][frameIndex];
+		vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, denoisePipeline);
+		vkCmdSetViewport(cmd, 0, 1, &viewport);
+		vkCmdSetScissor(cmd,  0, 1, &scissor);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, denoiseLayout, 0, 1, &denoiseSets[i][frameIndex], 0, NULL);
+		push[2] = 1 << i;
+		vkCmdPushConstants(cmd, denoiseLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+		vkCmdDraw(cmd, 3, 1, 0, 0);
+		vkCmdEndRenderPass(cmd);
+	}
+}
+
+/* The light (sunlight, sky light and bounced light incl. block light) of the opaque ray traced chunk faces just */
+/*  drawn is denoised, then added to their colour (multiplied by out_mod, see FragmentShader in */
+/*  misc/vulkan/VulkanShaderGen.c), like Radiance denoises all of its lighting before showing it. This pauses the main render pass, which is then continued afterwards (clearing */
+/*  out_mod, so that faces drawn afterwards can be denoised and added later without adding these twice) */
+static void RT_DenoiseNow(int colorMask) {
+	VkCommandBuffer cmd = frame->drawCmd;
+	VkRenderPassBeginInfo info = { 0 };
+	VkClearValue clears[7]     = { { { { 0 } } } };
+	VkViewport viewport = { 0 };
+	VkRect2D scissor    = { { 0 } };
+
+	vkCmdEndRenderPass(cmd);
+	RT_Denoise(cmd);
+
+	viewport.width    = (float)swapExtent.width;
+	viewport.height   = (float)swapExtent.height;
+	viewport.maxDepth = 1.0f;
+	scissor.extent    = swapExtent;
+
+	info.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	info.renderPass        = compositePass;
+	info.framebuffer       = compositeFramebuffers[imageIndex];
+	info.renderArea.extent = swapExtent;
+	vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+	if (colorMask) {
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipelines[colorMask]);
+		vkCmdSetViewport(cmd, 0, 1, &viewport);
+		vkCmdSetScissor(cmd,  0, 1, &scissor);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, compositeLayout, 0, 1, &compositeSets[frameIndex], 0, NULL);
+		vkCmdDraw(cmd, 3, 1, 0, 0);
+	}
+	vkCmdEndRenderPass(cmd);
+
+	info.renderPass      = denoiseResumePass;
+	info.framebuffer     = framebuffers[imageIndex][frameIndex];
+	info.clearValueCount = 7;
+	info.pClearValues    = clears;
+	vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+
+	/* Everything bound before has been replaced */
+	boundPipeline  = -1;
+	dirtyViewport  = true;
+	dirtyScissor   = true;
+	dirtyConstants = true;
+	dirtyTexture   = true;
+	dirtyVb        = true;
+	dirtyIb        = true;
+	dirtyCull      = true;
+	dirtyRtSet     = true;
 }
 
 /* The shadow history written this frame is only usable next frame if chunks were drawn this frame */

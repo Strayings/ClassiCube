@@ -13,6 +13,7 @@
 #include "TexturePack.h"
 #include "Game.h"
 #include "Options.h"
+#include "Audio.h"
 
 int Builder_SidesLevel, Builder_EdgeLevel;
 /* Packs an index into the 16x16x16 count array. Coordinates range from 0 to 15. */
@@ -46,8 +47,19 @@ static void (*Builder_PostPrepareChunk)(void);
 #ifdef BUILDER_SHADOW_CASTERS
 /* Fully bright faces are marked with an alpha of 254, so that ray traced shadows don't darken them */
 #define BUILDER_FULLBRIGHT_COL PackedCol_Make(255, 255, 255, 254)
+
+/* Faces of gold and iron blocks are marked with an alpha of 253, so that they're ray traced as reflective */
+/*  (only those blocks, since servers often give other blocks the metal sound, e.g. floor tiles) */
+static PackedCol Builder_TagCol(BlockID block, PackedCol col) {
+	if (PackedCol_A(col) != 255) return col; /* (e.g. fully bright) */
+
+	if ((block == BLOCK_GOLD || block == BLOCK_IRON) && Blocks.DigSounds[block] == SOUND_METAL)
+		return (col & PACKEDCOL_RGB_MASK) | PackedCol_A_Bits(253);
+	return col;
+}
 #else
 #define BUILDER_FULLBRIGHT_COL PACKEDCOL_WHITE
+#define Builder_TagCol(block, col) (col)
 #endif
 
 /* Contains state for vertices for a portion of a chunk mesh (vertices that are in a 1D atlas) */
@@ -214,28 +226,38 @@ static void Builder_SwapCasterFaces(int type, int faces) {
 /* Swaps the vertex write positions between faces of opaque casters and the given type of caster */
 static void Builder_SwapCasterType(int type) { Builder_SwapCasterFaces(type, (1 << FACE_COUNT) - 1); }
 
-static int Builder_CasterRanges[2 * ATLAS1D_MAX_ATLASES * 2 * FACE_COUNT * 2];
+#define BUILDER_TRANSLUCENT_RANGES 2 /* (not a type of shadow caster, see OutputShadowCasters) */
+#define BUILDER_SPRITE_RANGES      3 /* (same) */
+static int Builder_CasterRanges[3 * ATLAS1D_MAX_ATLASES * 2 * FACE_COUNT * 2];
 /* Tells the graphics backend which ranges of vertices in the chunk's VB cast shadows */
-/*  (ranges of opaque casters first, then ranges of cutout casters) */
+/*  (ranges of opaque casters first, then ranges of cutout casters, then ranges of translucent faces, e.g. water, */
+/*  then ranges of sprites, e.g. fire, which don't cast shadows but are seen in reflections) */
 static void OutputShadowCasters(GfxResourceID vb) {
 	struct Builder1DPart* part;
 	int* ranges = Builder_CasterRanges;
-	int i, j, face, type, start, first, casters, typeStart, count = 0, numOpaque = 0;
+	int i, j, face, type, start, first, casters, typeStart, count = 0, numOpaque = 0, numCutout = 0, numTranslucent = 0;
 
-	for (type = CASTER_OPAQUE; type <= CASTER_CUTOUT; type++)
+	for (type = CASTER_OPAQUE; type <= BUILDER_TRANSLUCENT_RANGES; type++)
 	{
 		typeStart = count;
 		for (i = 0; i < MapRenderer_1DUsedCount; i++)
 		{
 			for (j = 0; j < 2; j++)
 			{
+				/* (translucent faces are only in the translucent parts) */
+				if (type == BUILDER_TRANSLUCENT_RANGES && j == 0) continue;
 				part  = &Builder_Parts[i + j * ATLAS1D_MAX_ATLASES];
 				start = part->fOffset;
 
 				for (face = 0; face < FACE_COUNT; face++)
 				{
-					first   = start + (type == CASTER_CUTOUT ? part->typeCount[CASTER_OPAQUE][face] : 0);
-					casters = part->typeCount[type][face];
+					if (type == BUILDER_TRANSLUCENT_RANGES) {
+						first   = start;
+						casters = part->fCount[face];
+					} else {
+						first   = start + (type == CASTER_CUTOUT ? part->typeCount[CASTER_OPAQUE][face] : 0);
+						casters = part->typeCount[type][face];
+					}
 					start  += part->fCount[face];
 					if (!casters) continue;
 
@@ -250,8 +272,27 @@ static void OutputShadowCasters(GfxResourceID vb) {
 			}
 		}
 		if (type == CASTER_OPAQUE) numOpaque = count / 2;
+		if (type == CASTER_CUTOUT) numCutout = count / 2 - numOpaque;
 	}
-	Gfx_SetShadowCasters(vb, ranges, numOpaque, count / 2 - numOpaque, Builder_Lights, Builder_NumLights);
+	numTranslucent = count / 2 - numOpaque - numCutout;
+
+	/* Sprites (only in the normal parts) are just before the faces. Each sprite is 4 quads, in 4 blocks of */
+	/*  sCount / 4 vertices: Z, Z mirrored, X, X mirrored. The mirrored ones are in the same place as the others */
+	/*  (just facing the other way, since sprites are drawn with back faces culled), and rays see both sides of */
+	/*  a face, so only the Z and X blocks are needed */
+	for (i = 0; i < MapRenderer_1DUsedCount; i++)
+	{
+		part = &Builder_Parts[i];
+		if (!part->sCount) continue;
+		start = part->fOffset - part->sCount;
+
+		ranges[count++] = start;
+		ranges[count++] = part->sCount >> 2;
+		ranges[count++] = start + (part->sCount >> 1);
+		ranges[count++] = part->sCount >> 2;
+	}
+	Gfx_SetShadowCasters(vb, ranges, numOpaque, numCutout, numTranslucent, count / 2 - numOpaque - numCutout - numTranslucent,
+						Builder_Lights, Builder_NumLights);
 }
 #endif
 
@@ -921,7 +962,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 
 		col = fullBright ? BUILDER_FULLBRIGHT_COL :
 			x >= offset ? Lighting.Color_XSide_Fast(x - offset, y, z) : Env.SunXSide;
-		Drawer_XMin(count_XMin, col, loc, &part->faces.vertices[FACE_XMIN]);
+		Drawer_XMin(count_XMin, Builder_TagCol(Builder_Block, col), loc, &part->faces.vertices[FACE_XMIN]);
 	}
 
 	if (count_XMax) {
@@ -931,7 +972,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 
 		col = fullBright ? BUILDER_FULLBRIGHT_COL :
 			x <= (World.MaxX - offset) ? Lighting.Color_XSide_Fast(x + offset, y, z) : Env.SunXSide;
-		Drawer_XMax(count_XMax, col, loc, &part->faces.vertices[FACE_XMAX]);
+		Drawer_XMax(count_XMax, Builder_TagCol(Builder_Block, col), loc, &part->faces.vertices[FACE_XMAX]);
 	}
 
 	if (count_ZMin) {
@@ -941,7 +982,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 
 		col = fullBright ? BUILDER_FULLBRIGHT_COL :
 			z >= offset ? Lighting.Color_ZSide_Fast(x, y, z - offset) : Env.SunZSide;
-		Drawer_ZMin(count_ZMin, col, loc, &part->faces.vertices[FACE_ZMIN]);
+		Drawer_ZMin(count_ZMin, Builder_TagCol(Builder_Block, col), loc, &part->faces.vertices[FACE_ZMIN]);
 	}
 
 	if (count_ZMax) {
@@ -951,7 +992,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 
 		col = fullBright ? BUILDER_FULLBRIGHT_COL :
 			z <= (World.MaxZ - offset) ? Lighting.Color_ZSide_Fast(x, y, z + offset) : Env.SunZSide;
-		Drawer_ZMax(count_ZMax, col, loc, &part->faces.vertices[FACE_ZMAX]);
+		Drawer_ZMax(count_ZMax, Builder_TagCol(Builder_Block, col), loc, &part->faces.vertices[FACE_ZMAX]);
 	}
 
 	if (count_YMin) {
@@ -960,7 +1001,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 		part   = &Builder_Parts[baseOffset + Atlas1D_Index(loc)];
 
 		col = fullBright ? BUILDER_FULLBRIGHT_COL : Lighting.Color_YMin_Fast(x, y - offset, z);
-		Drawer_YMin(count_YMin, col, loc, &part->faces.vertices[FACE_YMIN]);
+		Drawer_YMin(count_YMin, Builder_TagCol(Builder_Block, col), loc, &part->faces.vertices[FACE_YMIN]);
 	}
 
 	if (count_YMax) {
@@ -969,7 +1010,7 @@ static void NormalBuilder_RenderBlock(int index, int x, int y, int z) {
 		part   = &Builder_Parts[baseOffset + Atlas1D_Index(loc)];
 
 		col = fullBright ? BUILDER_FULLBRIGHT_COL : Lighting.Color_YMax_Fast(x, y + offset, z);
-		Drawer_YMax(count_YMax, col, loc, &part->faces.vertices[FACE_YMAX]);
+		Drawer_YMax(count_YMax, Builder_TagCol(Builder_Block, col), loc, &part->faces.vertices[FACE_YMAX]);
 	}
 }
 

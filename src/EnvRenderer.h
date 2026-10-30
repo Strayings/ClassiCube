@@ -17,6 +17,8 @@ extern struct IGameComponent EnvRenderer_Component;
 void EnvRenderer_RenderSky(void);
 /* Renders textured cloud plane. */
 void EnvRenderer_RenderClouds(void);
+/* Returns the texture of the clouds (0 when there isn't one) */
+GfxResourceID EnvRenderer_CloudsTexture(void);
 /* Updates current fog colour and mode. */
 void EnvRenderer_UpdateFog(void);
 

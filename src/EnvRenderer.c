@@ -18,6 +18,7 @@
 #include "Camera.h"
 #include "Particle.h"
 #include "Options.h"
+#include "Lighting.h"
 #include "Entity.h"
 
 cc_bool EnvRenderer_Legacy, EnvRenderer_Minimal;
@@ -610,6 +611,10 @@ void EnvRenderer_RenderWeather(float delta) {
 *--------------------------------------------------------Sides/Edge-------------------------------------------------------*
 *#########################################################################################################################*/
 static GfxResourceID sides_vb, edges_vb, sides_tex, edges_tex;
+/* With ray traced shadows, water at the map's edges is drawn like water in the world */
+/*  (see EmitWater in misc/vulkan/VulkanShaderGen.c), marked with an alpha of 251 */
+static cc_bool edges_rt;
+#define EDGES_RAY_TRACED(block) (Lighting_GfxWater && Blocks.IsLiquid[block] && Blocks.Draw[block] == DRAW_TRANSLUCENT)
 static int sides_vertices, edges_vertices;
 static cc_bool sides_fullBright, edges_fullBright;
 static TextureLoc edges_lastTexLoc, sides_lastTexLoc;
@@ -800,6 +805,8 @@ static CC_NOINLINE void BuildMapEdges(void) {
 	edges_fullBright = Blocks.Brightness[block];
 	color = edges_fullBright ? PACKEDCOL_WHITE : Env.SunCol;
 	Block_Tint(color, block)
+	edges_rt = EDGES_RAY_TRACED(block);
+	if (edges_rt) color = (color & PACKEDCOL_RGB_MASK) | PackedCol_A_Bits(251);
 
 	y = (float)Env.EdgeHeight;
 	for (i = 0; i < 4; i++) {
@@ -838,11 +845,26 @@ void EnvRenderer_RenderMapEdges(void) {
 	int yVisible = min(0, Env_SidesHeight);
 	if (Camera.CurrentPos.y < yVisible && sides_vb) return;
 
+	/* (ray tracing was turned on or off since the edges were built) */
+	if (edges_vb && edges_rt != EDGES_RAY_TRACED(Env.EdgeBlock)) Gfx_DeleteVb(&edges_vb);
+
 	if (!edges_vb) {
 		BuildMapEdges();
 		if (!edges_vb) return;
 	}
-	RenderBorders(Env.EdgeBlock, edges_vb, edges_tex, edges_vertices);
+	if (!edges_rt) {
+		RenderBorders(Env.EdgeBlock, edges_vb, edges_tex, edges_vertices);
+		return;
+	}
+
+	/* Drawn like chunks, so that it's ray traced. Rays read the texture of what they hit from the bound */
+	/*  texture, so that has to be the terrain's (the water's own texture isn't used, see EmitWater) */
+	Gfx_SetupAlphaState(Blocks.Draw[Env.EdgeBlock]);
+	Gfx_BindTexture(Atlas1D.TexIds[0]);
+	Gfx_SetVertexFormat(VERTEX_FORMAT_TEXTURED);
+	Gfx_BindVb(edges_vb);
+	Gfx_DrawIndexedTris_T2fC4b(edges_vertices, 0, 0);
+	Gfx_RestoreAlphaState(Blocks.Draw[Env.EdgeBlock]);
 }
 
 

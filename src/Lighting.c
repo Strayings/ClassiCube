@@ -403,6 +403,7 @@ void ClassicLighting_AllocState(void) {
 /* When the graphics backend calculates sun shadows, every block has to be meshed as if */
 /*  it was in sunlight, otherwise blocks in shadow would end up being darkened twice */
 cc_bool Lighting_GfxSunShadows;
+cc_bool Lighting_GfxWater;
 static cc_bool   SunLighting_IsLit_Fast(int x, int y, int z)        { return true; }
 static PackedCol SunLighting_Color_Fast(int x, int y, int z)        { return Env.SunCol; }
 static PackedCol SunLighting_Color_YMin_Fast(int x, int y, int z)   { return Env.SunYMin; }

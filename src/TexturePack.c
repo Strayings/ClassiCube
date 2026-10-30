@@ -156,7 +156,13 @@ static void Atlas_Update1D(void) {
 		maxTexHeight     = min(maxTexHeight, maxCurHeight);
 	}
 
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+	/* Ray traced reflections, bounced light and shadows of cutout blocks read the texture of whatever a ray hits */
+	/*  from the 1D atlas that's bound, so all the textures need to be in one 1D atlas (when the GPU allows it) */
+	maxAtlasHeight   = min(16384, maxTexHeight);
+#else
 	maxAtlasHeight   = min(4096, maxTexHeight);
+#endif
 	maxTilesPerAtlas = maxAtlasHeight / Atlas2D.TileSize;
 	maxTiles         = Atlas2D.RowsCount * ATLAS2D_TILES_PER_ROW;
 

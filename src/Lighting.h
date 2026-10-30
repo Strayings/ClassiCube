@@ -32,6 +32,8 @@ void Lighting_SetMode(cc_uint8 mode, cc_bool fromServer);
 extern cc_bool Lighting_GfxSunShadows;
 /* Sets Lighting_GfxSunShadows, then rebuilds chunks if necessary */
 void Lighting_SetGfxSunShadows(cc_bool enabled);
+/* Whether water is drawn by the graphics backend's ray traced water instead (e.g. at the map's edges) */
+extern cc_bool Lighting_GfxWater;
 
 
 /* How much ambient occlusion to apply in fancy lighting where 1.0f = none and 0.0f = maximum*/

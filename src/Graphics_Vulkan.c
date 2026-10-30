@@ -170,6 +170,8 @@ struct RTParams {
 	float skyR, skyG, skyB, _pad7; /* Colour of the sky (seen in reflections) */
 	float cloudsR, cloudsG, cloudsB, cloudsY; /* Clouds (seen in reflections), see EnvRenderer_RenderClouds */
 	float cloudsOffset, cloudsDist, cloudsOn, tableValid;
+	float waterTime, waterOn, _pad9[2]; /* Time for the waves of water (wrapped every 1200 seconds), and whether water */
+	                                    /*  is drawn like Radiance's (see EmitWater) */
 };
 
 static VkInstance instance;
@@ -292,7 +294,7 @@ static cc_bool rtDrawn, rtPrevDrawn;
 /* Set when an option changes, since the previous frames' shadows/lighting no longer apply */
 static cc_bool rtResetHistory;
 static struct Matrix rtFrameMVP, rtPrevMVP;
-static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI, rtGodRays, rtBlockLights;
+static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI, rtGodRays, rtBlockLights, rtWater;
 static VkDeviceSize rtScratchAlign;
 static struct MemPool asPool, scratchPool;
 static VkDescriptorSetLayout rtSetLayout;
@@ -3317,6 +3319,7 @@ void Gfx_ClearBuffers(GfxBuffers buffers) {
 #define RT_OPT_GI          "gfx-rt-gi"
 #define RT_OPT_GOD_RAYS    "gfx-rt-godrays"
 #define RT_OPT_BLOCK_LIGHTS "gfx-rt-blocklights"
+#define RT_OPT_WATER       "gfx-rt-water"
 /* How much sunlight the air scatters per block, how much it scatters forwards (Henyey-Greenstein g), */
 /*  and how far along the view ray it's calculated for */
 #define RT_GOD_DENSITY 0.02f
@@ -3339,6 +3342,7 @@ static const char* const rtGI_Names[]         = { "Off", "On" };
 static const char* const rtGodRays_Names[]    = { "Off", "Low", "Medium", "High" };
 static const float rtGodRays_Strength[]       = { 0.0f, 0.06f, 0.12f, 0.2f };
 static const char* const rtBlockLights_Names[] = { "Off", "Low", "Medium", "High" };
+static const char* const rtWater_Names[]      = { "Off", "On" };
 static const float rtBlockLights_Strength[]    = { 0.0f, 3.0f, 6.0f, 12.0f };
 static const float rtSunAngle_Degrees[]  = { 20.0f, 40.0f, 60.0f, 90.0f };
 static const float rtShadowDist_Blocks[] = { 64.0f, 128.0f, 256.0f, 4096.0f };
@@ -3370,6 +3374,7 @@ static void RT_Init(void) {
 	rtGI         = Options_GetEnum(RT_OPT_GI,          1, rtGI_Names,         Array_Elems(rtGI_Names));
 	rtGodRays    = Options_GetEnum(RT_OPT_GOD_RAYS,    2, rtGodRays_Names,    Array_Elems(rtGodRays_Names));
 	rtBlockLights = Options_GetEnum(RT_OPT_BLOCK_LIGHTS, 2, rtBlockLights_Names, Array_Elems(rtBlockLights_Names));
+	rtWater      = Options_GetEnum(RT_OPT_WATER,       1, rtWater_Names,      Array_Elems(rtWater_Names));
 }
 
 static void RT_ListAdd(struct ChunkRT*** list, int* count, int* max, struct ChunkRT* rt) {
@@ -4455,6 +4460,9 @@ static void RT_UpdateConstants(void) {
 	p->skybox = EnvRenderer_ShouldRenderSkybox();
 	/* Wrapped at a multiple of 20 pi, so the caustics (whose speeds are multiples of 0.1) don't jump */
 	p->time   = (float)(Game.Time - RT_TIME_WRAP * (int)(Game.Time / RT_TIME_WRAP));
+	/* (the speed of every wave is a whole number of turns per 1200 seconds, like Radiance's per Minecraft day) */
+	p->waterTime = (float)(Game.Time - 1200.0 * (int)(Game.Time / 1200.0));
+	p->waterOn   = rtWater ? 1.0f : 0.0f;
 }
 
 /* The light of opaque faces (sunlight, sky light, bounced light and block light) is noisy, so like Radiance's */
@@ -4561,6 +4569,9 @@ static void RT_BeginFrame(void) {
 		Lighting_SetGfxSunShadows(active);
 	}
 
+	/* (water at the map's edges is drawn as ray traced water too, see EnvRenderer_RenderMapEdges) */
+	Lighting_GfxWater = rtActive && rtWater;
+
 	if (!rtActive) { if (frame->tlas) RT_FreeTLAS(frame); return; }
 	RT_UpdateConstants();
 	RT_EnsureTLAS(frame);
@@ -4627,6 +4638,12 @@ static void RT_SetGodRays(int v) {
 	RT_SaveEnum(RT_OPT_GOD_RAYS, rtGodRays_Names[v]);
 }
 
+static int  RT_GetWater(void) { return rtWater; }
+static void RT_SetWater(int v) {
+	rtWater = v;
+	RT_SaveEnum(RT_OPT_WATER, rtWater_Names[v]);
+}
+
 static int  RT_GetGI(void) { return rtGI; }
 static void RT_SetGI(int v) {
 	rtResetHistory = true;
@@ -4670,6 +4687,10 @@ static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
 		RT_GetBlockLights, RT_SetBlockLights,
 		"&eBlocks that give off light (e.g. lava) light up\n" \
 		"&enearby blocks, in the colour of their texture.");
+	MenuOptionsScreen_AddEnum(s, "Water", rtWater_Names, Array_Elems(rtWater_Names),
+		RT_GetWater,      RT_SetWater,
+		"&eWater has waves, reflects and refracts like real\n" \
+		"&ewater (like Radiance). Off draws normal water.");
 }
 
 

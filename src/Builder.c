@@ -50,7 +50,11 @@ static void (*Builder_PostPrepareChunk)(void);
 
 /* Faces of gold and iron blocks are marked with an alpha of 253, so that they're ray traced as reflective */
 /*  (only those blocks, since servers often give other blocks the metal sound, e.g. floor tiles) */
+/* Faces of water (translucent liquids) are marked with an alpha of 252, so that they're ray traced as water */
+/*  (see EmitWater in misc/vulkan/VulkanShaderGen.c), even when fully bright */
 static PackedCol Builder_TagCol(BlockID block, PackedCol col) {
+	if (Blocks.IsLiquid[block] && Blocks.Draw[block] == DRAW_TRANSLUCENT)
+		return (col & PACKEDCOL_RGB_MASK) | PackedCol_A_Bits(252);
 	if (PackedCol_A(col) != 255) return col; /* (e.g. fully bright) */
 
 	if ((block == BLOCK_GOLD || block == BLOCK_IRON) && Blocks.DigSounds[block] == SOUND_METAL)

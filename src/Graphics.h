@@ -387,6 +387,11 @@ void Gfx_SetShadowCasters(GfxResourceID vb, const int* ranges, int numOpaque, in
 						int numSprites, const int* lights, int numLights);
 /* Sets whether the sky is being drawn (the sky has god rays when using ray traced shadows) */
 void Gfx_SetSkyRendering(cc_bool enabled);
+/* Sets whether entities are being drawn (they're seen in ray traced reflections and refractions) */
+void Gfx_SetEntityRendering(cc_bool enabled);
+/* Sets whether the entity being drawn is hidden (e.g. outside the view), so is only seen in ray traced */
+/*  reflections and refractions. Returns false (and nothing should be drawn) when entities aren't ray traced */
+cc_bool Gfx_SetEntityHidden(cc_bool hidden);
 #endif
 /* Updates the data of a scratch vertex buffer */
 void Gfx_SetScratchVbData(GfxResourceID vb, void* vertices, int vCount);

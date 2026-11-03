@@ -916,6 +916,13 @@ typedef struct VkBufferImageCopy {
 	VkExtent3D   imageExtent;
 } VkBufferImageCopy;
 
+typedef struct VkImageBlit {
+	VkImageSubresourceLayers srcSubresource;
+	VkOffset3D srcOffsets[2];
+	VkImageSubresourceLayers dstSubresource;
+	VkOffset3D dstOffsets[2];
+} VkImageBlit;
+
 typedef struct VkMemoryBarrier {
 	VkStructureType sType;
 	const void* pNext;

@@ -112,4 +112,5 @@ VK_FUNC(void, vkCmdClearAttachments,   (VkCommandBuffer cmd, cc_uint32 count, co
 VK_FUNC(void, vkCmdCopyBuffer,         (VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, cc_uint32 count, const VkBufferCopy* pRegions))
 VK_FUNC(void, vkCmdCopyBufferToImage,  (VkCommandBuffer cmd, VkBuffer src, VkImage dst, VkImageLayout dstLayout, cc_uint32 count, const VkBufferImageCopy* pRegions))
 VK_FUNC(void, vkCmdCopyImageToBuffer,  (VkCommandBuffer cmd, VkImage src, VkImageLayout srcLayout, VkBuffer dst, cc_uint32 count, const VkBufferImageCopy* pRegions))
+VK_FUNC(void, vkCmdBlitImage,          (VkCommandBuffer cmd, VkImage src, VkImageLayout srcLayout, VkImage dst, VkImageLayout dstLayout, cc_uint32 count, const VkImageBlit* pRegions, int filter))
 VK_FUNC(void, vkCmdPipelineBarrier,    (VkCommandBuffer cmd, VkFlags srcStageMask, VkFlags dstStageMask, VkFlags dependencyFlags, cc_uint32 memoryCount, const VkMemoryBarrier* pMemoryBarriers, cc_uint32 bufferCount, const void* pBufferBarriers, cc_uint32 imageCount, const VkImageMemoryBarrier* pImageBarriers))

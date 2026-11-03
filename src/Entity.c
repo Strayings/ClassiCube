@@ -508,15 +508,37 @@ static cc_bool Entities_Tick(struct ScheduledTask2* task) {
 	return true;
 }
 
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+/* Entities that aren't drawn (e.g. outside the view, or yourself in first person) are still seen in ray traced */
+/*  reflections and refractions, like in Radiance. They're added after the entities that are drawn, so that those */
+/*  are still seen when there are too many entities to ray trace */
+static struct Entity* hiddenEntities[ENTITIES_MAX_COUNT];
+static int numHiddenEntities;
+#define Entity_AddHidden(e) hiddenEntities[numHiddenEntities++] = (e)
+#else
+#define Entity_AddHidden(e)
+#endif
+
 void Entities_RenderModels(float delta, float t) {
 	int i;
 	Gfx_SetAlphaTest(true);
-	
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+	Gfx_SetEntityRendering(true);
+	numHiddenEntities = 0;
+#endif
+
 	for (i = 0; i < ENTITIES_MAX_COUNT; i++)
 	{
 		if (!Entities.List[i]) continue;
 		Entities.List[i]->VTABLE->RenderModel(Entities.List[i], delta, t);
 	}
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+	if (numHiddenEntities && Gfx_SetEntityHidden(true)) {
+		for (i = 0; i < numHiddenEntities; i++) Model_Render(hiddenEntities[i]->Model, hiddenEntities[i]);
+		Gfx_SetEntityHidden(false);
+	}
+	Gfx_SetEntityRendering(false);
+#endif
 	Gfx_SetAlphaTest(false);
 }
 
@@ -761,7 +783,7 @@ static void LocalPlayer_RenderModel(struct Entity* e, float delta, float t) {
 	struct LocalPlayer* p = (struct LocalPlayer*)e;
 	AnimatedComp_GetCurrent(e, t);
 
-	if (!Camera.Active->isThirdPerson && p == Entities.CurPlayer) return;
+	if (!Camera.Active->isThirdPerson && p == Entities.CurPlayer) { Entity_AddHidden(e); return; }
 	Model_Render(e->Model, e);
 }
 
@@ -1148,9 +1170,10 @@ static void NetPlayer_RenderModel(struct Entity* e, float delta, float t) {
 	AnimatedComp_GetCurrent(e, t);
 	e->ShouldRender = Model_ShouldRender(e);
 	/* Original classic only shows players up to 64 blocks away */
-	if (Game_ClassicMode) e->ShouldRender &= Model_RenderDistance(e) <= 64 * 64;
+	if (Game_ClassicMode && Model_RenderDistance(e) > 64 * 64) { e->ShouldRender = false; return; }
 
 	if (e->ShouldRender) Model_Render(e->Model, e);
+	else Entity_AddHidden(e);
 }
 
 static cc_bool NetPlayer_ShouldRenderName(struct Entity* e) {

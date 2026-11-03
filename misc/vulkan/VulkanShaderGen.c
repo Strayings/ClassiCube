@@ -76,6 +76,7 @@
 #define OP_BITWISE_AND           199
 #define OP_DPDX                  207
 #define OP_DPDY                  208
+#define OP_PHI                   245
 #define OP_LOOP_MERGE            246
 #define OP_SELECTION_MERGE       247
 #define OP_LABEL                 248
@@ -456,7 +457,46 @@ struct TraceIds {
 	unsigned int tBool, tInt, tUint, tFloat, tVec2, tVec4, tSampled, tUVPtr, tTablePtr, pParamsTable;
 	unsigned int vParams, vTex, rayQuery, scene, cFlags, cMask, cNone, cCommitted, cZero, cOne, cHalf;
 	unsigned int cIdx[4];
+	/* (only for rays that can hit entities: the atlas of their textures, see EmitEntityTexel) */
+	unsigned int vEntTex, cEntIdx;
 };
+
+/* Entities' instance has bit 23 of its custom index set (see RT_BuildTLAS in src/Graphics_Vulkan.c), and their */
+/*  textures are in a separate atlas. Returns where the instance's geometries start in the table, and sets isEnt */
+static unsigned int EmitEntityIndex(unsigned int tBool, unsigned int tInt, unsigned int vEntTex, unsigned int cEntIdx,
+								unsigned int custom, unsigned int* isEnt) {
+	unsigned int base;
+	if (!vEntTex) { *isEnt = 0; return custom; }
+	*isEnt = Id(); base = Id();
+	/* (cEntIdx is 0x7FFFFF, and custom indices are 24 bits) */
+	Op(OP_SLESS_THAN, 4, tBool, *isEnt, cEntIdx, custom);
+	Op(OP_BITWISE_AND, 4, tInt, base, custom, cEntIdx);
+	return base;
+}
+
+/* Texel at uv of the texture of what was hit (the terrain atlas, or the atlas of entity textures when isEnt) */
+static void EmitEntityTexel(unsigned int tSampled, unsigned int tVec4, unsigned int vTex, unsigned int vEntTex,
+							unsigned int isEnt, unsigned int uv, unsigned int cZero, unsigned int sampler, unsigned int texel) {
+	unsigned int entLabel, worldLabel, merge, entSampler, texE, texW;
+	if (!isEnt) {
+		Op(OP_LOAD, 3, tSampled, sampler, vTex);
+		Op(OP_IMAGE_SAMPLE_EXPLICIT, 6, tVec4, texel, sampler, uv, IMAGE_OPERAND_LOD, cZero);
+		return;
+	}
+	entLabel = Id(); worldLabel = Id(); merge = Id(); entSampler = Id(); texE = Id(); texW = Id();
+	Op(OP_SELECTION_MERGE,    2, merge, 0);
+	Op(OP_BRANCH_CONDITIONAL, 3, isEnt, entLabel, worldLabel);
+	Op(OP_LABEL, 1, entLabel);
+	Op(OP_LOAD, 3, tSampled, entSampler, vEntTex);
+	Op(OP_IMAGE_SAMPLE_EXPLICIT, 6, tVec4, texE, entSampler, uv, IMAGE_OPERAND_LOD, cZero);
+	Op(OP_BRANCH, 1, merge);
+	Op(OP_LABEL, 1, worldLabel);
+	Op(OP_LOAD, 3, tSampled, sampler, vTex);
+	Op(OP_IMAGE_SAMPLE_EXPLICIT, 6, tVec4, texW, sampler, uv, IMAGE_OPERAND_LOD, cZero);
+	Op(OP_BRANCH, 1, merge);
+	Op(OP_LABEL, 1, merge);
+	Op(OP_PHI, 6, tVec4, texel, texE, entLabel, texW, worldLabel);
+}
 
 /* Starts tracing a ray if cond is true, see Blocked() in FragmentShader's GLSL */
 /*  (returns whether the ray hit anything. Code emitted until EmitTraceEnd is only run if cond is */
@@ -472,7 +512,7 @@ static unsigned int EmitTraceBegin(const struct TraceIds* t, unsigned int cond, 
 	unsigned int entryPtr = Id(), uvs = Id(), quad = Id(), first = Id(), oddBit = Id(), odd = Id();
 	unsigned int bx = Id(), by = Id(), w0a = Id(), w0 = Id(), t0 = Id(), t1 = Id(), t2 = Id(), t01 = Id(), uvHit = Id();
 	unsigned int sampler = Id(), texel = Id(), texAlpha = Id(), solid = Id();
-	unsigned int hitType = Id(), hit = Id();
+	unsigned int hitType = Id(), hit = Id(), base, isEnt;
 	unsigned int uvK[3];
 	int k;
 
@@ -497,7 +537,8 @@ static unsigned int EmitTraceBegin(const struct TraceIds* t, unsigned int cond, 
 	Op(OP_RAY_QUERY_GET_GEOMETRY_INDEX,  4, t->tInt,  geom,   t->rayQuery, t->cNone);
 	Op(OP_RAY_QUERY_GET_PRIMITIVE_INDEX, 4, t->tInt,  prim,   t->rayQuery, t->cNone);
 	Op(OP_RAY_QUERY_GET_BARYCENTRICS,    4, t->tVec2, bary,   t->rayQuery, t->cNone);
-	Op(OP_IADD, 4, t->tInt, entry, custom, geom);
+	base = EmitEntityIndex(t->tBool, t->tInt, t->vEntTex, t->cEntIdx, custom, &isEnt);
+	Op(OP_IADD, 4, t->tInt, entry, base, geom);
 	Op(OP_ACCESS_CHAIN, 4, t->pParamsTable, tablePtr, t->vParams, t->cIdx[0]);
 	Op(OP_LOAD, 3, t->tTablePtr, table, tablePtr);
 	Op(OP_PTR_ACCESS_CHAIN, 4, t->tTablePtr, entryPtr, table, entry);
@@ -530,8 +571,7 @@ static unsigned int EmitTraceBegin(const struct TraceIds* t, unsigned int cond, 
 	Op(OP_FADD, 4, t->tVec2, t01,   t0,  t1);
 	Op(OP_FADD, 4, t->tVec2, uvHit, t01, t2);
 
-	Op(OP_LOAD, 3, t->tSampled, sampler, t->vTex);
-	Op(OP_IMAGE_SAMPLE_EXPLICIT, 6, t->tVec4, texel, sampler, uvHit, IMAGE_OPERAND_LOD, t->cZero);
+	EmitEntityTexel(t->tSampled, t->tVec4, t->vTex, t->vEntTex, isEnt, uvHit, t->cZero, sampler, texel);
 	Op(OP_COMPOSITE_EXTRACT, 4, t->tFloat, texAlpha, texel, 3);
 	Op(OP_FORD_GREATER_EQUAL, 4, t->tBool, solid, texAlpha, t->cHalf);
 
@@ -852,6 +892,8 @@ struct HitIds {
 	unsigned int cMaxLights, invCell, gridCells, lightStrength, vHitLj, vHitSum;
 	/* (only for refractions through water: light at the hit point passes through the water, see EmitWaterHitLight) */
 	const struct WaterIds* water;
+	/* (only for rays that can hit entities, see EmitEntityTexel) */
+	unsigned int vEntTex, cEntIdx;
 };
 static void EmitWaterHitLight(const struct WaterIds* W, unsigned int hitPos, unsigned int* ambMul, unsigned int* sunMul);
 
@@ -881,7 +923,7 @@ static unsigned int EmitHitLight(const struct HitIds* H, unsigned int origin, un
 	unsigned int hK1 = Id(), hK = Id(), hOneMinus = Id(), hAdd = Id(), hLit = Id();
 	unsigned int hShadedA = Id(), hAbove = Id(), hBelow = Id(), hTagged = Id();
 	unsigned int albedoRgb = Id(), hitRgb = Id(), rad = Id();
-	unsigned int hFaceU, hDirectU, hBig = 0, hIsWater = 0;
+	unsigned int hFaceU, hDirectU, hBig = 0, hIsWater = 0, hBase, hIsEnt;
 	/* Default index buffer uses vertices 0,1,2 for the first triangle of a quad, then 2,3,0 */
 	static const int evenVertex[3] = { 0, 1, 2 }, oddVertex[3] = { 2, 3, 0 };
 	unsigned int pos[3], uvK[3], zcK[3];
@@ -893,7 +935,8 @@ static unsigned int EmitHitLight(const struct HitIds* H, unsigned int origin, un
 	Op(OP_RAY_QUERY_GET_GEOMETRY_INDEX,  4, H->tInt,   geom,   H->rayQuery, H->cCommitted);
 	Op(OP_RAY_QUERY_GET_PRIMITIVE_INDEX, 4, H->tInt,   prim,   H->rayQuery, H->cCommitted);
 	Op(OP_RAY_QUERY_GET_BARYCENTRICS,    4, H->tVec2,  bary,   H->rayQuery, H->cCommitted);
-	Op(OP_IADD, 4, H->tInt, entry, custom, geom);
+	hBase = EmitEntityIndex(H->tBool, H->tInt, H->vEntTex, H->cEntIdx, custom, &hIsEnt);
+	Op(OP_IADD, 4, H->tInt, entry, hBase, geom);
 	Op(OP_ACCESS_CHAIN, 4, H->pParamsTable, tablePtr, H->vParams, H->cInt0);
 	Op(OP_LOAD, 3, H->tTablePtr, table, tablePtr);
 	Op(OP_PTR_ACCESS_CHAIN, 4, H->tTablePtr, entryPtr, table, entry);
@@ -938,8 +981,7 @@ static unsigned int EmitHitLight(const struct HitIds* H, unsigned int origin, un
 	Op(OP_VECTOR_TIMES_SCALAR, 4, H->tVec2, t2, uvK[2], by);
 	Op(OP_FADD, 4, H->tVec2, t01,   t0,  t1);
 	Op(OP_FADD, 4, H->tVec2, hitUV, t01, t2);
-	Op(OP_LOAD, 3, H->tSampled, albedoSampler, H->vTex);
-	Op(OP_IMAGE_SAMPLE_EXPLICIT, 6, H->tVec4, albedo, albedoSampler, hitUV, IMAGE_OPERAND_LOD, H->cZero);
+	EmitEntityTexel(H->tSampled, H->tVec4, H->vTex, H->vEntTex, hIsEnt, hitUV, H->cZero, albedoSampler, albedo);
 
 	/* Normal of the face that was hit, pointing back towards where the ray came from */
 	Op(OP_FSUB, 4, H->tVec3, e1, pos[1], pos[0]);
@@ -1013,7 +1055,7 @@ static unsigned int EmitHitLight(const struct HitIds* H, unsigned int origin, un
 	Op(OP_FSUB, 4, H->tVec3,  hOneMinus, H->cVec3One, H->ratio);
 	Op(OP_VECTOR_TIMES_SCALAR, 4, H->tVec3, hAdd, hOneMinus, hK);
 	if (reflection) {
-		unsigned int hAmbient = Id();
+		unsigned int hAmbient = Id(), hUnlit = H->cVec3One;
 		if (H->water) {
 			/* (under water, sky light and sunlight are absorbed on the way down, and the sun makes caustics) */
 			unsigned int ambMul, sunMul, hAmbW = Id(), hAddW = Id();
@@ -1021,10 +1063,13 @@ static unsigned int EmitHitLight(const struct HitIds* H, unsigned int origin, un
 			Op(OP_FMUL, 4, H->tVec3, hAmbW, H->ratio, ambMul);
 			Op(OP_FMUL, 4, H->tVec3, hAddW, hAdd, sunMul);
 			Op(OP_FADD, 4, H->tVec3, hAmbient, hAmbW, hAddW);
+			/* (entities aren't shaded since their colour already has their light, see RT_CaptureEntity in */
+			/*  src/Graphics_Vulkan.c, but that light is still absorbed on its way down through the water) */
+			if (hIsEnt) { hUnlit = Id(); Op(OP_SELECT, 5, H->tVec3, hUnlit, hIsEnt, ambMul, H->cVec3One); }
 		} else {
 			Op(OP_FADD, 4, H->tVec3, hAmbient, H->ratio, hAdd);
 		}
-		Op(OP_SELECT, 5, H->tVec3, hLit, hShaded, hAmbient, H->cVec3One);
+		Op(OP_SELECT, 5, H->tVec3, hLit, hShaded, hAmbient, hUnlit);
 	} else {
 		unsigned int hEmit = Id();
 		Op(OP_SELECT, 5, H->tVec3, hEmit, H->hasLights, H->cVec3Zero, H->cVec3One);
@@ -1145,7 +1190,7 @@ struct ReflIds {
 	unsigned int mediumExt, mediumMax, mediumMissT;
 	/* (when not NULL: water that's hit reflects too, like the pixel's water, see EmitWaterSurface) */
 	const struct WaterIds* water;
-	unsigned int vWaterN, vWaterF;
+	unsigned int vWaterN, vWaterF, cTopFace;
 	/* What's seen, how much of what the next reflection sees is added, where the next reflection starts, */
 	/*  which way it goes, whether there are no more reflections, and how many reflections there have been */
 	unsigned int vSeen, vThru, vFrom, vDir, vDone, vBounces;
@@ -1236,7 +1281,7 @@ static void EmitReflection(const struct ReflIds* X, unsigned int origin, unsigne
 	unsigned int rad, fres, last = Id(), notLast = Id(), again = Id(), dn = Id(), dn2 = Id(), nScaled = Id(), dir2 = Id();
 	unsigned int keepK = Id(), radK = Id(), radT = Id(), seenA = Id(), seenN = Id();
 	unsigned int tK = Id(), tF = Id(), thruN = Id(), fromN = Id(), dirN = Id(), doneN = Id();
-	unsigned int sky, skyT = Id(), seenM = Id(), bI2 = Id(), bLoad = Id(), thruU;
+	unsigned int sky, skyT = Id(), seenM = Id(), bI2 = Id(), bLoad = Id(), thruU, waterHit = 0;
 	struct HitOut out;
 
 	Op(OP_STORE, 2, X->vSeen,    X->L_zero3);
@@ -1289,10 +1334,16 @@ static void EmitReflection(const struct ReflIds* X, unsigned int origin, unsigne
 			/* Water reflects again too, off its waves, and like deep water nothing is seen through it */
 			unsigned int wLabel = Id(), wMerge = Id(), dv = Id(), tl = Id(), nW, fW, nWL = Id(), fWL = Id();
 			unsigned int againW = Id(), againAny = Id(), nUse = Id(), fV = Id(), fresM, fresW = Id();
+			unsigned int wNy = Id(), wNyA = Id(), wFlat = Id(), wHit = Id();
+			/* (only its top or bottom, like the pixel's water, see FragmentShader) */
+			Op(OP_COMPOSITE_EXTRACT, 4, X->tFloat, wNy, out.normal, 1);
+			Op(OP_EXT_INST, 5, X->tFloat, wNyA, X->ext, GLSL_FABS, wNy);
+			Op(OP_FORD_GREATER_THAN, 4, X->tBool, wFlat, wNyA, X->cTopFace);
+			Op(OP_LOGICAL_AND, 4, X->tBool, wHit, out.water, wFlat);
 			Op(OP_STORE, 2, X->vWaterN, out.normal);
 			Op(OP_STORE, 2, X->vWaterF, X->cZero);
 			Op(OP_SELECTION_MERGE,    2, wMerge, 0);
-			Op(OP_BRANCH_CONDITIONAL, 3, out.water, wLabel, wMerge);
+			Op(OP_BRANCH_CONDITIONAL, 3, wHit, wLabel, wMerge);
 			Op(OP_LABEL, 1, wLabel);
 			Op(OP_FSUB, 4, X->tVec3, dv, out.origin, from);
 			Op(OP_EXT_INST, 5, X->tFloat, tl, X->ext, GLSL_LENGTH, dv);
@@ -1303,9 +1354,9 @@ static void EmitReflection(const struct ReflIds* X, unsigned int origin, unsigne
 			Op(OP_LABEL,  1, wMerge);
 			Op(OP_LOAD, 3, X->tVec3,  nWL, X->vWaterN);
 			Op(OP_LOAD, 3, X->tFloat, fWL, X->vWaterF);
-			Op(OP_LOGICAL_AND, 4, X->tBool, againW, out.water, notLast);
+			Op(OP_LOGICAL_AND, 4, X->tBool, againW, wHit, notLast);
 			Op(OP_LOGICAL_OR,  4, X->tBool, againAny, again, againW);
-			Op(OP_SELECT, 5, X->tVec3, nUse, out.water, nWL, out.normal);
+			Op(OP_SELECT, 5, X->tVec3, nUse, wHit, nWL, out.normal);
 			/* reflect(d, normal) */
 			Op(OP_DOT,  4, X->tFloat, dn,  d, nUse);
 			Op(OP_FMUL, 4, X->tFloat, dn2, dn, X->cTwo);
@@ -1313,9 +1364,10 @@ static void EmitReflection(const struct ReflIds* X, unsigned int origin, unsigne
 			Op(OP_FSUB, 4, X->tVec3, dir2, d, nScaled);
 			fresM = EmitFresnel(X, out.albedo, d, out.normal);
 			Op(OP_COMPOSITE_CONSTRUCT, 5, X->tVec3, fV, fWL, fWL, fWL);
-			Op(OP_SELECT, 5, X->tVec3, fresW, out.water, fV, fresM);
+			Op(OP_SELECT, 5, X->tVec3, fresW, wHit, fV, fresM);
 			fres = fresW;
 			again = againAny;
+			waterHit = wHit;
 		} else {
 			/* reflect(d, normal) */
 			Op(OP_DOT,  4, X->tFloat, dn,  d, out.normal);
@@ -1332,7 +1384,7 @@ static void EmitReflection(const struct ReflIds* X, unsigned int origin, unsigne
 			/* (nothing is seen through water) */
 			unsigned int radT0 = Id();
 			Op(OP_SELECT, 5, X->tVec3, radT0, again, radK, rad);
-			Op(OP_SELECT, 5, X->tVec3, radT, out.water, X->L_zero3, radT0);
+			Op(OP_SELECT, 5, X->tVec3, radT, waterHit, X->L_zero3, radT0);
 		} else {
 			Op(OP_SELECT, 5, X->tVec3, radT, again, radK, rad);
 		}
@@ -1345,7 +1397,7 @@ static void EmitReflection(const struct ReflIds* X, unsigned int origin, unsigne
 			unsigned int tF0 = Id(), tFW = Id();
 			Op(OP_FMUL, 4, X->tVec3, tF0, tK, fres);
 			Op(OP_FMUL, 4, X->tVec3, tFW, thruU, fres);
-			Op(OP_SELECT, 5, X->tVec3, tF, out.water, tFW, tF0);
+			Op(OP_SELECT, 5, X->tVec3, tF, waterHit, tFW, tF0);
 		} else {
 			Op(OP_FMUL, 4, X->tVec3, tF, tK, fres);
 		}
@@ -1393,7 +1445,8 @@ static void EmitReflection(const struct ReflIds* X, unsigned int origin, unsigne
 /*  texture isn't used, the surface has waves, reflects (Fresnel, f0 = 0.02 from water's IOR of 1.333) and refracts, */
 /*  light is absorbed on its way through the water (extinction = (1 - (0, 0.48, 0.65)) * 0.22 per block, so deep */
 /*  water is dark blue-green), sunlight reaching things under water makes caustics, and under water the surface is */
-/*  a mirror outside of Snell's window */
+/*  a mirror outside of Snell's window. Only the top (and bottom) of water is drawn this way: its sides (e.g. */
+/*  waterfalls, and the edges of water at different heights) are drawn like other translucent faces */
 
 /* Small helpers, each emitting one instruction and returning its result */
 static unsigned int E1(int op, unsigned int type, unsigned int a) {
@@ -1782,6 +1835,8 @@ static unsigned int EmitWater(const struct WaterIds* W0, const struct ReflIds* X
 	unsigned int notTir, condE, hitE, mergeE, tE0, tE, tExit = Id();
 	unsigned int hit, merge, hitLabel = Id(), missLabel = Id(), hitMerge = Id(), tM = Id(), inside, intoW, rad, dW;
 	unsigned int sky, exited, seeSky, skyS, refr = Id(), hdL = Id(), hdC, nh, ex, tv0, tv, body, reflF, bodyF;
+
+	traceExit.vEntTex = 0; /* (only sees translucent faces) */
 
 	/* Wave normal (only on the top of water, like Radiance) */
 	nY = EX(tF, n, 1); nYA = EG1(ext, GLSL_FABS, tF, nY); isTop = E2(OP_FORD_GREATER_THAN, tB, nYA, W.cTopFace);
@@ -2199,13 +2254,14 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 	unsigned int cMirror = 0, cGlintCos = 0, cGlintScale = 0, cReflection = 0, vRefl = 0, vReflK = 0, vClouds = 0, cInv2048 = 0, cMinRayY = 0;
 	unsigned int vWaterCol = 0, vWaterRefr = 0, vWaterDist = 0, vWaterExit = 0, cTagWater = 0, cTagEdge = 0, vRWaterN = 0, vRWaterF = 0;
 	struct WaterIds water;
+	unsigned int vEntTex = 0, cEntIdx = 0, cMaskRefr = 0;
 	unsigned int vHitLj = 0, vHitSum = 0, vOutMod = 0, vOutLight = 0, vRThru = 0, vRFrom = 0, vRDir = 0, vRDone = 0, vRBounces = 0;
 	unsigned int cTaps[4] = { 0, 0, 0, 0 };
 	unsigned int vWorld = 0, vScene = 0, vParams = 0, vHistory = 0, vOutHistory = 0;
 	unsigned int rayQuery = 0, vVisible = 0, vIndex = 0, vHits = 0, vSkyHits = 0;
 	unsigned int vHistVis = 0, vHistLen = 0, vHistSky = 0, vLen = 0, vSky = 0;
 	unsigned int cIdx[38];
-	unsigned int iface[20];
+	unsigned int iface[24];
 	int i, count = 0, push = fog || rt, fogBase = rt ? 1 : 0, fragPos = fog || rt;
 
 	Begin(rt ? SPIRV_1_4 : SPIRV_1_0);
@@ -2246,6 +2302,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		cMirror = Id(); cGlintCos = Id(); cGlintScale = Id(); cReflection = Id(); vRefl = Id(); vReflK = Id(); vClouds = Id(); cInv2048 = Id(); cMinRayY = Id();
 		vWaterCol = Id(); vWaterRefr = Id(); vWaterDist = Id(); vWaterExit = Id(); cTagWater = Id(); cTagEdge = Id(); vRWaterN = Id(); vRWaterF = Id();
 		vHitLj = Id(); vHitSum = Id(); vOutMod = Id(); vOutLight = Id(); vRThru = Id(); vRFrom = Id(); vRDir = Id(); vRDone = Id(); vRBounces = Id();
+		vEntTex = Id(); cEntIdx = Id(); cMaskRefr = Id();
 		for (i = 0; i < 4; i++) cTaps[i] = Id();
 		vWorld = Id(); vScene = Id(); vParams = Id(); vHistory = Id(); vOutHistory = Id();
 		rayQuery = Id(); vVisible = Id(); vIndex = Id(); vHits = Id(); vSkyHits = Id();
@@ -2277,6 +2334,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		iface[count++] = vOutGI;
 		iface[count++] = vResHistory;
 		iface[count++] = vClouds;
+		iface[count++] = vEntTex;
 		iface[count++] = vOutMod;
 		iface[count++] = vOutLight;
 		iface[count++] = vOutRes;
@@ -2325,6 +2383,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_DECORATE, 3, vResHistory, DECORATION_BINDING, 4);
 		Op(OP_DECORATE, 3, vClouds, DECORATION_DESCRIPTOR_SET, 1);
 		Op(OP_DECORATE, 3, vClouds, DECORATION_BINDING, 5);
+		Op(OP_DECORATE, 3, vEntTex, DECORATION_DESCRIPTOR_SET, 1);
+		Op(OP_DECORATE, 3, vEntTex, DECORATION_BINDING, 6);
 		Op(OP_DECORATE, 3, vOutRes, DECORATION_LOCATION, 3);
 		Op(OP_DECORATE, 3, vOutMod, DECORATION_LOCATION, 4);
 		Op(OP_DECORATE, 3, vOutLight, DECORATION_LOCATION, 5);
@@ -2450,8 +2510,11 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		for (i = 3; i < 38; i++) Op(OP_CONSTANT, 3, tInt, cIdx[i], i);
 		Op(OP_CONSTANT, 3, tUint,  cFlags,     RAY_FLAGS_SHADOW);
 		/* Every ray sees shadow casting faces (mask 1), but only reflections see translucent faces, e.g. water (mask 2) */
+		/*  Reflections and refractions through water also see entities (mask 4), but other rays don't */
 		Op(OP_CONSTANT, 3, tUint,  cMask,      0x01);
-		Op(OP_CONSTANT, 3, tUint,  cMaskRefl,  0x03);
+		Op(OP_CONSTANT, 3, tUint,  cMaskRefl,  0x07);
+		Op(OP_CONSTANT, 3, tUint,  cMaskRefr,  0x05);
+		Op(OP_CONSTANT, 3, tInt,   cEntIdx,    0x7FFFFF);
 		Op(OP_CONSTANT, 3, tUint,  cCommitted, RAY_INTERSECTION_COMMITTED);
 		Op(OP_CONSTANT, 3, tUint,  cNone,      0);
 		Op(OP_CONSTANT, 3, tFloat, cOffset,    FLOAT_RAY_OFFSET);
@@ -2569,6 +2632,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_VARIABLE, 3, pOutVec4, vOutGI,      STORAGE_OUTPUT);
 		Op(OP_VARIABLE, 3, pSampled, vResHistory, STORAGE_UNIFORM_CONSTANT);
 		Op(OP_VARIABLE, 3, pSampled, vClouds, STORAGE_UNIFORM_CONSTANT);
+		Op(OP_VARIABLE, 3, pSampled, vEntTex, STORAGE_UNIFORM_CONSTANT);
 		Op(OP_VARIABLE, 3, pOutVec4, vOutRes,     STORAGE_OUTPUT);
 		Op(OP_VARIABLE, 3, pOutVec4, vOutMod,     STORAGE_OUTPUT);
 		Op(OP_VARIABLE, 3, pOutVec4, vOutLight,   STORAGE_OUTPUT);
@@ -2824,19 +2888,29 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			Op(OP_FORD_GREATER_THAN, 4, tBool, aAbove, vertexAlpha, cTagLow);
 			Op(OP_FORD_LESS_THAN,    4, tBool, aBelow, vertexAlpha, cTagMetal);
 			Op(OP_LOGICAL_AND, 4, tBool, isMetal, aAbove, aBelow);
-			Op(OP_LOGICAL_OR, 4, tBool, shadedCol, shadedA, isMetal);
 			/* (water is alpha 252, see Builder_TagCol and EmitWater) */
 			{
-				/* (and only when water is turned on, otherwise it's drawn like other translucent faces) */
-				unsigned int wAbove = Id(), wBelow = Id(), wTag = Id(), wOnF = Id(), wOn = Id();
+				/* Only when water is turned on, and only its top (or bottom), like Radiance's waves. Sides of */
+				/*  water (e.g. waterfalls and the edges of steps) are drawn and shaded like other translucent faces */
+				unsigned int wAbove = Id(), wBelow = Id(), wTag = Id(), wOnF = Id(), wOn = Id(), wNy = Id(), wNyA = Id();
+				unsigned int wFlat = Id(), wOn2 = Id(), notW = Id(), wSide = Id(), shaded0 = Id();
 				isWater = Id(); isEdgeWater = Id();
 				Op(OP_FORD_GREATER_THAN, 4, tBool, wAbove, vertexAlpha, cTagWater);
 				Op(OP_FORD_LESS_THAN,    4, tBool, wBelow, vertexAlpha, cTagLow);
 				Op(OP_LOGICAL_AND, 4, tBool, wTag, wAbove, wBelow);
 				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, wOnF, waterParams, 1);
 				Op(OP_FORD_GREATER_THAN, 4, tBool, wOn, wOnF, cHalf);
-				Op(OP_LOGICAL_AND, 4, tBool, isWater, wTag, wOn);
+				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, wNy, n, 1);
+				Op(OP_EXT_INST, 5, tFloat, wNyA, ext, GLSL_FABS, wNy);
+				Op(OP_FORD_GREATER_THAN, 4, tBool, wFlat, wNyA, water.cTopFace);
+				Op(OP_LOGICAL_AND, 4, tBool, wOn2, wTag, wOn);
+				Op(OP_LOGICAL_AND, 4, tBool, isWater, wOn2, wFlat);
 				Op(OP_FORD_LESS_THAN,    4, tBool, isEdgeWater, vertexAlpha, cTagEdge);
+				/* (water drawn like other translucent faces is shaded like them) */
+				Op(OP_LOGICAL_NOT, 3, tBool, notW, isWater);
+				Op(OP_LOGICAL_AND, 4, tBool, wSide, wTag, notW);
+				Op(OP_LOGICAL_OR, 4, tBool, shaded0, shadedA, isMetal);
+				Op(OP_LOGICAL_OR, 4, tBool, shadedCol, shaded0, wSide);
 			}
 		}
 		Op(OP_EXT_INST, 5, tFloat, len, ext, GLSL_LENGTH, toCam);
@@ -3222,6 +3296,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			trace.cFlags = (skyMode && textured) ? cFlagsOpaque : cFlags;
 			trace.cNone = cNone; trace.cCommitted = cCommitted; trace.cZero = cZero; trace.cOne = cOne; trace.cHalf = cHalf;
 			for (i = 0; i < 4; i++) trace.cIdx[i] = cIdx[i];
+			trace.vEntTex = 0; trace.cEntIdx = cEntIdx;
 
 			hitIds.trace = &trace; hitIds.ext = ext; hitIds.tInt = tInt; hitIds.tUint = tUint; hitIds.tFloat = tFloat;
 			hitIds.tVec2 = tVec2; hitIds.tVec3 = tVec3; hitIds.tVec4 = tVec4; hitIds.tBool = tBool; hitIds.tSampled = tSampled;
@@ -3232,6 +3307,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			hitIds.cVec3Zero = cVec3Zero; hitIds.cOffset = cOffset; hitIds.cBright = cBright; hitIds.cTagLow = cTagLow;
 			hitIds.cTagMetal = cTagMetal; hitIds.cTagWater = cTagWater; hitIds.cMinDirect = cMinDirect; hitIds.sun = sun; hitIds.diffuseScale = diffuseScale;
 			hitIds.ratio = ratio; hitIds.dist = dist; hitIds.hasLights = hasLights; hitIds.water = NULL;
+			hitIds.vEntTex = 0; hitIds.cEntIdx = cEntIdx;
 			for (i = 0; i < 4; i++) hitIds.cIdx[i] = cIdx[i];
 
 			/* Only 1 sun ray per frame is needed once there's enough history (2 otherwise, so that surfaces */
@@ -4076,7 +4152,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			unsigned int reflA = Id(), reflCond = Id(), reflLabel = Id(), reflMerge = Id();
 			unsigned int scene2 = Id(), offset2 = Id(), origin2 = Id(), vn = Id(), vn2 = Id(), nScaled = Id(), rDir = Id();
 			unsigned int left = Id(), fadeLen = Id(), fadeA = Id(), fade = Id(), kR = Id();
-			struct TraceIds traceR = trace, trace2 = trace;
+			struct TraceIds traceR = trace, trace2 = trace, traceW;
 			struct ReflIds X;
 			struct LightRayIds hitL;
 
@@ -4105,8 +4181,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, nScaled, n, vn2);
 			Op(OP_FSUB, 4, tVec3, rDir, viewDir, nScaled);
 
-			traceR.scene = scene2; traceR.cMask = cMaskRefl;
-			hitIds.trace = &trace2;
+			traceR.scene = scene2; traceR.cMask = cMaskRefl; traceR.vEntTex = vEntTex;
+			hitIds.trace = &trace2; hitIds.vEntTex = vEntTex;
 			memset(&hitL, 0, sizeof(hitL));
 			hitL.ext = ext; hitL.tInt = tInt; hitL.tFloat = tFloat; hitL.tVec3 = tVec3; hitL.tVec4 = tVec4; hitL.tVec4Ptr = tVec4Ptr;
 			hitL.cIdx3 = cIdx[3]; hitL.cInt1 = cInt1; hitL.cZero = cZero; hitL.cOne = cOne; hitL.cInvReach2 = cInvReach2;
@@ -4128,7 +4204,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			water.ext = ext; water.tBool = tBool; water.cZero = cZero; water.cOne = cOne; water.cTwo = cTwo;
 			water.cHalf = cHalf; water.cNone = cNone; water.cVec3One = cVec3One; water.cVec3Zero = cVec3Zero;
 			water.cOffset = cOffset; water.time = waterTime;
-			X.water = &water; X.vWaterN = vRWaterN; X.vWaterF = vRWaterF;
+			X.water = &water; X.vWaterN = vRWaterN; X.vWaterF = vRWaterF; X.cTopFace = water.cTopFace;
 			X.vSeen = vRefl; X.vThru = vRThru; X.vFrom = vRFrom; X.vDir = vRDir; X.vDone = vRDone; X.vBounces = vRBounces;
 			/* (rays towards the sun from what reflections hit don't see water, like other shadow rays) */
 			trace2.scene = scene2;
@@ -4161,7 +4237,9 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				water.cOffset = cOffset; water.vRefr = vWaterRefr; water.vDist = vWaterDist; water.vExit = vWaterExit;
 				water.time = waterTime;
 				water.surfY = 0; water.lightDir = 0; water.intoWater = 0;
-				wCol = EmitWater(&water, &X, &hitIds, &trace2, wpos, n, viewDir, len, camIn, dist, sun, inRange, isEdgeWater);
+				/* (refractions see entities too, e.g. players under water) */
+				traceW = trace2; traceW.cMask = cMaskRefr; traceW.vEntTex = vEntTex;
+				wCol = EmitWater(&water, &X, &hitIds, &traceW, wpos, n, viewDir, len, camIn, dist, sun, inRange, isEdgeWater);
 				Op(OP_STORE, 2, vWaterCol, wCol);
 				Op(OP_BRANCH, 1, wMerge);
 				Op(OP_LABEL,  1, wMerge);

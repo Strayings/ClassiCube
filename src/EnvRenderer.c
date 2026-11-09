@@ -285,6 +285,8 @@ void EnvRenderer_RenderSky(void) {
 	Gfx_BindVb(sky_vb);
 #if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
 	Gfx_SetSkyRendering(true);
+	/* (volumetric clouds treat what has no depth as the sky, see Gfx_RenderClouds) */
+	if (Lighting_GfxClouds) Gfx_SetDepthWrite(false);
 #endif
 
 	if (skyY == normY) {
@@ -302,6 +304,7 @@ void EnvRenderer_RenderSky(void) {
 	}
 #if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
 	Gfx_SetSkyRendering(false);
+	if (Lighting_GfxClouds) Gfx_SetDepthWrite(true);
 #endif
 }
 

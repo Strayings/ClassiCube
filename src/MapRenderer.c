@@ -312,6 +312,10 @@ void MapRenderer_RenderTranslucent(float delta) {
 	Gfx_DisableMipmaps();
 
 	Gfx_SetDepthWrite(true);
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+	/* Volumetric clouds are drawn over the world drawn so far (but under rain/snow, the held block etc) */
+	Gfx_RenderClouds();
+#endif
 	/* If we weren't under water, render weather after to blend properly */
 	if (!inTranslucent && Env.Weather != WEATHER_SUNNY) {
 		Gfx_SetAlphaTest(true);

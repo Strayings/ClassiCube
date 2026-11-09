@@ -394,6 +394,8 @@ void Gfx_SetEntityRendering(cc_bool enabled);
 /*  inside the model. Returns false (and nothing should be drawn) when entities aren't ray traced */
 enum EntityHidden { ENTITY_HIDDEN_NONE, ENTITY_HIDDEN, ENTITY_HIDDEN_SELF };
 cc_bool Gfx_SetEntityHidden(int mode);
+/* Draws volumetric clouds over the scene drawn so far (when they're turned on) */
+void Gfx_RenderClouds(void);
 #endif
 /* Updates the data of a scratch vertex buffer */
 void Gfx_SetScratchVbData(GfxResourceID vb, void* vertices, int vCount);

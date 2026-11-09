@@ -215,6 +215,24 @@ static VkSemaphore renderSems[MAX_SWAP_IMAGES];
 static VkImage depthImage;
 static VkImageView depthView;
 static struct MemAlloc depthAlloc;
+/* (depth only view of the depth buffer, for volumetric clouds to read, see Gfx_RenderClouds) */
+static VkImageView depthSampleView;
+static cc_bool depthSampleable;
+
+/* Volumetric clouds are ray marched at half resolution into these (one per frame slot, so the previous frame's */
+/*  can be blended in), then drawn over the scene (see Gfx_RenderClouds) */
+static VkImage cloudImages[2];
+static VkImageView cloudViews[2];
+static struct MemAlloc cloudAllocs[2];
+static VkFramebuffer cloudFramebuffers[2];
+static VkExtent2D cloudExtent;
+static VkDescriptorSetLayout cloudSetLayout, cloudCompSetLayout;
+static VkDescriptorPool cloudPool;
+static VkDescriptorSet cloudSets[2], cloudCompSets[2];
+static VkPipelineLayout cloudLayout, cloudCompLayout;
+static VkShaderModule cloudModule, cloudCompModule;
+static VkPipeline cloudPipeline, cloudCompPipelines[16];
+static cc_uint32 cloudsLastFrame = (cc_uint32)-2;
 /* Ray traced shadows/sky light (0), bounced light/god rays (1) and picked block light (2, ReSTIR) of each pixel, */
 /*  which are blended over multiple frames to give smooth results (frame slot i writes to history images [x][i], */
 /*  and reads the previous frame's history images). These are colour attachments 2, 3 and 4 of the render pass */
@@ -309,7 +327,7 @@ static cc_bool rtResetHistory;
 static struct Matrix rtFrameMVP, rtPrevMVP;
 static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI, rtGodRays, rtBlockLights, rtWater, rtClouds;
 /* Noise for the shape of realistic clouds (see RT_CreateCloudNoise) */
-static GfxResourceID rtCloudNoise;
+static GfxResourceID rtCloudNoise, rtCloudShape, rtCloudDetail;
 static VkDeviceSize rtScratchAlign;
 static struct MemPool asPool, scratchPool;
 static VkDescriptorSetLayout rtSetLayout;
@@ -713,7 +731,7 @@ static void Ring_Reset(struct Frame* f) {
 /* Resources might still be in use by the GPU when the game deletes them, so they are */
 /*  only actually destroyed once the frame they were deleted in has finished rendering */
 static void FreeTexture(struct VulkanTexture* tex) {
-	vkFreeDescriptorSets(device, tex->pool, 2, tex->sets);
+	if (tex->pool) vkFreeDescriptorSets(device, tex->pool, 2, tex->sets);
 	vkDestroyImageView(device, tex->view, NULL);
 	vkDestroyImage(device, tex->image, NULL);
 	MemAlloc_Free(&imagePool, &tex->alloc);
@@ -793,6 +811,23 @@ static void EndUploadCmd(void) {
 							VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 							0, 1, &barrier, 0, NULL, 0, NULL);
 	vkEndCommandBuffer(frame->uploadCmd);
+}
+
+static void RT_DepthBarrier(VkCommandBuffer cmd, VkFlags aspect, VkImageLayout oldLayout, VkImageLayout newLayout,
+						VkFlags srcStage, VkFlags srcAccess, VkFlags dstStage, VkFlags dstAccess) {
+	VkImageMemoryBarrier barrier = { 0 };
+	barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.srcAccessMask       = srcAccess;
+	barrier.dstAccessMask       = dstAccess;
+	barrier.oldLayout           = oldLayout;
+	barrier.newLayout           = newLayout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = depthImage;
+	barrier.subresourceRange.aspectMask = aspect;
+	barrier.subresourceRange.levelCount = 1;
+	barrier.subresourceRange.layerCount = 1;
+	vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, NULL, 0, NULL, 1, &barrier);
 }
 
 static void ImageBarrier(VkCommandBuffer cmd, VkImage image, cc_uint32 levels,
@@ -1092,6 +1127,8 @@ static void ChooseFormats(void) {
 		if (!(fmtProps.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) continue;
 
 		depthFormat = depthFormats[i];
+		/* (volumetric clouds need to read it, see Gfx_RenderClouds) */
+		depthSampleable = (fmtProps.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
 		return;
 	}
 	Process_Abort("No supported Vulkan depth buffer format");
@@ -1332,7 +1369,20 @@ static void DestroySwapchainResources(void) {
 		}
 	}
 
+	for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+	{
+		if (cloudFramebuffers[j]) vkDestroyFramebuffer(device, cloudFramebuffers[j], NULL);
+		if (cloudViews[j])  vkDestroyImageView(device, cloudViews[j], NULL);
+		if (cloudImages[j]) vkDestroyImage(device, cloudImages[j], NULL);
+		MemAlloc_Free(&imagePool, &cloudAllocs[j]);
+		cloudFramebuffers[j] = 0;
+		cloudViews[j]  = 0;
+		cloudImages[j] = 0;
+	}
+
 	/* Depth buffer doesn't exist when the window was minimised */
+	if (depthSampleView) vkDestroyImageView(device, depthSampleView, NULL);
+	depthSampleView = 0;
 	if (depthView)  vkDestroyImageView(device, depthView, NULL);
 	if (depthImage) vkDestroyImage(device, depthImage, NULL);
 	MemAlloc_Free(&imagePool, &depthAlloc);
@@ -1373,7 +1423,7 @@ static void CreateDepthBuffer(void) {
 	info.arrayLayers   = 1;
 	info.samples       = VK_SAMPLE_COUNT_1_BIT;
 	info.tiling        = VK_IMAGE_TILING_OPTIMAL;
-	info.usage         = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+	info.usage         = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | (depthSampleable ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
 	info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
 	info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -1394,6 +1444,11 @@ static void CreateDepthBuffer(void) {
 	if (depthFormat == VK_FORMAT_D24_UNORM_S8_UINT) viewInfo.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
 
 	res = vkCreateImageView(device, &viewInfo, NULL, &depthView);
+	if (res) Process_Abort2(res, "Failed to create Vulkan depth buffer view");
+
+	if (!depthSampleable) return;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+	res = vkCreateImageView(device, &viewInfo, NULL, &depthSampleView);
 	if (res) Process_Abort2(res, "Failed to create Vulkan depth buffer view");
 }
 
@@ -1516,6 +1571,62 @@ static void CreateDenoiseImages(void) {
 		writes[1].dstSet    = compositeSets[j];
 		vkUpdateDescriptorSets(device, 2, writes, 0, NULL);
 	}
+
+	/* Volumetric clouds are ray marched at half resolution (see Gfx_RenderClouds) */
+	if (!depthSampleable || !depthSampleView) return;
+	cloudExtent.width  = (swapExtent.width  + 1) / 2;
+	cloudExtent.height = (swapExtent.height + 1) / 2;
+	info.extent.width  = cloudExtent.width;
+	info.extent.height = cloudExtent.height;
+	fbInfo.width       = cloudExtent.width;
+	fbInfo.height      = cloudExtent.height;
+
+	for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+	{
+		res = vkCreateImage(device, &info, NULL, &cloudImages[j]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan clouds image");
+
+		vkGetImageMemoryRequirements(device, cloudImages[j], &reqs);
+		if (!AllocMemory(&imagePool, &reqs, &cloudAllocs[j])) Process_Abort("Out of video memory! (allocating clouds images)");
+		vkBindImageMemory(device, cloudImages[j], cloudAllocs[j].block->memory, cloudAllocs[j].offset);
+
+		viewInfo.image = cloudImages[j];
+		res = vkCreateImageView(device, &viewInfo, NULL, &cloudViews[j]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan clouds view");
+
+		fbInfo.pAttachments = &cloudViews[j];
+		res = vkCreateFramebuffer(device, &fbInfo, NULL, &cloudFramebuffers[j]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan clouds framebuffer");
+	}
+
+	/* The ray march reads the depth buffer, this frame's history (which pixels are the sky) and the previous */
+	/*  frame's clouds. The composite pass reads this frame's clouds */
+	for (j = 0; j < FRAMES_IN_FLIGHT; j++)
+	{
+		images[0].sampler     = samplers[0];
+		images[0].imageView   = depthSampleView;
+		images[0].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+		images[1].sampler     = samplers[0];
+		images[1].imageView   = historyViews[0][j];
+		images[2].sampler     = samplers[2];
+		images[2].imageView   = cloudViews[(j + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT];
+		for (k = 0; k < 3; k++) writes[k].dstSet = cloudSets[j];
+		vkUpdateDescriptorSets(device, 3, writes, 0, NULL);
+
+		images[1].sampler     = samplers[0];
+		images[1].imageView   = depthSampleView;
+		images[1].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+		images[0].sampler     = samplers[2];
+		images[0].imageView   = cloudViews[j];
+		images[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		writes[0].dstSet      = cloudCompSets[j];
+		writes[1].dstSet      = cloudCompSets[j];
+		vkUpdateDescriptorSets(device, 2, writes, 0, NULL);
+		images[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	}
+	images[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	images[2].sampler     = samplers[0];
+	cloudsLastFrame = frameCounter - 2;
 }
 
 /* Each frame slot's ray tracing descriptor set reads the previous frame's history images */
@@ -1787,6 +1898,8 @@ static const struct ShaderDesc denoise_descs[] = {
 	{ fs_denoise,    sizeof(fs_denoise)    },
 };
 static const struct ShaderDesc composite_desc = { fs_composite, sizeof(fs_composite) };
+static const struct ShaderDesc clouds_desc    = { fs_clouds, sizeof(fs_clouds) };
+static const struct ShaderDesc cloudComp_desc = { fs_cloud_composite, sizeof(fs_cloud_composite) };
 
 static VkShaderModule CreateShader(const struct ShaderDesc* desc) {
 	VkShaderModuleCreateInfo info = { 0 };
@@ -2032,6 +2145,83 @@ static void CreateDenoiseObjects(void) {
 		res = vkCreateGraphicsPipelines(device, 0, 1, &info, NULL, &compositePipelines[i]);
 		if (res) Process_Abort2(res, "Failed to create Vulkan composite pipeline");
 	}
+
+	/* ---- Volumetric clouds: ray marched into a half resolution image, then drawn over the scene ---- */
+	if (!depthSampleable) return;
+	{
+		VkDescriptorSetLayout cloudLayouts[2];
+		VkPushConstantRange cloudRange;
+
+		/* The depth buffer, this frame's history and the previous frame's clouds (set 1 = ray tracing's set) */
+		setInfo.bindingCount = 3;
+		res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &cloudSetLayout);
+		if (res) Process_Abort2(res, "Failed to create Vulkan clouds descriptor set layout");
+		setInfo.bindingCount = 2;
+		res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &cloudCompSetLayout);
+		if (res) Process_Abort2(res, "Failed to create Vulkan clouds descriptor set layout");
+
+		size.descriptorCount = 5 * FRAMES_IN_FLIGHT;
+		poolInfo.maxSets     = 2 * FRAMES_IN_FLIGHT;
+		res = vkCreateDescriptorPool(device, &poolInfo, NULL, &cloudPool);
+		if (res) Process_Abort2(res, "Failed to create Vulkan clouds descriptor pool");
+
+		for (i = 0; i < FRAMES_IN_FLIGHT; i++) layouts[i] = cloudSetLayout;
+		allocInfo.descriptorPool     = cloudPool;
+		allocInfo.descriptorSetCount = FRAMES_IN_FLIGHT;
+		res = vkAllocateDescriptorSets(device, &allocInfo, cloudSets);
+		if (res) Process_Abort2(res, "Failed to allocate Vulkan clouds descriptor sets");
+		for (i = 0; i < FRAMES_IN_FLIGHT; i++) layouts[i] = cloudCompSetLayout;
+		res = vkAllocateDescriptorSets(device, &allocInfo, cloudCompSets);
+		if (res) Process_Abort2(res, "Failed to allocate Vulkan clouds descriptor sets");
+
+		/* (inverse of the camera's view * projection matrix, then the screen's size and whether there's history) */
+		cloudRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+		cloudRange.offset     = 0;
+		cloudRange.size       = sizeof(struct Matrix) + 4 * sizeof(float);
+		cloudLayouts[0] = cloudSetLayout;
+		cloudLayouts[1] = rtSetLayout;
+		layoutInfo.setLayoutCount         = 2;
+		layoutInfo.pSetLayouts            = cloudLayouts;
+		layoutInfo.pushConstantRangeCount = 1;
+		layoutInfo.pPushConstantRanges    = &cloudRange;
+		res = vkCreatePipelineLayout(device, &layoutInfo, NULL, &cloudLayout);
+		if (res) Process_Abort2(res, "Failed to create Vulkan clouds pipeline layout");
+
+		/* (the screen's size, and the size of the clouds image) */
+		cloudRange.size           = 4 * sizeof(float);
+		layoutInfo.setLayoutCount = 1;
+		layoutInfo.pSetLayouts    = &cloudCompSetLayout;
+		res = vkCreatePipelineLayout(device, &layoutInfo, NULL, &cloudCompLayout);
+		if (res) Process_Abort2(res, "Failed to create Vulkan clouds pipeline layout");
+
+		cloudModule      = CreateShader(&clouds_desc);
+		stages[1].module = cloudModule;
+		blendAttachment.blendEnable    = false;
+		blendAttachment.colorWriteMask = 0x0F;
+		info.layout     = cloudLayout;
+		info.renderPass = denoisePass;
+		res = vkCreateGraphicsPipelines(device, 0, 1, &info, NULL, &cloudPipeline);
+		if (res) Process_Abort2(res, "Failed to create Vulkan clouds pipeline");
+
+		/* scene * transmittance + light from the clouds */
+		cloudCompModule  = CreateShader(&cloudComp_desc);
+		stages[1].module = cloudCompModule;
+		blendAttachment.blendEnable         = true;
+		blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+		blendAttachment.colorBlendOp        = VK_BLEND_OP_ADD;
+		blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+		blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendAttachment.alphaBlendOp        = VK_BLEND_OP_ADD;
+		info.layout     = cloudCompLayout;
+		info.renderPass = compositePass;
+		for (i = 1; i < 16; i++)
+		{
+			blendAttachment.colorWriteMask = i;
+			res = vkCreateGraphicsPipelines(device, 0, 1, &info, NULL, &cloudCompPipelines[i]);
+			if (res) Process_Abort2(res, "Failed to create Vulkan clouds pipeline");
+		}
+	}
 }
 
 static void DestroyDenoiseObjects(void) {
@@ -2049,13 +2239,25 @@ static void DestroyDenoiseObjects(void) {
 	vkDestroyDescriptorPool(device, compositePool, NULL);
 	vkDestroyDescriptorSetLayout(device, compositeSetLayout, NULL);
 	vkDestroyRenderPass(device, compositePass, NULL);
+
+	if (!cloudPipeline) return;
+	vkDestroyPipeline(device, cloudPipeline, NULL);
+	for (i = 1; i < 16; i++) vkDestroyPipeline(device, cloudCompPipelines[i], NULL);
+	vkDestroyPipelineLayout(device, cloudLayout, NULL);
+	vkDestroyPipelineLayout(device, cloudCompLayout, NULL);
+	vkDestroyShaderModule(device, cloudModule, NULL);
+	vkDestroyShaderModule(device, cloudCompModule, NULL);
+	vkDestroyDescriptorPool(device, cloudPool, NULL);
+	vkDestroyDescriptorSetLayout(device, cloudSetLayout, NULL);
+	vkDestroyDescriptorSetLayout(device, cloudCompSetLayout, NULL);
+	cloudPipeline = 0;
 }
 
 /* Set 1 contains the top level acceleration structure for ray traced shadows (binding 0), */
 /*  struct RTParams (binding 1), the previous frame's history images (bindings 2, 3 and 4), and the clouds */
 /*  texture (binding 5) */
 static void CreateRTDescriptors(void) {
-	VkDescriptorSetLayoutBinding bindings[8] = { { 0 } };
+	VkDescriptorSetLayoutBinding bindings[10] = { { 0 } };
 	VkDescriptorSetLayoutCreateInfo setInfo  = { 0 };
 	VkDescriptorPoolCreateInfo poolInfo      = { 0 };
 	VkDescriptorSetAllocateInfo allocInfo    = { 0 };
@@ -2087,9 +2289,13 @@ static void CreateRTDescriptors(void) {
 	bindings[6].binding         = 6;
 	bindings[7] = bindings[2]; /* Noise for realistic clouds (see RT_UpdateClouds) */
 	bindings[7].binding         = 7;
+	bindings[8] = bindings[2]; /* 3D noise for the shape and detail of volumetric clouds (see RT_UpdateClouds) */
+	bindings[8].binding         = 8;
+	bindings[9] = bindings[2];
+	bindings[9].binding         = 9;
 
 	setInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	setInfo.bindingCount = 8;
+	setInfo.bindingCount = 10;
 	setInfo.pBindings    = bindings;
 
 	res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &rtSetLayout);
@@ -2100,7 +2306,7 @@ static void CreateRTDescriptors(void) {
 	sizes[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	sizes[1].descriptorCount = FRAMES_IN_FLIGHT;
 	sizes[2].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	sizes[2].descriptorCount = FRAMES_IN_FLIGHT * (HISTORY_IMAGES + 3);
+	sizes[2].descriptorCount = FRAMES_IN_FLIGHT * (HISTORY_IMAGES + 5);
 
 	poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets       = FRAMES_IN_FLIGHT;
@@ -2456,6 +2662,8 @@ static void Gfx_FreeState(void) {
 	FreeDefaultResources();
 	Gfx_DeleteTexture(&white_square);
 	Gfx_DeleteTexture(&rtCloudNoise);
+	Gfx_DeleteTexture(&rtCloudShape);
+	Gfx_DeleteTexture(&rtCloudDetail);
 }
 
 static void Gfx_RestoreState(void) {
@@ -2993,6 +3201,9 @@ static void BeginRenderPass(VkRenderPass pass) {
 			ImageBarrier(frame->drawCmd, modImages[j], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 						VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 			ImageBarrier(frame->drawCmd, lightImages[j], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+						VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+			if (!cloudImages[j]) continue;
+			ImageBarrier(frame->drawCmd, cloudImages[j], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 						VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 		}
 		historyFresh = false;
@@ -4842,6 +5053,161 @@ static void RT_CreateCloudNoise(void) {
 	Mem_Free(bmp.scan0);
 }
 
+/* ---- 3D noise for volumetric clouds (see EmitCloudDensity in misc/vulkan/VulkanShaderGen.c) ---- */
+#define RT_SHAPE_SIZE  64
+#define RT_DETAIL_SIZE 32
+static float RT_NoiseHash3(int x, int y, int z, int seed) {
+	cc_uint32 h = (cc_uint32)x * 374761393u + (cc_uint32)y * 668265263u + (cc_uint32)z * 2147483647u + (cc_uint32)seed * 2246822519u;
+	h = (h ^ (h >> 13)) * 1274126177u;
+	return (float)((h ^ (h >> 16)) & 0xFFFFFF) / (float)0x1000000;
+}
+
+/* Tileable Worley noise: 1 - distance to the nearest random point (one per cell), with cells cells across */
+static float RT_Worley3(float u, float v, float w, int cells, int seed) {
+	float fx = u * cells, fy = v * cells, fz = w * cells, best = 4.0f, dx, dy, dz, d;
+	int ix = (int)fx, iy = (int)fy, iz = (int)fz, x, y, z, cx, cy, cz;
+
+	for (z = -1; z <= 1; z++)
+		for (y = -1; y <= 1; y++)
+			for (x = -1; x <= 1; x++)
+	{
+		cx = ((ix + x) % cells + cells) % cells;
+		cy = ((iy + y) % cells + cells) % cells;
+		cz = ((iz + z) % cells + cells) % cells;
+		dx = ix + x + RT_NoiseHash3(cx, cy, cz, seed)     - fx;
+		dy = iy + y + RT_NoiseHash3(cx, cy, cz, seed + 1) - fy;
+		dz = iz + z + RT_NoiseHash3(cx, cy, cz, seed + 2) - fz;
+		d  = dx * dx + dy * dy + dz * dz;
+		if (d < best) best = d;
+	}
+	d = Math_SqrtF(best);
+	return d < 1.0f ? 1.0f - d : 0.0f;
+}
+
+static float RT_Grad3(int x, int y, int z, int cells, int seed, float dx, float dy, float dz) {
+	/* (one of the 12 directions to the edges of a cube) */
+	static const float g[12][3] = { {1,1,0},{-1,1,0},{1,-1,0},{-1,-1,0},{1,0,1},{-1,0,1},{1,0,-1},{-1,0,-1},{0,1,1},{0,-1,1},{0,1,-1},{0,-1,-1} };
+	int i = (int)(RT_NoiseHash3(x % cells, y % cells, z % cells, seed) * 12.0f) % 12;
+	return g[i][0] * dx + g[i][1] * dy + g[i][2] * dz;
+}
+
+/* Tileable Perlin noise (0 to 1) */
+static float RT_Perlin3(float u, float v, float w, int cells, int seed) {
+	float fx = u * cells, fy = v * cells, fz = w * cells, tx, ty, tz, a, b, c, d, e, f, gg, h, x0, x1, y0, y1;
+	int ix = (int)fx, iy = (int)fy, iz = (int)fz;
+	fx -= ix; fy -= iy; fz -= iz;
+	tx = fx * fx * fx * (fx * (fx * 6 - 15) + 10);
+	ty = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+	tz = fz * fz * fz * (fz * (fz * 6 - 15) + 10);
+	a = RT_Grad3(ix,     iy,     iz,     cells, seed, fx,     fy,     fz);
+	b = RT_Grad3(ix + 1, iy,     iz,     cells, seed, fx - 1, fy,     fz);
+	c = RT_Grad3(ix,     iy + 1, iz,     cells, seed, fx,     fy - 1, fz);
+	d = RT_Grad3(ix + 1, iy + 1, iz,     cells, seed, fx - 1, fy - 1, fz);
+	e = RT_Grad3(ix,     iy,     iz + 1, cells, seed, fx,     fy,     fz - 1);
+	f = RT_Grad3(ix + 1, iy,     iz + 1, cells, seed, fx - 1, fy,     fz - 1);
+	gg = RT_Grad3(ix,    iy + 1, iz + 1, cells, seed, fx,     fy - 1, fz - 1);
+	h = RT_Grad3(ix + 1, iy + 1, iz + 1, cells, seed, fx - 1, fy - 1, fz - 1);
+	x0 = a + (b - a) * tx; x1 = c + (d - c) * tx; y0 = x0 + (x1 - x0) * ty;
+	x0 = e + (f - e) * tx; x1 = gg + (h - gg) * tx; y1 = x0 + (x1 - x0) * ty;
+	return (y0 + (y1 - y0) * tz) * 0.5f + 0.5f;
+}
+
+/* Shape: Perlin-Worley (fractal Perlin noise remapped by fractal Worley noise, like Nubis), detail: fractal Worley */
+static float RT_CloudNoise(float u, float v, float w, cc_bool shape) {
+	float p, wo;
+	if (!shape) {
+		return RT_Worley3(u, v, w, 4, 7) * 0.625f + RT_Worley3(u, v, w, 8, 11) * 0.25f + RT_Worley3(u, v, w, 16, 13) * 0.125f;
+	}
+	p  = RT_Perlin3(u, v, w, 4, 1) * 0.5f + RT_Perlin3(u, v, w, 8, 2) * 0.25f + RT_Perlin3(u, v, w, 16, 3) * 0.125f +
+		 RT_Perlin3(u, v, w, 32, 4) * 0.125f;
+	wo = RT_Worley3(u, v, w, 4, 5) * 0.625f + RT_Worley3(u, v, w, 8, 6) * 0.375f;
+	/* remap(perlin, worley - 1, 1, 0, 1) */
+	return (p - (wo - 1.0f)) / (2.0f - wo);
+}
+
+static GfxResourceID RT_Create3DNoise(int size, cc_bool shape) {
+	VkImageCreateInfo info         = { 0 };
+	VkImageViewCreateInfo viewInfo = { 0 };
+	VkBufferImageCopy region       = { 0 };
+	struct VulkanTexture* tex;
+	VkMemoryRequirements reqs;
+	VkCommandBuffer cmd;
+	VkDeviceSize offset;
+	VkBuffer buffer;
+	float* values;
+	float lo = 1e9f, hi = -1e9f, v;
+	cc_uint8* data;
+	int x, y, z, i, count = size * size * size;
+
+	/* Normalised to 0 to 1 (the shape a bit higher, so that clouds are mostly solid with holes eaten away) */
+	values = (float*)Mem_Alloc(count, sizeof(float), "cloud noise");
+	for (z = 0, i = 0; z < size; z++)
+		for (y = 0; y < size; y++)
+			for (x = 0; x < size; x++, i++)
+	{
+		v = RT_CloudNoise((x + 0.5f) / size, (y + 0.5f) / size, (z + 0.5f) / size, shape);
+		values[i] = v;
+		if (v < lo) lo = v;
+		if (v > hi) hi = v;
+	}
+
+	tex = (struct VulkanTexture*)Mem_AllocCleared(1, sizeof(struct VulkanTexture), "cloud noise");
+	info.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	info.imageType     = VK_IMAGE_TYPE_3D;
+	info.format        = VK_FORMAT_R8_UNORM;
+	info.extent.width  = size;
+	info.extent.height = size;
+	info.extent.depth  = size;
+	info.mipLevels     = 1;
+	info.arrayLayers   = 1;
+	info.samples       = VK_SAMPLE_COUNT_1_BIT;
+	info.tiling        = VK_IMAGE_TILING_OPTIMAL;
+	info.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+	info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if (vkCreateImage(device, &info, NULL, &tex->image)) Process_Abort("Failed to create Vulkan cloud noise");
+
+	vkGetImageMemoryRequirements(device, tex->image, &reqs);
+	if (!AllocMemory(&imagePool, &reqs, &tex->alloc)) Process_Abort("Out of video memory! (allocating cloud noise)");
+	vkBindImageMemory(device, tex->image, tex->alloc.block->memory, tex->alloc.offset);
+
+	viewInfo.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image    = tex->image;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+	viewInfo.format   = VK_FORMAT_R8_UNORM;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = 1;
+	if (vkCreateImageView(device, &viewInfo, NULL, &tex->view)) Process_Abort("Failed to create Vulkan cloud noise view");
+	tex->levels = 1;
+	tex->width  = size;
+	tex->height = size;
+
+	cmd  = UploadCmd();
+	data = (cc_uint8*)Ring_Alloc(count, &buffer, &offset);
+	if (!data) Process_Abort("Out of memory! (uploading cloud noise)");
+	for (i = 0; i < count; i++)
+	{
+		v = (values[i] - lo) / (hi - lo + 1e-6f);
+		if (shape) v = 0.25f + 0.75f * v;
+		data[i] = (cc_uint8)(v * 255.0f + 0.5f);
+	}
+	Mem_Free(values);
+
+	ImageBarrier(cmd, tex->image, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+	region.bufferOffset = offset;
+	region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.imageSubresource.layerCount = 1;
+	region.imageExtent.width  = size;
+	region.imageExtent.height = size;
+	region.imageExtent.depth  = size;
+	vkCmdCopyBufferToImage(cmd, buffer, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	ImageBarrier(cmd, tex->image, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+	return tex;
+}
+
 static void RT_UpdateClouds(struct RTParams* p) {
 	GfxResourceID tex = EnvRenderer_CloudsTexture();
 	struct VulkanTexture* vkTex = (struct VulkanTexture*)(tex ? tex : white_square);
@@ -4856,9 +5222,12 @@ static void RT_UpdateClouds(struct RTParams* p) {
 	p->cloudsY      = Env.CloudsHeight + 0.1f;
 	p->cloudsOffset = (float)(Game.Time / 2048.0f * 0.6f * Env.CloudsSpeed);
 	p->cloudsDist   = (float)Game_ViewDistance;
-	/* (0 = none, 1 = flat clouds, 2 = realistic clouds, see EmitClouds) */
+	/* (0 = none, 1 = flat clouds, 2 = volumetric clouds, see EmitClouds) */
 	p->cloudsOn     = !visible ? 0.0f : (Lighting_GfxClouds ? 2.0f : (tex ? 1.0f : 0.0f));
 	if (!rtCloudNoise) RT_CreateCloudNoise();
+	/* (the ray tracing shaders always need these bound, even when there are no clouds) */
+	if (!rtCloudShape)  rtCloudShape  = RT_Create3DNoise(RT_SHAPE_SIZE,  true);
+	if (!rtCloudDetail) rtCloudDetail = RT_Create3DNoise(RT_DETAIL_SIZE, false);
 	noise = (struct VulkanTexture*)(rtCloudNoise ? rtCloudNoise : white_square);
 	if (!vkTex || !noise) return;
 
@@ -4878,6 +5247,13 @@ static void RT_UpdateClouds(struct RTParams* p) {
 	imageInfo.sampler   = samplers[2];
 	imageInfo.imageView = noise->view;
 	write.dstBinding    = 7;
+	vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+
+	imageInfo.imageView = ((struct VulkanTexture*)rtCloudShape)->view;
+	write.dstBinding    = 8;
+	vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+	imageInfo.imageView = ((struct VulkanTexture*)rtCloudDetail)->view;
+	write.dstBinding    = 9;
 	vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
 }
 
@@ -5055,6 +5431,136 @@ static void RT_DenoiseNow(int colorMask) {
 	dirtyRtSet     = true;
 }
 
+/* Inverse of a 4x4 matrix (false if it has none) */
+static cc_bool RT_Invert4x4(const struct Matrix* matrix, struct Matrix* result) {
+	const float* m = (const float*)matrix;
+	float inv[16], det, *r = (float*)result;
+	int i;
+	inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+	inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+	inv[8]  =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+	inv[12] = -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+	inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+	inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+	inv[9]  = -m[0]*m[9]*m[15]  + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+	inv[13] =  m[0]*m[9]*m[14]  - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+	inv[2]  =  m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]  - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7]  - m[13]*m[3]*m[6];
+	inv[6]  = -m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]  + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7]  + m[12]*m[3]*m[6];
+	inv[10] =  m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]  - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7]  - m[12]*m[3]*m[5];
+	inv[14] = -m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]  + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6]  + m[12]*m[2]*m[5];
+	inv[3]  = -m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]  + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7]   + m[9]*m[3]*m[6];
+	inv[7]  =  m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]  - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7]   - m[8]*m[3]*m[6];
+	inv[11] = -m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]   + m[4]*m[1]*m[11] - m[4]*m[3]*m[9]  - m[8]*m[1]*m[7]   + m[8]*m[3]*m[5];
+	inv[15] =  m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]   - m[4]*m[1]*m[10] + m[4]*m[2]*m[9]  + m[8]*m[1]*m[6]   - m[8]*m[2]*m[5];
+
+	det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+	if (det == 0.0f) return false;
+	det = 1.0f / det;
+	for (i = 0; i < 16; i++) r[i] = inv[i] * det;
+	return true;
+}
+
+/* Volumetric clouds, like Radiance's (see CloudsFragmentShader in misc/vulkan/VulkanShaderGen.c): the main render pass */
+/*  is paused, the clouds are ray marched at half resolution (up to the depth buffer, so they're in front of or */
+/*  behind what's been drawn, from below, inside or above them), blended with the previous frame's clouds, then */
+/*  drawn over the scene */
+void Gfx_RenderClouds(void) {
+	VkCommandBuffer cmd;
+	VkRenderPassBeginInfo info = { 0 };
+	VkClearValue clears[7]     = { { { { 0 } } } };
+	VkViewport viewport = { 0 };
+	VkRect2D scissor    = { { 0 } };
+	VkDescriptorSet sets[2];
+	VkFlags depthAspect;
+	struct Matrix mvp;
+	struct { struct Matrix invMVP; float info[4]; } push;
+	float size[4];
+
+	if (!Lighting_GfxClouds || !frame || !frame->tlas || !renderPassActive || !drawBegun || !cloudImages[frameIndex]) return;
+	if (Env.CloudsHeight < -2000 || EnvRenderer_Minimal || !colorMask) return;
+	/* (in water or lava, its fog hides everything far away anyway, like the flat clouds) */
+	if (RT_CameraLiquid() != BLOCK_AIR) return;
+	Matrix_Mul(&mvp, &Gfx.View, &Gfx.Projection);
+	if (!RT_Invert4x4(&mvp, &push.invMVP)) return;
+
+	FlushDeferredDraws();
+	cmd = frame->drawCmd;
+	vkCmdEndRenderPass(cmd);
+	depthAspect = VK_IMAGE_ASPECT_DEPTH_BIT | (depthFormat == VK_FORMAT_D24_UNORM_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+	RT_DepthBarrier(cmd, depthAspect, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+	/* Ray march at half resolution */
+	viewport.width    = (float)cloudExtent.width;
+	viewport.height   = (float)cloudExtent.height;
+	viewport.maxDepth = 1.0f;
+	scissor.extent    = cloudExtent;
+	info.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	info.renderPass        = denoisePass;
+	info.framebuffer       = cloudFramebuffers[frameIndex];
+	info.renderArea.extent = cloudExtent;
+	vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cloudPipeline);
+	vkCmdSetViewport(cmd, 0, 1, &viewport);
+	vkCmdSetScissor(cmd,  0, 1, &scissor);
+	sets[0] = cloudSets[frameIndex];
+	sets[1] = frame->rtSet;
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cloudLayout, 0, 2, sets, 0, NULL);
+	push.info[0] = (float)swapExtent.width;
+	push.info[1] = (float)swapExtent.height;
+	/* (the previous frame's clouds are only blended in when they were drawn in the previous frame) */
+	push.info[2] = (cloudsLastFrame + 1 == frameCounter) ? 1.0f : 0.0f;
+	push.info[3] = 0.0f;
+	vkCmdPushConstants(cmd, cloudLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+	vkCmdDraw(cmd, 3, 1, 0, 0);
+	vkCmdEndRenderPass(cmd);
+
+	/* Drawn over the scene */
+	viewport.width    = (float)swapExtent.width;
+	viewport.height   = (float)swapExtent.height;
+	scissor.extent    = swapExtent;
+	info.renderPass        = compositePass;
+	info.framebuffer       = compositeFramebuffers[imageIndex];
+	info.renderArea.extent = swapExtent;
+	vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cloudCompPipelines[colorMask]);
+	vkCmdSetViewport(cmd, 0, 1, &viewport);
+	vkCmdSetScissor(cmd,  0, 1, &scissor);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cloudCompLayout, 0, 1, &cloudCompSets[frameIndex], 0, NULL);
+	size[0] = (float)swapExtent.width;
+	size[1] = (float)swapExtent.height;
+	size[2] = (float)cloudExtent.width;
+	size[3] = (float)cloudExtent.height;
+	vkCmdPushConstants(cmd, cloudCompLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(size), size);
+	vkCmdDraw(cmd, 3, 1, 0, 0);
+	vkCmdEndRenderPass(cmd);
+
+	RT_DepthBarrier(cmd, depthAspect, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+	/* The main render pass continues (keeping everything) */
+	info.renderPass      = resumePass;
+	info.framebuffer     = framebuffers[imageIndex][frameIndex];
+	info.clearValueCount = 7;
+	info.pClearValues    = clears;
+	vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+	cloudsLastFrame = frameCounter;
+
+	/* Everything bound before has been replaced */
+	boundPipeline  = -1;
+	dirtyViewport  = true;
+	dirtyScissor   = true;
+	dirtyConstants = true;
+	dirtyTexture   = true;
+	dirtyVb        = true;
+	dirtyIb        = true;
+	dirtyCull      = true;
+	dirtyRtSet     = true;
+}
+
 /* The shadow history written this frame is only usable next frame if chunks were drawn this frame */
 static void RT_EndFrame(void) {
 	rtPrevDrawn = rtDrawn;
@@ -5073,11 +5579,8 @@ static void RT_BeginFrame(void) {
 
 	/* (water at the map's edges is drawn as ray traced water too, see EnvRenderer_RenderMapEdges) */
 	Lighting_GfxWater = rtActive && rtWater;
-	/* Realistic clouds are drawn by the sky's shader instead (see EnvRenderer_RenderClouds). The sky is only above */
-	/*  the camera, so they're only seen from below (flat clouds are drawn otherwise), and a rotating skybox would */
-	/*  rotate them too */
-	Lighting_GfxClouds = rtActive && rtClouds && Camera.CurrentPos.y < Env.CloudsHeight &&
-		!(EnvRenderer_ShouldRenderSkybox() && (Env.SkyboxHorSpeed || Env.SkyboxVerSpeed));
+	/* Volumetric clouds are drawn over the scene instead (see Gfx_RenderClouds and EnvRenderer_RenderClouds) */
+	Lighting_GfxClouds = rtActive && rtClouds && cloudPipeline;
 
 	Mem_Set(rtNumEntVertices, 0, sizeof(rtNumEntVertices));
 	rtNumEntTextures = 0;

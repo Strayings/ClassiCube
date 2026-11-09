@@ -199,6 +199,8 @@ GfxResourceID EnvRenderer_CloudsTexture(void) { return clouds_tex; }
 void EnvRenderer_RenderClouds(void) {
 	float offset;
 	if (Env.CloudsHeight < -2000 || !clouds_tex) return;
+	/* (realistic clouds are drawn by the sky's shader instead) */
+	if (Lighting_GfxClouds) return;
 
 	if (!clouds_vb) {
 		BuildClouds();

@@ -234,6 +234,7 @@ static const unsigned int causticConsts[8] = {
 #define FLOAT_IGN_X       0x3D897143u /* 0.06711056 */
 #define FLOAT_IGN_Y       0x3BBF4590u /* 0.00583715 */
 #define FLOAT_IGN_SCALE   0x4253EE82u /* 52.9829189 */
+#define FLOAT_IGN_FRAME   0x40B2D2D8u /* 5.588238 (interleaved gradient noise that changes every frame, see FragmentShader) */
 
 /* Terminate on first hit (opaque flag isn't used, so that leaves etc can be alpha tested) */
 #define RAY_FLAGS_SHADOW 4
@@ -1188,23 +1189,32 @@ static unsigned int EmitHitLight(const struct HitIds* H, unsigned int origin, un
 	return rad;
 }
 
+/* (see EmitClouds) */
+struct CloudIds;
+static unsigned int EmitClouds(const struct CloudIds* C, unsigned int origin, unsigned int dir, unsigned int bg,
+							unsigned int steps, unsigned int jitter);
+
 /* Ids used for reflection rays (see EmitReflection) */
 struct ReflIds {
 	const struct HitIds* hit;
 	const struct TraceIds* trace;
 	unsigned int ext, tFloat, tVec2, tVec3, tVec4, tBool, tSampled;
 	unsigned int cZero, cOne, cTwo, cHalf, cVec3One, cNone, cGlintCos, cGlintScale, cMinRayY, cInv2048;
-	unsigned int sun, sunCol, skyCol, cloudsA, cloudsB, vClouds, dist;
+	unsigned int sun, sunCol, skyCol, cloudsA, cloudsB, vClouds, dist, cOneHalf;
+	unsigned int hitSun; /* (when not 0: the sun's direction under water, for what's hit before mediumMax, see EmitWater) */
 	unsigned int tInt, cInt0, cInt1, cMaxBounce, cLastBounce, L_zero3, cMirror;
 	/* (when not 0: light is absorbed on its way back, by exp(-mediumExt * min(distance, mediumMax)), and is */
 	/*  multiplied by mediumMissT when nothing is hit, like Radiance's segmentTransmittance under water) */
 	unsigned int mediumExt, mediumMax, mediumMissT;
 	/* (when not NULL: water that's hit reflects too, like the pixel's water, see EmitWaterSurface) */
 	const struct WaterIds* water;
-	unsigned int vWaterN, vWaterF, cTopFace;
+	unsigned int vWaterN, vWaterF;
 	/* What's seen, how much of what the next reflection sees is added, where the next reflection starts, */
 	/*  which way it goes, whether there are no more reflections, and how many reflections there have been */
 	unsigned int vSeen, vThru, vFrom, vDir, vDone, vBounces;
+	/* (when not NULL: realistic clouds are seen too, when they're turned on, see EmitClouds) */
+	const struct CloudIds* clouds;
+	unsigned int vCloudOut, cCloudSteps, cCloudJitter;
 };
 
 /* Returns what's seen along dir from origin when nothing is hit: the sky, plus the sun when dir is towards it, */
@@ -1259,6 +1269,21 @@ static unsigned int EmitReflectedSky(const struct ReflIds* X, unsigned int origi
 	Op(OP_VECTOR_SHUFFLE, 7, X->tVec3, cCol, X->cloudsA, X->cloudsA, 0, 1, 2);
 	Op(OP_FMUL, 4, X->tVec3, cloudRgb, cRgb, cCol);
 	Op(OP_SELECT, 5, X->tVec3, out, isCloud, cloudRgb, skyR);
+	if (X->clouds) {
+		/* (realistic clouds instead when they're turned on, with fewer steps than the sky's) */
+		unsigned int real = Id(), rLabel = Id(), rMerge = Id(), rCol, res = Id();
+		Op(OP_FORD_GREATER_THAN, 4, X->tBool, real, cOn, X->cOneHalf);
+		Op(OP_STORE, 2, X->vCloudOut, out);
+		Op(OP_SELECTION_MERGE,    2, rMerge, 0);
+		Op(OP_BRANCH_CONDITIONAL, 3, real, rLabel, rMerge);
+		Op(OP_LABEL, 1, rLabel);
+		rCol = EmitClouds(X->clouds, origin, dir, skyR, X->cCloudSteps, X->cCloudJitter);
+		Op(OP_STORE, 2, X->vCloudOut, rCol);
+		Op(OP_BRANCH, 1, rMerge);
+		Op(OP_LABEL,  1, rMerge);
+		Op(OP_LOAD, 3, X->tVec3, res, X->vCloudOut);
+		return res;
+	}
 	return out;
 }
 
@@ -1324,7 +1349,16 @@ static void EmitReflection(const struct ReflIds* X, unsigned int origin, unsigne
 	Op(OP_BRANCH_CONDITIONAL, 3, hit, hitLabel, missLabel);
 	Op(OP_LABEL, 1, hitLabel);
 	{
-		rad = EmitHitLight(X->hit, from, d, X->sun, 1, &out);
+		if (X->hitSun) {
+			/* (only hits before the ray leaves the water are lit by the sun's direction under water) */
+			unsigned int tq = Id(), inW = Id(), sunU = Id();
+			Op(OP_RAY_QUERY_GET_T, 4, X->tFloat, tq, X->trace->rayQuery, X->trace->cCommitted);
+			Op(OP_FORD_LESS_THAN, 4, X->tBool, inW, tq, X->mediumMax);
+			Op(OP_SELECT, 5, X->tVec3, sunU, inW, X->hitSun, X->sun);
+			rad = EmitHitLight(X->hit, from, d, sunU, 1, &out);
+		} else {
+			rad = EmitHitLight(X->hit, from, d, X->sun, 1, &out);
+		}
 		thruU = thru;
 		if (X->mediumExt) {
 			unsigned int dv = Id(), tl = Id(), tc = Id(), nt = Id(), e = Id(), tr = Id();
@@ -1345,12 +1379,8 @@ static void EmitReflection(const struct ReflIds* X, unsigned int origin, unsigne
 			/* Water reflects again too, off its waves, and like deep water nothing is seen through it */
 			unsigned int wLabel = Id(), wMerge = Id(), dv = Id(), tl = Id(), nW, fW, nWL = Id(), fWL = Id();
 			unsigned int againW = Id(), againAny = Id(), nUse = Id(), fV = Id(), fresM, fresW = Id();
-			unsigned int wNy = Id(), wNyA = Id(), wFlat = Id(), wHit = Id();
-			/* (only its top or bottom, like the pixel's water, see FragmentShader) */
-			Op(OP_COMPOSITE_EXTRACT, 4, X->tFloat, wNy, out.normal, 1);
-			Op(OP_EXT_INST, 5, X->tFloat, wNyA, X->ext, GLSL_FABS, wNy);
-			Op(OP_FORD_GREATER_THAN, 4, X->tBool, wFlat, wNyA, X->cTopFace);
-			Op(OP_LOGICAL_AND, 4, X->tBool, wHit, out.water, wFlat);
+			/* (every face of water, like the pixel's water. Only its top has waves, see EmitWaterSurface) */
+			unsigned int wHit = out.water;
 			Op(OP_STORE, 2, X->vWaterN, out.normal);
 			Op(OP_STORE, 2, X->vWaterF, X->cZero);
 			Op(OP_SELECTION_MERGE,    2, wMerge, 0);
@@ -1504,6 +1534,192 @@ static unsigned int CV3(unsigned int tVec3, unsigned int tFloat, float a, float 
 static unsigned int CV4(unsigned int tVec4, unsigned int tFloat, const float* v) {
 	unsigned int x = CF(tFloat, v[0]), y = CF(tFloat, v[1]), z = CF(tFloat, v[2]), w = CF(tFloat, v[3]), r = Id();
 	Op(OP_CONSTANT_COMPOSITE, 6, tVec4, r, x, y, z, w); return r;
+}
+
+/*########################################################################################################################*
+*---------------------------------------------------Realistic clouds-----------------------------------------------------*
+*#########################################################################################################################*/
+/* Ids for realistic clouds (see EmitClouds) */
+struct CloudIds {
+	unsigned int ext, tInt, tFloat, tVec2, tVec3, tVec4, tBool, tSampled;
+	unsigned int vNoise, cloudsA, cloudsB, sun; /* (noise texture, cloud colour + height, cloud offset, sun's direction) */
+	unsigned int vT, vC, vI, vt;                /* (transmittance, light, step and distance along the ray so far) */
+	unsigned int cZero, cOne, cInt0, cInt1, cVec3Zero;
+	unsigned int cThick, cInvThick, cScaleA, cScaleB, cTile, cCover, cContrast, cDetail, cSigma, cSigmaL;
+	unsigned int cLight1, cLight2, cLightW1, cLightW2, cMaxLen, cMaxDist, cFadeY, cTMin, cDenseMin, cMinDy;
+	unsigned int cAmbLo, cAmbHi, cSunBase, cSunPhase, cHgNum, cHgA, cHgB, cProfLo, cProfHi;
+};
+
+/* Clouds are a layer 24 blocks thick, starting at the clouds' height. The noise texture's red channel gives their */
+/*  shape (768 blocks across), and its green channel eats away at their edges (160 blocks across) */
+#define CLOUD_THICKNESS 24.0f
+#define CLOUD_HG_G      0.5f /* (forward scattering, so the edges of clouds in front of the sun are brightest) */
+static void EmitCloudConstants(struct CloudIds* C) {
+	unsigned int tF = C->tFloat;
+	const float g = CLOUD_HG_G;
+	C->cThick    = CF(tF, CLOUD_THICKNESS);    C->cInvThick = CF(tF, 1.0f / CLOUD_THICKNESS);
+	C->cScaleA   = CF(tF, 1.0f / 768.0f);      C->cScaleB   = CF(tF, 1.0f / 160.0f);
+	C->cTile     = CF(tF, 2048.0f);            /* (the clouds' offset is in units of 2048 blocks, see RT_UpdateClouds) */
+	C->cCover    = CF(tF, 0.42f);              C->cContrast = CF(tF, 3.0f);
+	C->cDetail   = CF(tF, 0.45f);              C->cSigma    = CF(tF, 0.2f);
+	C->cSigmaL   = CF(tF, 0.15f);
+	C->cLight1   = CF(tF, 4.0f);               C->cLight2   = CF(tF, 12.0f);
+	C->cLightW1  = CF(tF, 4.0f);               C->cLightW2  = CF(tF, 8.0f);
+	C->cMaxLen   = CF(tF, 200.0f);             C->cMaxDist  = CF(tF, 3500.0f);
+	C->cFadeY    = CF(tF, 8.0f);               C->cTMin     = CF(tF, 0.02f);
+	C->cDenseMin = CF(tF, 0.003f);             C->cMinDy    = CF(tF, 0.0005f);
+	C->cAmbLo    = CF(tF, 0.55f);              C->cAmbHi    = CF(tF, 0.35f);
+	C->cSunBase  = CF(tF, 0.3f);               C->cSunPhase = CF(tF, 0.12f);
+	C->cHgNum    = CF(tF, 1.0f - g * g);       C->cHgA      = CF(tF, 1.0f + g * g);  C->cHgB = CF(tF, 2.0f * g);
+	C->cProfLo   = CF(tF, 5.0f);               C->cProfHi   = CF(tF, 1.6f);
+}
+
+/* Density of the clouds at p (0 to 1): the shape, thinner towards the bottom and top of the layer, minus detail */
+static unsigned int EmitCloudDensity(const struct CloudIds* C, unsigned int p, unsigned int wind) {
+	unsigned int ext = C->ext, tF = C->tFloat, t2 = C->tVec2;
+	unsigned int y, y0, rel, h, lo0, lo, hiA, hi0, hi, prof, px, pz, px2, xz, uvA, uvB, a, b, shape, c0, c1, dB, c2;
+	unsigned int sA = Id(), tA = Id(), sB = Id(), tB = Id();
+
+	y  = EX(tF, p, 1); y0 = EX(tF, C->cloudsA, 3);
+	rel = E2(OP_FSUB, tF, y, y0); h = E2(OP_FMUL, tF, rel, C->cInvThick);
+	lo0 = E2(OP_FMUL, tF, h, C->cProfLo); lo = EG3(ext, GLSL_FCLAMP, tF, lo0, C->cZero, C->cOne);
+	hiA = E2(OP_FSUB, tF, C->cOne, h); hi0 = E2(OP_FMUL, tF, hiA, C->cProfHi);
+	hi  = EG3(ext, GLSL_FCLAMP, tF, hi0, C->cZero, C->cOne);
+	prof = E2(OP_FMUL, tF, lo, hi);
+
+	px = EX(tF, p, 0); pz = EX(tF, p, 2);
+	px2 = E2(OP_FADD, tF, px, wind); xz = EC2(t2, px2, pz);
+	uvA = E2(OP_VECTOR_TIMES_SCALAR, t2, xz, C->cScaleA);
+	uvB = E2(OP_VECTOR_TIMES_SCALAR, t2, xz, C->cScaleB);
+	Op(OP_LOAD, 3, C->tSampled, sA, C->vNoise);
+	Op(OP_IMAGE_SAMPLE_EXPLICIT, 6, C->tVec4, tA, sA, uvA, IMAGE_OPERAND_LOD, C->cZero);
+	Op(OP_LOAD, 3, C->tSampled, sB, C->vNoise);
+	Op(OP_IMAGE_SAMPLE_EXPLICIT, 6, C->tVec4, tB, sB, uvB, IMAGE_OPERAND_LOD, C->cZero);
+	a = EX(tF, tA, 0); b = EX(tF, tB, 1);
+
+	shape = E2(OP_FMUL, tF, a, prof);
+	c0 = E2(OP_FSUB, tF, shape, C->cCover); c1 = E2(OP_FMUL, tF, c0, C->cContrast);
+	dB = E2(OP_FMUL, tF, b, C->cDetail);    c2 = E2(OP_FSUB, tF, c1, dB);
+	return EG3(ext, GLSL_FCLAMP, tF, c2, C->cZero, C->cOne);
+}
+
+/* Returns bg (what's behind the clouds) seen along dir from origin through the clouds: ray marched through the layer */
+/*  in steps (starting jitter (0 to 1) of a step in, so the steps don't show as bands), with the light at each point */
+/*  being the clouds' colour * (sky light, brighter towards the top + sunlight * phase, absorbed by the cloud between */
+/*  the point and the sun (2 samples towards the sun)). Like real clouds, they fade out towards the horizon */
+/* Equivalent GLSL:
+	float t0 = max(min(tA, tB), 0.0), seg = min(max(tA, tB) - t0, 200.0), dt = seg / steps; (tA/B = where it's at the bottom/top)
+	float T = 1.0; vec3 C = vec3(0.0); float t = t0 + dt * jitter;
+	for (int i = 0; i < steps && T > 0.02 && seg > 0.0 && t0 < 3500.0; i++, t += dt) {
+		vec3 p = origin + dir * t; float d = density(p);
+		if (d > 0.003) {
+			float sunT = exp(-(density(p + sun * 4.0) * 4.0 + density(p + sun * 12.0) * 8.0) * 0.15);
+			vec3 S = cloudCol * (0.55 + 0.35 * h(p) + sunT * (0.3 + 0.12 * HG(dot(dir, sun), 0.5) * 4pi));
+			float a = 1.0 - exp(-d * 0.2 * dt); C += T * a * S; T *= 1.0 - a;
+		}
+	}
+	float fade = clamp(abs(dir.y) * 8.0, 0.0, 1.0) * clamp(1.0 - t0 / 3500.0, 0.0, 1.0);
+	return bg * (1.0 - fade * (1.0 - T)) + C * fade;
+*/
+static unsigned int EmitClouds(const struct CloudIds* C, unsigned int origin, unsigned int dir, unsigned int bg,
+							unsigned int steps, unsigned int jitter) {
+	unsigned int ext = C->ext, tF = C->tFloat, t3 = C->tVec3, tB = C->tBool, tI = C->tInt;
+	unsigned int header = Id(), cond = Id(), body = Id(), lit = Id(), sm = Id(), cont = Id(), merge = Id();
+	unsigned int oy, dy, ady, small, dyS, y0, y1, a0, ta, b0, tb, tn, tf, t0, seg0, seg, v0, v1, valid, stepsF, dt, jt, tStart;
+	unsigned int cosV, hgM, hgD, hgS, hgP, hg, sunK0, sunK, col, wind0, wind;
+	unsigned int i = Id(), T = Id(), go1, go2, go12, go, t = Id(), tr0, p, d, dense;
+	unsigned int l1p0, l1p, l1, l2p0, l2p, l2, od0a, od0b, od0, od, nod, sunT, hy, hr, hh, hC, amb0, amb, li0, li, S;
+	unsigned int e0, e, ne, tr, a, Cc = Id(), w, Sw, C2, T2, i1, tN;
+	unsigned int Tf = Id(), Cf = Id(), fy0, fy, fd0, fd1, fd, fade0, fade, omT, k, keep, bgK, cK;
+
+	/* Where the ray enters and leaves the layer (only up to 200 blocks of it, since rays near the horizon */
+	/*  would go through a lot of it, and fade out anyway) */
+	oy = EX(tF, origin, 1); dy = EX(tF, dir, 1);
+	ady = EG1(ext, GLSL_FABS, tF, dy); small = E2(OP_FORD_LESS_THAN, tB, ady, C->cMinDy);
+	dyS = ES(tF, small, C->cMinDy, dy);
+	y0 = EX(tF, C->cloudsA, 3); y1 = E2(OP_FADD, tF, y0, C->cThick);
+	a0 = E2(OP_FSUB, tF, y0, oy); ta = E2(OP_FDIV, tF, a0, dyS);
+	b0 = E2(OP_FSUB, tF, y1, oy); tb = E2(OP_FDIV, tF, b0, dyS);
+	tn = EG2(ext, GLSL_FMIN, tF, ta, tb); tf = EG2(ext, GLSL_FMAX, tF, ta, tb);
+	t0 = EG2(ext, GLSL_FMAX, tF, tn, C->cZero);
+	seg0 = E2(OP_FSUB, tF, tf, t0); seg = EG2(ext, GLSL_FMIN, tF, seg0, C->cMaxLen);
+	v0 = E2(OP_FORD_GREATER_THAN, tB, seg, C->cZero); v1 = E2(OP_FORD_LESS_THAN, tB, t0, C->cMaxDist);
+	valid = E2(OP_LOGICAL_AND, tB, v0, v1);
+	stepsF = E1(OP_CONVERT_S_TO_F, tF, steps); dt = E2(OP_FDIV, tF, seg, stepsF);
+	jt = E2(OP_FMUL, tF, dt, jitter); tStart = E2(OP_FADD, tF, t0, jt);
+
+	/* (the phase is the same along the ray: Henyey-Greenstein * 4 pi) */
+	cosV = E2(OP_DOT, tF, dir, C->sun);
+	hgM = E2(OP_FMUL, tF, C->cHgB, cosV); hgD = E2(OP_FSUB, tF, C->cHgA, hgM);
+	hgS = EG1(ext, GLSL_SQRT, tF, hgD); hgP = E2(OP_FMUL, tF, hgD, hgS); hg = E2(OP_FDIV, tF, C->cHgNum, hgP);
+	sunK0 = E2(OP_FMUL, tF, hg, C->cSunPhase); sunK = E2(OP_FADD, tF, sunK0, C->cSunBase);
+	col = Id(); Op(OP_VECTOR_SHUFFLE, 7, t3, col, C->cloudsA, C->cloudsA, 0, 1, 2);
+	wind0 = EX(tF, C->cloudsB, 0); wind = E2(OP_FMUL, tF, wind0, C->cTile);
+
+	Op(OP_STORE, 2, C->vT, C->cOne);
+	Op(OP_STORE, 2, C->vC, C->cVec3Zero);
+	Op(OP_STORE, 2, C->vI, C->cInt0);
+	Op(OP_STORE, 2, C->vt, tStart);
+	Op(OP_BRANCH, 1, header);
+	Op(OP_LABEL,  1, header);
+	Op(OP_LOOP_MERGE, 3, merge, cont, 0);
+	Op(OP_BRANCH, 1, cond);
+	Op(OP_LABEL,  1, cond);
+	Op(OP_LOAD, 3, tI, i, C->vI);
+	Op(OP_LOAD, 3, tF, T, C->vT);
+	go1 = E2(OP_SLESS_THAN, tB, i, steps); go2 = E2(OP_FORD_GREATER_THAN, tB, T, C->cTMin);
+	go12 = E2(OP_LOGICAL_AND, tB, go1, go2); go = E2(OP_LOGICAL_AND, tB, go12, valid);
+	Op(OP_BRANCH_CONDITIONAL, 3, go, body, merge);
+	Op(OP_LABEL, 1, body);
+	Op(OP_LOAD, 3, tF, t, C->vt);
+	tr0 = E2(OP_VECTOR_TIMES_SCALAR, t3, dir, t); p = E2(OP_FADD, t3, origin, tr0);
+	d = EmitCloudDensity(C, p, wind);
+	dense = E2(OP_FORD_GREATER_THAN, tB, d, C->cDenseMin);
+	Op(OP_SELECTION_MERGE,    2, sm, 0);
+	Op(OP_BRANCH_CONDITIONAL, 3, dense, lit, sm);
+	Op(OP_LABEL, 1, lit);
+	{
+		l1p0 = E2(OP_VECTOR_TIMES_SCALAR, t3, C->sun, C->cLight1); l1p = E2(OP_FADD, t3, p, l1p0);
+		l1   = EmitCloudDensity(C, l1p, wind);
+		l2p0 = E2(OP_VECTOR_TIMES_SCALAR, t3, C->sun, C->cLight2); l2p = E2(OP_FADD, t3, p, l2p0);
+		l2   = EmitCloudDensity(C, l2p, wind);
+		od0a = E2(OP_FMUL, tF, l1, C->cLightW1); od0b = E2(OP_FMUL, tF, l2, C->cLightW2);
+		od0  = E2(OP_FADD, tF, od0a, od0b); od = E2(OP_FMUL, tF, od0, C->cSigmaL);
+		nod  = E1(OP_FNEGATE, tF, od); sunT = EG1(ext, GLSL_EXP, tF, nod);
+
+		hy = EX(tF, p, 1); hr = E2(OP_FSUB, tF, hy, y0); hh = E2(OP_FMUL, tF, hr, C->cInvThick);
+		hC = EG3(ext, GLSL_FCLAMP, tF, hh, C->cZero, C->cOne);
+		amb0 = E2(OP_FMUL, tF, hC, C->cAmbHi); amb = E2(OP_FADD, tF, amb0, C->cAmbLo);
+		li0  = E2(OP_FMUL, tF, sunT, sunK); li = E2(OP_FADD, tF, amb, li0);
+		S    = E2(OP_VECTOR_TIMES_SCALAR, t3, col, li);
+
+		e0 = E2(OP_FMUL, tF, d, C->cSigma); e = E2(OP_FMUL, tF, e0, dt);
+		ne = E1(OP_FNEGATE, tF, e); tr = EG1(ext, GLSL_EXP, tF, ne); a = E2(OP_FSUB, tF, C->cOne, tr);
+		Op(OP_LOAD, 3, t3, Cc, C->vC);
+		w  = E2(OP_FMUL, tF, T, a); Sw = E2(OP_VECTOR_TIMES_SCALAR, t3, S, w); C2 = E2(OP_FADD, t3, Cc, Sw);
+		T2 = E2(OP_FMUL, tF, T, tr);
+		Op(OP_STORE, 2, C->vC, C2);
+		Op(OP_STORE, 2, C->vT, T2);
+	}
+	Op(OP_BRANCH, 1, sm);
+	Op(OP_LABEL,  1, sm);
+	Op(OP_BRANCH, 1, cont);
+	Op(OP_LABEL,  1, cont);
+	i1 = E2(OP_IADD, tI, i, C->cInt1); tN = E2(OP_FADD, tF, t, dt);
+	Op(OP_STORE, 2, C->vI, i1);
+	Op(OP_STORE, 2, C->vt, tN);
+	Op(OP_BRANCH, 1, header);
+	Op(OP_LABEL,  1, merge);
+
+	Op(OP_LOAD, 3, tF, Tf, C->vT);
+	Op(OP_LOAD, 3, t3, Cf, C->vC);
+	fy0 = E2(OP_FMUL, tF, ady, C->cFadeY); fy = EG3(ext, GLSL_FCLAMP, tF, fy0, C->cZero, C->cOne);
+	fd0 = E2(OP_FDIV, tF, t0, C->cMaxDist); fd1 = E2(OP_FSUB, tF, C->cOne, fd0);
+	fd  = EG3(ext, GLSL_FCLAMP, tF, fd1, C->cZero, C->cOne);
+	fade0 = E2(OP_FMUL, tF, fy, fd); fade = ES(tF, valid, fade0, C->cZero);
+	omT  = E2(OP_FSUB, tF, C->cOne, Tf); k = E2(OP_FMUL, tF, fade, omT); keep = E2(OP_FSUB, tF, C->cOne, k);
+	bgK  = E2(OP_VECTOR_TIMES_SCALAR, t3, bg, keep); cK = E2(OP_VECTOR_TIMES_SCALAR, t3, Cf, fade);
+	return E2(OP_FADD, t3, bgK, cK);
 }
 
 /* Ids for water (see EmitWater) */
@@ -1929,8 +2145,6 @@ static unsigned int EmitWater(const struct WaterIds* W0, const struct ReflIds* X
 	negSun = E1(OP_FNEGATE, t3, sun); aS = E2(OP_VECTOR_TIMES_SCALAR, t3, negSun, W.cEtaIn);
 	bSs0 = E2(OP_FMUL, tF, W.cEtaIn, dS); bSs = E2(OP_FADD, tF, bSs0, sqS); bS = E2(OP_VECTOR_TIMES_SCALAR, t3, W.cUnitY, bSs);
 	rS = E2(OP_FSUB, t3, aS, bS); rSn = EG1(ext, GLSL_NORMALIZE, t3, rS); Lu = E1(OP_FNEGATE, t3, rSn);
-	/* (looking out of water, the refraction hits things in the air, which the sun lights from its usual direction) */
-	sunDirR = ES(t3, camInWater, sun, Lu);
 
 	/* Where the refraction leaves the water (into water: up to 50 blocks, like Radiance's maximum distance). */
 	/*  Water's faces are only seen by rays with mask 2 */
@@ -1955,7 +2169,13 @@ static unsigned int EmitWater(const struct WaterIds* W0, const struct ReflIds* X
 	/* What the refraction sees */
 	Op(OP_STORE, 2, W.vRefr, W.cVec3Zero);
 	Op(OP_STORE, 2, W.vDist, tExit);
-	hit = EmitTraceBegin(traceRefr, traceOk, originDn, refrDir, tMaxR, W.cNone, &merge);
+	/* (up to the shadow distance when it leaves the water, e.g. through a waterfall. Otherwise only up to where */
+	/*  the exit trace stopped, since deep water absorbs everything further anyway) */
+	{
+		unsigned int leaves = E2(OP_FORD_LESS_THAN, tB, tExit, tMaxR), canLeave = E2(OP_LOGICAL_OR, tB, camInWater, leaves);
+		unsigned int tR = ES(tF, canLeave, dist, tMaxR);
+		hit = EmitTraceBegin(traceRefr, traceOk, originDn, refrDir, tR, W.cNone, &merge);
+	}
 	Op(OP_SELECTION_MERGE,    2, hitMerge, 0);
 	Op(OP_BRANCH_CONDITIONAL, 3, hit, hitLabel, missLabel);
 	Op(OP_LABEL, 1, hitLabel);
@@ -1964,9 +2184,50 @@ static unsigned int EmitWater(const struct WaterIds* W0, const struct ReflIds* X
 		Op(OP_RAY_QUERY_GET_T, 4, tF, tM, traceRefr->rayQuery, traceRefr->cCommitted);
 		inside = E2(OP_FORD_LESS_THAN, tB, tM, tExit);
 		intoW  = E2(OP_LOGICAL_AND, tB, notIn, inside);
-		W.surfY = EX(tF, wpos, 1); W.lightDir = Lu; W.intoWater = intoW;
+		/* (things in the air, e.g. looking out of water or through a waterfall, are lit from the sun's usual direction) */
+		sunDirR = ES(t3, intoW, Lu, sun);
+		/* (seen through the side of water, the water's surface is at least the top of that block) */
+		{
+			unsigned int wy = EX(tF, wpos, 1), wyF = EG1(ext, GLSL_FLOOR, tF, wy), wyT = E2(OP_FADD, tF, wyF, W.cOne);
+			W.surfY = ES(tF, isTop, wy, wyT);
+		}
+		W.lightDir = Lu; W.intoWater = intoW;
 		H->water = &W;
 		rad = EmitHitLight(H, originDn, refrDir, sunDirR, 1, &out);
+		{
+			/* Gold and iron blocks under water reflect too, like a gold or iron block seen in a reflection (one */
+			/*  reflection, which sees entities like the refraction does). It's absorbed by the water it passes */
+			/*  through, i.e. up to where it leaves the water when going up */
+			struct ReflIds XM = *X;
+			unsigned int mCond, dn, dn2, nS2, mDir, my, up, dv0, dv, myS, lw, lwC, dMax, nMax, eM, missM, seenM = Id(), fresM;
+			unsigned int mLabel = Id(), mMerge = Id(), keep, radK, mixK, seenF, radM;
+			mCond = E2(OP_LOGICAL_AND, tB, out.metal, intoW);
+			dn  = E2(OP_DOT, tF, refrDir, out.normal); dn2 = E2(OP_FMUL, tF, dn, W.cTwo);
+			nS2 = E2(OP_VECTOR_TIMES_SCALAR, t3, out.normal, dn2); mDir = E2(OP_FSUB, t3, refrDir, nS2);
+			my  = EX(tF, mDir, 1); up = E2(OP_FORD_GREATER_THAN, tB, my, W.cMinLy);
+			dv0 = E2(OP_FSUB, tF, W.surfY, EX(tF, out.origin, 1)); dv = EG2(ext, GLSL_FMAX, tF, dv0, W.cZero);
+			myS = EG2(ext, GLSL_FMAX, tF, my, W.cMinLy); lw = E2(OP_FDIV, tF, dv, myS);
+			lwC = EG2(ext, GLSL_FMIN, tF, lw, W.cMaxDist); dMax = ES(tF, up, lwC, W.cMaxDist);
+			nMax = E1(OP_FNEGATE, tF, dMax); eM = E2(OP_VECTOR_TIMES_SCALAR, t3, W.cExt, nMax); missM = EG1(ext, GLSL_EXP, t3, eM);
+			XM.trace = traceRefr; XM.water = NULL; XM.hitSun = Lu;
+			XM.mediumExt = W.cExt; XM.mediumMax = dMax; XM.mediumMissT = missM;
+			XM.cMaxBounce = X->cInt1; XM.cLastBounce = X->cInt0;
+			Op(OP_STORE, 2, XM.vSeen, W.cVec3Zero);
+			Op(OP_SELECTION_MERGE,    2, mMerge, 0);
+			Op(OP_BRANCH_CONDITIONAL, 3, mCond, mLabel, mMerge);
+			Op(OP_LABEL, 1, mLabel);
+			EmitReflection(&XM, out.origin, mDir);
+			Op(OP_BRANCH, 1, mMerge);
+			Op(OP_LABEL,  1, mMerge);
+			Op(OP_LOAD, 3, t3, seenM, XM.vSeen);
+			/* (combined like gold and iron blocks seen in reflections, see EmitReflection) */
+			fresM = EmitFresnel(X, out.albedo, refrDir, out.normal);
+			keep  = E2(OP_FSUB, tF, W.cOne, X->cMirror);
+			radK  = E2(OP_VECTOR_TIMES_SCALAR, t3, rad, keep);
+			mixK  = E2(OP_FMUL, t3, fresM, seenM); seenF = E2(OP_VECTOR_TIMES_SCALAR, t3, mixK, X->cMirror);
+			radM  = E2(OP_FADD, t3, radK, seenF);
+			rad   = ES(t3, mCond, radM, rad);
+		}
 		H->water = NULL;
 		dW = EG2(ext, GLSL_FMIN, tF, tM, tExit);
 		Op(OP_STORE, 2, W.vRefr, rad);
@@ -2178,7 +2439,7 @@ void main() {
 		(sunlight scattered towards the camera by the air between the camera and the face, with points along the view
 		 ray picked in proportion to how much light from there reaches the camera, i.e. exp(-density * distance))
 		float godTrans = 1.0 - exp(-godDensity * min(length(toCam), godRange));
-		float godU     = fract(ign + float((temporal > 0.5 ? frame : 0) & 1023) * 0.618034);
+		float godU     = IGN(gl_FragCoord.xy + 5.588238 * float((temporal > 0.5 ? frame : 0) & 1023)); (changes every frame)
 
 		for (int i = 0; i < rays; i++) {
 			vec2 d = DiscPoint((sunStart + i * step) % samples, samples);
@@ -2247,7 +2508,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 	unsigned int cNdcScale = 0, cVec2Half = 0, cIgnDir = 0, cIVec2Zero = 0, cIVec2One = 0;
 	unsigned int cSkyPoints = 0, cSkyPointsF = 0, cGoldenFrac = 0, cFaceWeights = 0, cTwo = 0, cThree = 0, cInv64 = 0;
 	unsigned int cMinSun = 0, pFuncVec3 = 0, vGIHistory = 0, vOutGI = 0, vBounce = 0, vHistBounce = 0, vBounceOut = 0, vHitShadow = 0;
-	unsigned int cQuarter = 0, cFrameMask = 0, vHistGod = 0, vGod = 0;
+	unsigned int cQuarter = 0, cFrameMask = 0, vHistGod = 0, vGod = 0, cIgnFrame = 0;
 	unsigned int cFlagsOpaque = 0, cSeven = 0, cSkyMarker = 0, cSkyDist = 0, cCausticA = 0;
 	unsigned int cCausticSpeedA = 0, cCausticSpeedB = 0, vGodLit = 0, skyGodAdd = 0, cSkyGod = 0;
 	unsigned int cCau[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -2266,6 +2527,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 	unsigned int vWaterCol = 0, vWaterRefr = 0, vWaterDist = 0, vWaterExit = 0, cTagWater = 0, cTagEdge = 0, vRWaterN = 0, vRWaterF = 0;
 	struct WaterIds water;
 	unsigned int vEntTex = 0, cEntIdx = 0, cMaskRefr = 0, cMaskNoSelf = 0;
+	unsigned int vNoise = 0, vCT = 0, vCC = 0, vCI = 0, vCt = 0, vCOut = 0, cOneHalfC = 0;
+	struct CloudIds clouds;
 	unsigned int vHitLj = 0, vHitSum = 0, vOutMod = 0, vOutLight = 0, vRThru = 0, vRFrom = 0, vRDir = 0, vRDone = 0, vRBounces = 0;
 	unsigned int cTaps[4] = { 0, 0, 0, 0 };
 	unsigned int vWorld = 0, vScene = 0, vParams = 0, vHistory = 0, vOutHistory = 0;
@@ -2295,7 +2558,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		cNdcScale = Id(); cVec2Half = Id(); cIgnDir = Id(); cIVec2Zero = Id(); cIVec2One = Id();
 		cSkyPoints = Id(); cSkyPointsF = Id(); cGoldenFrac = Id(); cFaceWeights = Id(); cTwo = Id(); cThree = Id(); cInv64 = Id();
 		cMinSun = Id(); pFuncVec3 = Id(); vGIHistory = Id(); vOutGI = Id(); vBounce = Id(); vHistBounce = Id(); vBounceOut = Id(); vHitShadow = Id();
-		cQuarter = Id(); cFrameMask = Id(); vHistGod = Id(); vGod = Id();
+		cQuarter = Id(); cFrameMask = Id(); vHistGod = Id(); vGod = Id(); cIgnFrame = Id();
 		cFlagsOpaque = Id(); cSeven = Id(); cSkyMarker = Id(); cSkyDist = Id(); cCausticA = Id();
 		cCausticSpeedA = Id(); cCausticSpeedB = Id(); vGodLit = Id(); cSkyGod = Id();
 		for (i = 0; i < 8; i++) cCau[i] = Id();
@@ -2314,6 +2577,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		vWaterCol = Id(); vWaterRefr = Id(); vWaterDist = Id(); vWaterExit = Id(); cTagWater = Id(); cTagEdge = Id(); vRWaterN = Id(); vRWaterF = Id();
 		vHitLj = Id(); vHitSum = Id(); vOutMod = Id(); vOutLight = Id(); vRThru = Id(); vRFrom = Id(); vRDir = Id(); vRDone = Id(); vRBounces = Id();
 		vEntTex = Id(); cEntIdx = Id(); cMaskRefr = Id(); cMaskNoSelf = Id();
+		vNoise = Id(); vCT = Id(); vCC = Id(); vCI = Id(); vCt = Id(); vCOut = Id();
 		for (i = 0; i < 4; i++) cTaps[i] = Id();
 		vWorld = Id(); vScene = Id(); vParams = Id(); vHistory = Id(); vOutHistory = Id();
 		rayQuery = Id(); vVisible = Id(); vIndex = Id(); vHits = Id(); vSkyHits = Id();
@@ -2346,6 +2610,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		iface[count++] = vResHistory;
 		iface[count++] = vClouds;
 		iface[count++] = vEntTex;
+		iface[count++] = vNoise;
 		iface[count++] = vOutMod;
 		iface[count++] = vOutLight;
 		iface[count++] = vOutRes;
@@ -2396,6 +2661,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_DECORATE, 3, vClouds, DECORATION_BINDING, 5);
 		Op(OP_DECORATE, 3, vEntTex, DECORATION_DESCRIPTOR_SET, 1);
 		Op(OP_DECORATE, 3, vEntTex, DECORATION_BINDING, 6);
+		Op(OP_DECORATE, 3, vNoise, DECORATION_DESCRIPTOR_SET, 1);
+		Op(OP_DECORATE, 3, vNoise, DECORATION_BINDING, 7);
 		Op(OP_DECORATE, 3, vOutRes, DECORATION_LOCATION, 3);
 		Op(OP_DECORATE, 3, vOutMod, DECORATION_LOCATION, 4);
 		Op(OP_DECORATE, 3, vOutLight, DECORATION_LOCATION, 5);
@@ -2556,6 +2823,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_CONSTANT, 3, tFloat, cMinSun,     FLOAT_MIN_SUN);
 		Op(OP_CONSTANT, 3, tFloat, cQuarter,    FLOAT_QUARTER);
 		Op(OP_CONSTANT, 3, tInt,   cFrameMask,  1023);
+		Op(OP_CONSTANT, 3, tFloat, cIgnFrame,   FLOAT_IGN_FRAME);
 		Op(OP_CONSTANT, 3, tUint,  cFlagsOpaque,   RAY_FLAGS_SHADOW_OPAQUE);
 		Op(OP_CONSTANT, 3, tInt,   cInt64,     64);
 		Op(OP_CONSTANT, 3, tFloat, cInv2Pow24, FLOAT_INV_2POW24);
@@ -2585,6 +2853,10 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_CONSTANT, 3, tFloat, cTagEdge,      FLOAT_TAG_EDGE);
 		water.tUint = tUint; water.tFloat = tFloat; water.tVec2 = tVec2; water.tVec3 = tVec3; water.tVec4 = tVec4;
 		EmitWaterConstants(&water);
+		memset(&clouds, 0, sizeof(clouds));
+		clouds.tFloat = tFloat;
+		EmitCloudConstants(&clouds);
+		cOneHalfC = CF(tFloat, 1.5f); /* (clouds mode 2 = realistic, see RT_UpdateClouds) */
 		Op(OP_CONSTANT, 3, tFloat, cInv2048,      FLOAT_INV_2048);
 		Op(OP_CONSTANT, 3, tFloat, cMinRayY,      FLOAT_MIN_RAY_Y);
 		Op(OP_CONSTANT, 3, tFloat, cSeven,         FLOAT_SEVEN);
@@ -2649,6 +2921,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_VARIABLE, 3, pSampled, vResHistory, STORAGE_UNIFORM_CONSTANT);
 		Op(OP_VARIABLE, 3, pSampled, vClouds, STORAGE_UNIFORM_CONSTANT);
 		Op(OP_VARIABLE, 3, pSampled, vEntTex, STORAGE_UNIFORM_CONSTANT);
+		Op(OP_VARIABLE, 3, pSampled, vNoise,  STORAGE_UNIFORM_CONSTANT);
 		Op(OP_VARIABLE, 3, pOutVec4, vOutRes,     STORAGE_OUTPUT);
 		Op(OP_VARIABLE, 3, pOutVec4, vOutMod,     STORAGE_OUTPUT);
 		Op(OP_VARIABLE, 3, pOutVec4, vOutLight,   STORAGE_OUTPUT);
@@ -2704,6 +2977,11 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_VARIABLE, 3, pFuncVec3,  vHitSum,     STORAGE_FUNCTION);
 		Op(OP_VARIABLE, 3, pFuncVec3,  vWaterCol,   STORAGE_FUNCTION);
 		Op(OP_VARIABLE, 3, pFuncVec3,  vWaterRefr,  STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncFloat, vCT,         STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncVec3,  vCC,         STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncInt,   vCI,         STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncFloat, vCt,         STORAGE_FUNCTION);
+		Op(OP_VARIABLE, 3, pFuncVec3,  vCOut,       STORAGE_FUNCTION);
 		Op(OP_VARIABLE, 3, pFuncFloat, vWaterDist,  STORAGE_FUNCTION);
 		Op(OP_VARIABLE, 3, pFuncFloat, vWaterExit,  STORAGE_FUNCTION);
 		Op(OP_VARIABLE, 3, pFuncVec3,  vRWaterN,    STORAGE_FUNCTION);
@@ -2801,6 +3079,11 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsVec3,  paramPtr, vParams, cIdx[38]); selfMin      = Id(); Op(OP_LOAD, 3, tVec3,  selfMin,      paramPtr);
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsVec3,  paramPtr, vParams, cIdx[39]); selfMax      = Id(); Op(OP_LOAD, 3, tVec3,  selfMax,      paramPtr);
 		waterTime = Id(); Op(OP_COMPOSITE_EXTRACT, 4, tFloat, waterTime, waterParams, 0);
+		clouds.ext = ext; clouds.tInt = tInt; clouds.tVec2 = tVec2; clouds.tVec3 = tVec3; clouds.tVec4 = tVec4;
+		clouds.tBool = tBool; clouds.tSampled = tSampled; clouds.vNoise = vNoise;
+		clouds.cloudsA = cloudsA; clouds.cloudsB = cloudsB; clouds.sun = sun;
+		clouds.vT = vCT; clouds.vC = vCC; clouds.vI = vCI; clouds.vt = vCt;
+		clouds.cZero = cZero; clouds.cOne = cOne; clouds.cInt0 = cInt0; clouds.cInt1 = cInt1; clouds.cVec3Zero = cVec3Zero;
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pPushFloat,   paramPtr, vPush,   cIdx[0]);  temporal     = Id(); Op(OP_LOAD, 3, tFloat, temporal,     paramPtr);
 
 		/* The sky has no real position, so a point far away in the direction of the sky is used instead */
@@ -2909,21 +3192,17 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			Op(OP_LOGICAL_AND, 4, tBool, isMetal, aAbove, aBelow);
 			/* (water is alpha 252, see Builder_TagCol and EmitWater) */
 			{
-				/* Only when water is turned on, and only its top (or bottom), like Radiance's waves. Sides of */
-				/*  water (e.g. waterfalls and the edges of steps) are drawn and shaded like other translucent faces */
-				unsigned int wAbove = Id(), wBelow = Id(), wTag = Id(), wOnF = Id(), wOn = Id(), wNy = Id(), wNyA = Id();
-				unsigned int wFlat = Id(), wOn2 = Id(), notW = Id(), wSide = Id(), shaded0 = Id();
+				/* Only when water is turned on. Like Radiance, every face of water is drawn like water (the sides of */
+				/*  water, e.g. waterfalls and the edges of steps, just have no waves, see EmitWater) */
+				unsigned int wAbove = Id(), wBelow = Id(), wTag = Id(), wOnF = Id(), wOn = Id();
+				unsigned int notW = Id(), wSide = Id(), shaded0 = Id();
 				isWater = Id(); isEdgeWater = Id();
 				Op(OP_FORD_GREATER_THAN, 4, tBool, wAbove, vertexAlpha, cTagWater);
 				Op(OP_FORD_LESS_THAN,    4, tBool, wBelow, vertexAlpha, cTagLow);
 				Op(OP_LOGICAL_AND, 4, tBool, wTag, wAbove, wBelow);
 				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, wOnF, waterParams, 1);
 				Op(OP_FORD_GREATER_THAN, 4, tBool, wOn, wOnF, cHalf);
-				Op(OP_COMPOSITE_EXTRACT, 4, tFloat, wNy, n, 1);
-				Op(OP_EXT_INST, 5, tFloat, wNyA, ext, GLSL_FABS, wNy);
-				Op(OP_FORD_GREATER_THAN, 4, tBool, wFlat, wNyA, water.cTopFace);
-				Op(OP_LOGICAL_AND, 4, tBool, wOn2, wTag, wOn);
-				Op(OP_LOGICAL_AND, 4, tBool, isWater, wOn2, wFlat);
+				Op(OP_LOGICAL_AND, 4, tBool, isWater, wTag, wOn);
 				Op(OP_FORD_LESS_THAN,    4, tBool, isEdgeWater, vertexAlpha, cTagEdge);
 				/* (water drawn like other translucent faces is shaded like them) */
 				Op(OP_LOGICAL_NOT, 3, tBool, notW, isWater);
@@ -3408,11 +3687,20 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				Op(OP_EXT_INST, 5, tFloat, expV, ext, GLSL_EXP, godExp);
 				Op(OP_FSUB, 4, tFloat, godTrans, cOne, expV);
 			}
-			/* Each frame a different point (golden ratio sequence), starting at a different point per pixel */
+			/* Each frame a different point, using interleaved gradient noise that also changes every frame (like */
+			/*  Jimenez's temporal IGN). A golden ratio sequence offset by each pixel's IGN instead leaves an error */
+			/*  that only depends on the IGN, so it stays on screen as diagonal stripes */
 			Op(OP_BITWISE_AND, 4, tInt, frameLow, frameTerm, cFrameMask);
 			Op(OP_CONVERT_S_TO_F, 3, tFloat, frameLowF, frameLow);
-			Op(OP_FMUL, 4, tFloat, frameSeq, frameLowF, cGoldenFrac);
-			Op(OP_FADD, 4, tFloat, godUa, ign, frameSeq);
+			Op(OP_FMUL, 4, tFloat, frameSeq, frameLowF, cIgnFrame);
+			{
+				unsigned int shiftV = Id(), fragS = Id(), gd = Id(), gf = Id();
+				Op(OP_COMPOSITE_CONSTRUCT, 4, tVec2, shiftV, frameSeq, frameSeq);
+				Op(OP_FADD, 4, tVec2, fragS, fragXY, shiftV);
+				Op(OP_DOT,  4, tFloat, gd, fragS, cIgnDir);
+				Op(OP_EXT_INST, 5, tFloat, gf, ext, GLSL_FRACT, gd);
+				Op(OP_FMUL, 4, tFloat, godUa, gf, cIgnScale);
+			}
 			Op(OP_EXT_INST, 5, tFloat, godU0, ext, GLSL_FRACT, godUa);
 			outerHeader = Id(); outerCond = Id(); outerBody = Id(); outerContinue = Id(); outerMerge = Id();
 			Op(OP_BRANCH, 1, outerHeader);
@@ -4221,6 +4509,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			X.cVec3One = cVec3One; X.cNone = cNone; X.cGlintCos = cGlintCos; X.cGlintScale = cGlintScale; X.cMinRayY = cMinRayY;
 			X.cInv2048 = cInv2048; X.sun = sun; X.sunCol = sunCol; X.skyCol = skyCol;
 			X.cloudsA = cloudsA; X.cloudsB = cloudsB; X.vClouds = vClouds; X.dist = dist;
+			X.clouds = &clouds; X.vCloudOut = vCOut; X.cCloudSteps = cIdx[8]; X.cCloudJitter = cHalf; X.cOneHalf = cOneHalfC;
+			X.hitSun = 0;
 			X.tInt = tInt; X.cInt0 = cInt0; X.cInt1 = cInt1; X.cMaxBounce = cIdx[RESTIR_MAX_BOUNCES];
 			X.cLastBounce = cIdx[RESTIR_MAX_BOUNCES - 1]; X.L_zero3 = cVec3Zero; X.cMirror = cMirror;
 			X.mediumExt = 0; X.mediumMax = 0; X.mediumMissT = 0;
@@ -4228,7 +4518,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			water.ext = ext; water.tBool = tBool; water.cZero = cZero; water.cOne = cOne; water.cTwo = cTwo;
 			water.cHalf = cHalf; water.cNone = cNone; water.cVec3One = cVec3One; water.cVec3Zero = cVec3Zero;
 			water.cOffset = cOffset; water.time = waterTime;
-			X.water = &water; X.vWaterN = vRWaterN; X.vWaterF = vRWaterF; X.cTopFace = water.cTopFace;
+			X.water = &water; X.vWaterN = vRWaterN; X.vWaterF = vRWaterF;
 			X.vSeen = vRefl; X.vThru = vRThru; X.vFrom = vRFrom; X.vDir = vRDir; X.vDone = vRDone; X.vBounces = vRBounces;
 			/* (rays towards the sun from what reflections hit don't see water, like other shadow rays) */
 			trace2.scene = scene2;
@@ -4306,7 +4596,31 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		}
 		Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, giDenom,  sunSafe, face);
 		Op(OP_FDIV, 4, tVec3, giDiv, bounceOut, giDenom);
-		Op(OP_VECTOR_SHUFFLE, 7, tVec3, rgbCol, col, col, 0, 1, 2);
+		if (skyMode) {
+			/* Realistic clouds in front of the sky (when they're turned on, see EmitClouds) */
+			unsigned int skyRgb = Id(), cOnF = Id(), real = Id(), rLabel = Id(), rMerge = Id(), cRes, xy = Id();
+			unsigned int gd = Id(), gf = Id(), gs = Id(), jit = Id();
+			Op(OP_VECTOR_SHUFFLE, 7, tVec3, skyRgb, col, col, 0, 1, 2);
+			Op(OP_COMPOSITE_EXTRACT, 4, tFloat, cOnF, cloudsB, 2);
+			Op(OP_FORD_GREATER_THAN, 4, tBool, real, cOnF, cOneHalfC);
+			Op(OP_STORE, 2, vCOut, skyRgb);
+			Op(OP_SELECTION_MERGE,    2, rMerge, 0);
+			Op(OP_BRANCH_CONDITIONAL, 3, real, rLabel, rMerge);
+			Op(OP_LABEL, 1, rLabel);
+			/* (the steps start at a different point per pixel (interleaved gradient noise), so they don't show as bands) */
+			Op(OP_VECTOR_SHUFFLE, 6, tVec2, xy, fragPosV, fragPosV, 0, 1);
+			Op(OP_DOT, 4, tFloat, gd, xy, cIgnDir);
+			Op(OP_EXT_INST, 5, tFloat, gf, ext, GLSL_FRACT, gd);
+			Op(OP_FMUL, 4, tFloat, gs, gf, cIgnScale);
+			Op(OP_EXT_INST, 5, tFloat, jit, ext, GLSL_FRACT, gs);
+			cRes = EmitClouds(&clouds, cam, viewDir, skyRgb, cIdx[24], jit);
+			Op(OP_STORE, 2, vCOut, cRes);
+			Op(OP_BRANCH, 1, rMerge);
+			Op(OP_LABEL,  1, rMerge);
+			Op(OP_LOAD, 3, tVec3, rgbCol, vCOut);
+		} else {
+			Op(OP_VECTOR_SHUFFLE, 7, tVec3, rgbCol, col, col, 0, 1, 2);
+		}
 
 		/* The light of opaque faces (sunlight, sky light and bounced light incl. block light) isn't added here, */
 		/*  but written to out_light (relative to what vertex colours include, i.e. as absolute light), then */

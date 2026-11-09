@@ -307,7 +307,9 @@ static cc_bool rtDrawn, rtPrevDrawn;
 /* Set when an option changes, since the previous frames' shadows/lighting no longer apply */
 static cc_bool rtResetHistory;
 static struct Matrix rtFrameMVP, rtPrevMVP;
-static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI, rtGodRays, rtBlockLights, rtWater;
+static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI, rtGodRays, rtBlockLights, rtWater, rtClouds;
+/* Noise for the shape of realistic clouds (see RT_CreateCloudNoise) */
+static GfxResourceID rtCloudNoise;
 static VkDeviceSize rtScratchAlign;
 static struct MemPool asPool, scratchPool;
 static VkDescriptorSetLayout rtSetLayout;
@@ -2053,7 +2055,7 @@ static void DestroyDenoiseObjects(void) {
 /*  struct RTParams (binding 1), the previous frame's history images (bindings 2, 3 and 4), and the clouds */
 /*  texture (binding 5) */
 static void CreateRTDescriptors(void) {
-	VkDescriptorSetLayoutBinding bindings[7] = { { 0 } };
+	VkDescriptorSetLayoutBinding bindings[8] = { { 0 } };
 	VkDescriptorSetLayoutCreateInfo setInfo  = { 0 };
 	VkDescriptorPoolCreateInfo poolInfo      = { 0 };
 	VkDescriptorSetAllocateInfo allocInfo    = { 0 };
@@ -2083,9 +2085,11 @@ static void CreateRTDescriptors(void) {
 	bindings[5].binding         = 5;
 	bindings[6] = bindings[2]; /* Atlas of entity textures (see RT_CopyEntityTextures) */
 	bindings[6].binding         = 6;
+	bindings[7] = bindings[2]; /* Noise for realistic clouds (see RT_UpdateClouds) */
+	bindings[7].binding         = 7;
 
 	setInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	setInfo.bindingCount = 7;
+	setInfo.bindingCount = 8;
 	setInfo.pBindings    = bindings;
 
 	res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &rtSetLayout);
@@ -2096,7 +2100,7 @@ static void CreateRTDescriptors(void) {
 	sizes[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	sizes[1].descriptorCount = FRAMES_IN_FLIGHT;
 	sizes[2].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	sizes[2].descriptorCount = FRAMES_IN_FLIGHT * (HISTORY_IMAGES + 2);
+	sizes[2].descriptorCount = FRAMES_IN_FLIGHT * (HISTORY_IMAGES + 3);
 
 	poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets       = FRAMES_IN_FLIGHT;
@@ -2451,6 +2455,7 @@ static void Gfx_FreeState(void) {
 
 	FreeDefaultResources();
 	Gfx_DeleteTexture(&white_square);
+	Gfx_DeleteTexture(&rtCloudNoise);
 }
 
 static void Gfx_RestoreState(void) {
@@ -3054,8 +3059,8 @@ static cc_bool PrepareDraw(cc_bool lines, cc_bool terrain) {
 	cmd = frame->drawCmd;
 
 	/* No point tracing rays when nothing is written to the colour buffer (e.g. depth only pass) */
-	/*  The sky only has god rays, so it's only ray traced when they're on */
-	sky = rtSkyDraw && rtActive && frame->tlas && colorMask && rtGodRays && !lines;
+	/*  The sky only has god rays and realistic clouds, so it's only ray traced when they're on */
+	sky = rtSkyDraw && rtActive && frame->tlas && colorMask && (rtGodRays || Lighting_GfxClouds) && !lines;
 	rt  = (terrain && textured && rtActive && frame->tlas && colorMask) || sky;
 	key = CalcPipelineKey(lines, rt, sky);
 
@@ -3364,6 +3369,7 @@ void Gfx_ClearBuffers(GfxBuffers buffers) {
 #define RT_OPT_GOD_RAYS    "gfx-rt-godrays"
 #define RT_OPT_BLOCK_LIGHTS "gfx-rt-blocklights"
 #define RT_OPT_WATER       "gfx-rt-water"
+#define RT_OPT_CLOUDS      "gfx-rt-clouds"
 /* How much sunlight the air scatters per block, how much it scatters forwards (Henyey-Greenstein g), */
 /*  and how far along the view ray it's calculated for */
 #define RT_GOD_DENSITY 0.02f
@@ -3389,6 +3395,7 @@ static const char* const rtGodRays_Names[]    = { "Off", "Low", "Medium", "High"
 static const float rtGodRays_Strength[]       = { 0.0f, 0.06f, 0.12f, 0.2f };
 static const char* const rtBlockLights_Names[] = { "Off", "Low", "Medium", "High" };
 static const char* const rtWater_Names[]      = { "Off", "On" };
+static const char* const rtClouds_Names[]     = { "Normal", "Realistic" };
 static const float rtBlockLights_Strength[]    = { 0.0f, 3.0f, 6.0f, 12.0f };
 static const float rtSunAngle_Degrees[]  = { 20.0f, 40.0f, 60.0f, 90.0f };
 static const float rtShadowDist_Blocks[] = { 64.0f, 128.0f, 256.0f, 4096.0f };
@@ -3421,6 +3428,7 @@ static void RT_Init(void) {
 	rtGodRays    = Options_GetEnum(RT_OPT_GOD_RAYS,    2, rtGodRays_Names,    Array_Elems(rtGodRays_Names));
 	rtBlockLights = Options_GetEnum(RT_OPT_BLOCK_LIGHTS, 2, rtBlockLights_Names, Array_Elems(rtBlockLights_Names));
 	rtWater      = Options_GetEnum(RT_OPT_WATER,       1, rtWater_Names,      Array_Elems(rtWater_Names));
+	rtClouds     = Options_GetEnum(RT_OPT_CLOUDS,      1, rtClouds_Names,     Array_Elems(rtClouds_Names));
 }
 
 static void RT_ListAdd(struct ChunkRT*** list, int* count, int* max, struct ChunkRT* rt) {
@@ -4773,11 +4781,74 @@ static void RT_UpdateWater(struct RTParams* p) {
 
 /* Clouds are seen in reflections, the same as in EnvRenderer_RenderClouds. The texture is set every frame, */
 /*  since it might have been replaced (e.g. by a new texture pack) */
+/* Tileable noise for the shape of realistic clouds (see EmitClouds in misc/vulkan/VulkanShaderGen.c): */
+/*  red = large scale shape (fractal value noise), green = small scale detail (billowy fractal noise) */
+#define RT_NOISE_SIZE 256
+static float RT_NoiseHash(int x, int y, int seed) {
+	cc_uint32 h = (cc_uint32)x * 374761393u + (cc_uint32)y * 668265263u + (cc_uint32)seed * 2246822519u;
+	h = (h ^ (h >> 13)) * 1274126177u;
+	return (float)((h ^ (h >> 16)) & 0xFFFFFF) / (float)0xFFFFFF;
+}
+
+/* Smoothly interpolated random values on a grid of cells x cells across the texture (so that it tiles) */
+static float RT_ValueNoise(float u, float v, int cells, int seed) {
+	float fx = u * cells, fy = v * cells, tx, ty, a, b, c, d, ab, cd;
+	int x0 = (int)fx, y0 = (int)fy, x1, y1;
+	tx = fx - x0; tx = tx * tx * (3.0f - 2.0f * tx);
+	ty = fy - y0; ty = ty * ty * (3.0f - 2.0f * ty);
+	x0 %= cells; x1 = (x0 + 1) % cells;
+	y0 %= cells; y1 = (y0 + 1) % cells;
+
+	a = RT_NoiseHash(x0, y0, seed); b = RT_NoiseHash(x1, y0, seed);
+	c = RT_NoiseHash(x0, y1, seed); d = RT_NoiseHash(x1, y1, seed);
+	ab = a + (b - a) * tx; cd = c + (d - c) * tx;
+	return ab + (cd - ab) * ty;
+}
+
+static float RT_FractalNoise(float u, float v, int cells, int octaves, int seed) {
+	float sum = 0.0f, total = 0.0f, amp = 0.5f;
+	int i;
+	for (i = 0; i < octaves; i++, cells *= 2, amp *= 0.5f)
+	{
+		sum   += RT_ValueNoise(u, v, cells, seed + i) * amp;
+		total += amp;
+	}
+	return sum / total;
+}
+
+static void RT_CreateCloudNoise(void) {
+	struct Bitmap bmp;
+	float u, v, shape, detail;
+	int x, y;
+
+	Bitmap_TryAllocate(&bmp, RT_NOISE_SIZE, RT_NOISE_SIZE);
+	if (!bmp.scan0) return;
+
+	for (y = 0; y < RT_NOISE_SIZE; y++)
+	{
+		for (x = 0; x < RT_NOISE_SIZE; x++)
+		{
+			u = (x + 0.5f) / RT_NOISE_SIZE; v = (y + 0.5f) / RT_NOISE_SIZE;
+			/* (fractal value noise is mostly around 0.5, so it's stretched out) */
+			shape  = (RT_FractalNoise(u, v, 4, 5, 1) - 0.5f) * 2.2f + 0.5f;
+			detail = RT_FractalNoise(u, v, 16, 3, 9);
+			detail = 1.0f - Math_AbsF(detail * 2.0f - 1.0f);
+			Math_Clamp(shape,  0.0f, 1.0f);
+			Math_Clamp(detail, 0.0f, 1.0f);
+			Bitmap_GetPixel(&bmp, x, y) = BitmapCol_Make((int)(shape * 255.0f), (int)(detail * 255.0f), 0, 255);
+		}
+	}
+	rtCloudNoise = Gfx_CreateTexture(&bmp, 0, false);
+	Mem_Free(bmp.scan0);
+}
+
 static void RT_UpdateClouds(struct RTParams* p) {
 	GfxResourceID tex = EnvRenderer_CloudsTexture();
 	struct VulkanTexture* vkTex = (struct VulkanTexture*)(tex ? tex : white_square);
+	struct VulkanTexture* noise;
 	VkDescriptorImageInfo imageInfo;
 	VkWriteDescriptorSet write = { 0 };
+	cc_bool visible = Env.CloudsHeight >= -2000 && !EnvRenderer_Minimal;
 
 	p->cloudsR      = PackedCol_R(Env.CloudsCol) / 255.0f;
 	p->cloudsG      = PackedCol_G(Env.CloudsCol) / 255.0f;
@@ -4785,8 +4856,11 @@ static void RT_UpdateClouds(struct RTParams* p) {
 	p->cloudsY      = Env.CloudsHeight + 0.1f;
 	p->cloudsOffset = (float)(Game.Time / 2048.0f * 0.6f * Env.CloudsSpeed);
 	p->cloudsDist   = (float)Game_ViewDistance;
-	p->cloudsOn     = (Env.CloudsHeight >= -2000 && tex && !EnvRenderer_Minimal) ? 1.0f : 0.0f;
-	if (!vkTex) return;
+	/* (0 = none, 1 = flat clouds, 2 = realistic clouds, see EmitClouds) */
+	p->cloudsOn     = !visible ? 0.0f : (Lighting_GfxClouds ? 2.0f : (tex ? 1.0f : 0.0f));
+	if (!rtCloudNoise) RT_CreateCloudNoise();
+	noise = (struct VulkanTexture*)(rtCloudNoise ? rtCloudNoise : white_square);
+	if (!vkTex || !noise) return;
 
 	imageInfo.sampler     = samplers[0];
 	imageInfo.imageView   = vkTex->view;
@@ -4798,6 +4872,12 @@ static void RT_UpdateClouds(struct RTParams* p) {
 	write.descriptorCount = 1;
 	write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	write.pImageInfo      = &imageInfo;
+	vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+
+	/* (bilinear, since realistic clouds are smooth) */
+	imageInfo.sampler   = samplers[2];
+	imageInfo.imageView = noise->view;
+	write.dstBinding    = 7;
 	vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
 }
 
@@ -4993,6 +5073,11 @@ static void RT_BeginFrame(void) {
 
 	/* (water at the map's edges is drawn as ray traced water too, see EnvRenderer_RenderMapEdges) */
 	Lighting_GfxWater = rtActive && rtWater;
+	/* Realistic clouds are drawn by the sky's shader instead (see EnvRenderer_RenderClouds). The sky is only above */
+	/*  the camera, so they're only seen from below (flat clouds are drawn otherwise), and a rotating skybox would */
+	/*  rotate them too */
+	Lighting_GfxClouds = rtActive && rtClouds && Camera.CurrentPos.y < Env.CloudsHeight &&
+		!(EnvRenderer_ShouldRenderSkybox() && (Env.SkyboxHorSpeed || Env.SkyboxVerSpeed));
 
 	Mem_Set(rtNumEntVertices, 0, sizeof(rtNumEntVertices));
 	rtNumEntTextures = 0;
@@ -5070,6 +5155,12 @@ static void RT_SetWater(int v) {
 	RT_SaveEnum(RT_OPT_WATER, rtWater_Names[v]);
 }
 
+static int  RT_GetClouds(void) { return rtClouds; }
+static void RT_SetClouds(int v) {
+	rtClouds = v;
+	RT_SaveEnum(RT_OPT_CLOUDS, rtClouds_Names[v]);
+}
+
 static int  RT_GetGI(void) { return rtGI; }
 static void RT_SetGI(int v) {
 	rtResetHistory = true;
@@ -5078,10 +5169,10 @@ static void RT_SetGI(int v) {
 }
 
 static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
-	MenuOptionsScreen_AddBool(s, "RT shadows",
+	MenuOptionsScreen_AddBool(s, "Ray tracing",
 		RT_GetEnabled,    RT_SetEnabled,
-		"&eShadows from the sun are calculated using ray tracing.\n" \
-		"&eReplaces the Lighting mode and Smooth lighting settings.");
+		"&eLighting, shadows, reflections and water are ray\n" \
+		"&etraced. Replaces the Lighting mode settings.");
 	MenuOptionsScreen_AddEnum(s, "Sun angle", rtSunAngle_Names, Array_Elems(rtSunAngle_Names),
 		RT_GetSunAngle,   RT_SetSunAngle,
 		"&eHow high up in the sky the sun is.\n" \
@@ -5117,6 +5208,10 @@ static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
 		RT_GetWater,      RT_SetWater,
 		"&eWater has waves, reflects and refracts like real\n" \
 		"&ewater (like Radiance). Off draws normal water.");
+	MenuOptionsScreen_AddEnum(s, "Clouds", rtClouds_Names, Array_Elems(rtClouds_Names),
+		RT_GetClouds,     RT_SetClouds,
+		"&eRealistic draws soft clouds with depth, lit by the sun,\n" \
+		"&ein the server's cloud colour. Normal draws flat clouds.");
 }
 
 
@@ -5339,7 +5434,7 @@ cc_result Gfx_TakeScreenshot(struct Stream* output) {
 cc_bool Gfx_WarnIfNecessary(void) { return false; }
 cc_bool Gfx_GetUIOptions(struct MenuOptionsScreen* s) {
 	if (rtSupported) {
-		MenuOptionsScreen_AddSubmenu(s, "RTX options...", RTXOptionsScreen_InitWidgets,
+		MenuOptionsScreen_AddSubmenu(s, "Ray tracing options...", RTXOptionsScreen_InitWidgets,
 			"&eOptions for ray tracing effects.\n" \
 			"&eRequires a GPU with ray tracing support.");
 	}

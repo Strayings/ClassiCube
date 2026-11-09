@@ -34,6 +34,8 @@ extern cc_bool Lighting_GfxSunShadows;
 void Lighting_SetGfxSunShadows(cc_bool enabled);
 /* Whether water is drawn by the graphics backend's ray traced water instead (e.g. at the map's edges) */
 extern cc_bool Lighting_GfxWater;
+/* Whether clouds are drawn by the graphics backend instead (realistic ray traced clouds) */
+extern cc_bool Lighting_GfxClouds;
 
 
 /* How much ambient occlusion to apply in fancy lighting where 1.0f = none and 0.0f = maximum*/

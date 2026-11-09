@@ -1192,7 +1192,8 @@ static unsigned int EmitHitLight(const struct HitIds* H, unsigned int origin, un
 /* (see EmitClouds) */
 struct CloudIds;
 static void EmitClouds(const struct CloudIds* C, unsigned int origin, unsigned int dir, unsigned int tMax,
-						unsigned int steps, unsigned int jitter, unsigned int* sOut, unsigned int* tOut, unsigned int* tmOut);
+						unsigned int steps, unsigned int jitter, unsigned int* sOut, unsigned int* tOut, unsigned int* tmOut,
+						unsigned int* validOut);
 
 /* Ids used for reflection rays (see EmitReflection) */
 struct ReflIds {
@@ -1279,7 +1280,7 @@ static unsigned int EmitReflectedSky(const struct ReflIds* X, unsigned int origi
 		Op(OP_LABEL, 1, rLabel);
 		{
 			unsigned int cS, cT, cTm, skyT;
-			EmitClouds(X->clouds, origin, dir, X->cCloudFar, X->cCloudSteps, X->cCloudJitter, &cS, &cT, &cTm);
+			EmitClouds(X->clouds, origin, dir, X->cCloudFar, X->cCloudSteps, X->cCloudJitter, &cS, &cT, &cTm, NULL);
 			skyT = Id(); Op(OP_VECTOR_TIMES_SCALAR, 4, X->tVec3, skyT, skyR, cT);
 			rCol = Id(); Op(OP_FADD, 4, X->tVec3, rCol, skyT, cS);
 		}
@@ -1689,7 +1690,8 @@ static unsigned int EmitCloudHG(const struct CloudIds* C, unsigned int cosV, uns
 	(then faded out in the distance, and towards the sky's colour, like Radiance's aerial perspective)
 */
 static void EmitClouds(const struct CloudIds* C, unsigned int origin, unsigned int dir, unsigned int tMax,
-						unsigned int steps, unsigned int jitter, unsigned int* sOut, unsigned int* tOut, unsigned int* tmOut) {
+						unsigned int steps, unsigned int jitter, unsigned int* sOut, unsigned int* tOut, unsigned int* tmOut,
+						unsigned int* validOut) {
 	unsigned int ext = C->ext, tF = C->tFloat, t3 = C->tVec3, tB = C->tBool, tI = C->tInt;
 	unsigned int header = Id(), cond = Id(), body = Id(), lit = Id(), sm = Id(), cont = Id(), merge = Id();
 	unsigned int oy, dy, ady, small, dyS, y0, y1, a0, ta, b0, tb, tn, tf, t0, t1a, t1, seg0, seg, valid, stepsF, dt, jt, tStart;
@@ -1826,6 +1828,7 @@ static void EmitClouds(const struct CloudIds* C, unsigned int origin, unsigned i
 		Sar = EG3(ext, GLSL_FMIX, t3, Sfd, skyS, arV);
 	}
 	*sOut = Sar; *tOut = Tfd; *tmOut = tm;
+	if (validOut) *validOut = valid;
 	(void)Tfd1;
 }
 
@@ -5464,11 +5467,11 @@ void main() {
 	vec4 a = invMVP * vec4(ndc, 0.5, 1.0), b = invMVP * vec4(ndc, d, 1.0);
 	vec3 dir = normalize(a.xyz / a.w - camPos); float tMax = sky ? 1e6 : length(b.xyz / b.w - camPos);
 	float jitter = IGN(gl_FragCoord.xy + 5.588238 * float(frame & 1023));
-	clouds(camPos, dir, tMax, 48, jitter) -> S, T, tm;
+	clouds(camPos, dir, tMax, 48, jitter) -> S, T, tm, inLayer; (inLayer = whether the ray goes through the clouds' layer)
 	(blended with the previous frame's clouds where they were, like MCVR's cloud history)
 	vec4 c = prevMVP * vec4(camPos + dir * tm, 1.0); vec2 uv = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
 	vec4 h = texture(prevClouds, uv);
-	float w = (c.w > 0.001 && all(greaterThanEqual(uv, vec2(0))) && all(lessThanEqual(uv, vec2(1)))) ?
+	float w = (inLayer && c.w > 0.001 && all(greaterThanEqual(uv, vec2(0))) && all(lessThanEqual(uv, vec2(1)))) ?
 		info.z * 0.9 * (1.0 - smoothstep(0.15, 0.5, abs(h.a - T))) : 0.0;
 	out_col = vec4(mix(S, h.rgb, w), mix(T, h.a, w));
 }
@@ -5486,7 +5489,7 @@ static void CloudsFragmentShader(const char* name) {
 	unsigned int sD, iD, dT4, d, invP, invM, cam, sunP, sun, sunCP, sunCol, skyCP, skyCol;
 	unsigned int cAP, cloudsA, cBP, cloudsB, clipA, a4, aw, a3, aXyz, dirA, dir, clipB, b4, bw, bXyz, b3, bRel, sd;
 	unsigned int dNone, isSky, tMax, frP, fr, frM, frF, frS, frV, fcS, gd, gf, gs, jit;
-	unsigned int S, T, tm, pR0, pR, pR4, pmP, pm, pc, pcw, ok0, pcwS, pcx, pcy, ux0, ux, uy0, uy, uv, ge, le, geA, leA, in0, use;
+	unsigned int S, T, tm, inLayer, pR0, pR, pR4, pmP, pm, pc, pcw, ok0, pcwS, pcx, pcy, ux0, ux, uy0, uy, uv, ge, le, geA, leA, in0, use;
 	unsigned int sP, h4, hRgb, hA, dTa, dTv, x0, x1, x, x2, x3, x4, ss, keep0, keep1, histOk, keep, wgt, wV, rgb, alpha, outV;
 	unsigned int iface[2];
 	struct CloudIds C;
@@ -5695,7 +5698,7 @@ static void CloudsFragmentShader(const char* name) {
 	C.cloudsA = cloudsA; C.cloudsB = cloudsB; C.sun = sun; C.sunCol = sunCol; C.skyCol = skyCol;
 	C.vT = vT; C.vC = vC; C.vI = vI; C.vt = vt; C.vTW = vTW; C.vW = vW;
 	C.cZero = cZero; C.cOne = cOne; C.cInt0 = cInt0; C.cInt1 = cInt1; C.cVec3Zero = cVec3Zero;
-	EmitClouds(&C, cam, dir, tMax, cSteps, jit, &S, &T, &tm);
+	EmitClouds(&C, cam, dir, tMax, cSteps, jit, &S, &T, &tm, &inLayer);
 
 	/* Blended with the previous frame's clouds, where they were then */
 	pR0 = E2(OP_VECTOR_TIMES_SCALAR, tVec3, dir, tm); pR = E2(OP_FADD, tVec3, cam, pR0);
@@ -5711,6 +5714,9 @@ static void CloudsFragmentShader(const char* name) {
 	ge  = E2(OP_FORD_GREATER_EQUAL, tBVec2, uv, cVec2Zero); le = E2(OP_FORD_LESS_THAN, tBVec2, uv, cVec2One);
 	geA = E1(OP_ALL, tBool, ge); leA = E1(OP_ALL, tBool, le);
 	in0 = E2(OP_LOGICAL_AND, tBool, geA, leA); use = E2(OP_LOGICAL_AND, tBool, ok0, in0);
+	/* (only where the ray goes through the clouds' layer: otherwise there are no clouds, and the point it's */
+	/*  reprojected from would be right in front of the camera, which could be anywhere in the previous frame) */
+	use = E2(OP_LOGICAL_AND, tBool, use, inLayer);
 	sP = Id(); Op(OP_LOAD, 3, tSampled, sP, vPrev);
 	{
 		/* (half a texel inside the edges of the half resolution image, so the other edge isn't read) */

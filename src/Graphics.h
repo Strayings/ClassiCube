@@ -396,6 +396,8 @@ enum EntityHidden { ENTITY_HIDDEN_NONE, ENTITY_HIDDEN, ENTITY_HIDDEN_SELF };
 cc_bool Gfx_SetEntityHidden(int mode);
 /* Draws volumetric clouds over the scene drawn so far (when they're turned on) */
 void Gfx_RenderClouds(void);
+/* Applies post processing (bloom, motion blur, depth of field, sharpening) to the world drawn so far */
+void Gfx_RenderPostEffects(void);
 #endif
 /* Updates the data of a scratch vertex buffer */
 void Gfx_SetScratchVbData(GfxResourceID vb, void* vertices, int vCount);

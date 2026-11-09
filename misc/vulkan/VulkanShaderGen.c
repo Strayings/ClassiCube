@@ -1,6 +1,7 @@
 /* Generates misc/vulkan/VulkanShaders.h */
 /*   e.g. gcc VulkanShaderGen.c -o VulkanShaderGen && ./VulkanShaderGen > VulkanShaders.h */
 /* SPIR-V is written out directly, so no shader compiler (glslang, shaderc etc) is needed */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5890,6 +5891,328 @@ static void CloudCompositeFragmentShader(const char* name) {
 	End(name);
 }
 
+/*########################################################################################################################*
+*---------------------------------------------------Post processing------------------------------------------------------*
+*#########################################################################################################################*/
+/* Common ids for the post processing shaders */
+struct PostIds {
+	unsigned int ext, tVoid, tFunc, tFloat, tVec2, tVec3, tVec4, tInt, tIVec2, tBool, tMat4, tImage, tSampled, pSampled;
+	unsigned int pInVec4, pOutVec4, cZero, cOne, cHalf, cTwo, cInt0, cInt1, cVec2One, cVec3Zero, vFragCoord, vOut, label;
+};
+
+static void PostBegin(struct PostIds* P) {
+	Begin(SPIRV_1_0);
+	P->ext = Id(); P->tVoid = Id(); P->tFunc = Id(); P->tFloat = Id(); P->tVec2 = Id(); P->tVec3 = Id(); P->tVec4 = Id();
+	P->tInt = Id(); P->tIVec2 = Id(); P->tBool = Id(); P->tMat4 = Id(); P->tImage = Id(); P->tSampled = Id(); P->pSampled = Id();
+	P->pInVec4 = Id(); P->pOutVec4 = Id(); P->vFragCoord = Id(); P->vOut = Id(); P->label = Id();
+}
+
+static void PostHeader(struct PostIds* P, unsigned int main_) {
+	unsigned int iface[2];
+	ExtInstImport(P->ext);
+	Op(OP_MEMORY_MODEL, 2, ADDRESSING_LOGICAL, MEMORY_GLSL450);
+	iface[0] = P->vFragCoord; iface[1] = P->vOut;
+	EntryPoint(MODEL_FRAGMENT, main_, 2, iface);
+	Op(OP_EXECUTION_MODE, 2, main_, MODE_ORIGIN_UPPER_LEFT);
+	Op(OP_DECORATE, 3, P->vFragCoord, DECORATION_BUILTIN, BUILTIN_FRAG_COORD);
+	Op(OP_DECORATE, 3, P->vOut, DECORATION_LOCATION, 0);
+}
+
+/* Types (after decorations), then common constants */
+static void PostTypes(struct PostIds* P) {
+	Op(OP_TYPE_VOID,     1, P->tVoid);
+	Op(OP_TYPE_FUNCTION, 2, P->tFunc, P->tVoid);
+	Op(OP_TYPE_FLOAT,    2, P->tFloat, 32);
+	Op(OP_TYPE_VECTOR,   3, P->tVec2, P->tFloat, 2);
+	Op(OP_TYPE_VECTOR,   3, P->tVec3, P->tFloat, 3);
+	Op(OP_TYPE_VECTOR,   3, P->tVec4, P->tFloat, 4);
+	Op(OP_TYPE_INT,      3, P->tInt, 32, 1);
+	Op(OP_TYPE_VECTOR,   3, P->tIVec2, P->tInt, 2);
+	Op(OP_TYPE_BOOL,     1, P->tBool);
+	Op(OP_TYPE_MATRIX,   3, P->tMat4, P->tVec4, 4);
+	Op(OP_TYPE_IMAGE,         8, P->tImage, P->tFloat, 1, 0, 0, 0, 1, 0);
+	Op(OP_TYPE_SAMPLED_IMAGE, 2, P->tSampled, P->tImage);
+	Op(OP_TYPE_POINTER,  3, P->pSampled, STORAGE_UNIFORM_CONSTANT, P->tSampled);
+	Op(OP_TYPE_POINTER,  3, P->pInVec4,  STORAGE_INPUT,  P->tVec4);
+	Op(OP_TYPE_POINTER,  3, P->pOutVec4, STORAGE_OUTPUT, P->tVec4);
+}
+static void PostConstants(struct PostIds* P) {
+	P->cZero = CF(P->tFloat, 0.0f); P->cOne = CF(P->tFloat, 1.0f); P->cHalf = CF(P->tFloat, 0.5f); P->cTwo = CF(P->tFloat, 2.0f);
+	P->cInt0 = Id(); Op(OP_CONSTANT, 3, P->tInt, P->cInt0, 0);
+	P->cInt1 = Id(); Op(OP_CONSTANT, 3, P->tInt, P->cInt1, 1);
+	P->cVec2One  = Id(); Op(OP_CONSTANT_COMPOSITE, 4, P->tVec2, P->cVec2One, P->cOne, P->cOne);
+	P->cVec3Zero = Id(); Op(OP_CONSTANT_COMPOSITE, 5, P->tVec3, P->cVec3Zero, P->cZero, P->cZero, P->cZero);
+}
+
+/* rgb of a bilinear sample at uv, clamped to between lo and hi (so the other edge isn't read) */
+static unsigned int PostSample(struct PostIds* P, unsigned int var, unsigned int uv, unsigned int lo, unsigned int hi) {
+	unsigned int sm = Id(), r = Id(), uvC = EG3(P->ext, GLSL_FCLAMP, P->tVec2, uv, lo, hi), rgb = Id();
+	Op(OP_LOAD, 3, P->tSampled, sm, var);
+	Op(OP_IMAGE_SAMPLE_EXPLICIT, 6, P->tVec4, r, sm, uvC, IMAGE_OPERAND_LOD, P->cZero);
+	Op(OP_VECTOR_SHUFFLE, 7, P->tVec3, rgb, r, r, 0, 1, 2);
+	return rgb;
+}
+
+/* Points on a disc (golden angle spiral) as vec2 constants, and their gaussian weights (normalised) */
+static void PostSpiral(struct PostIds* P, int count, unsigned int* offs, unsigned int* weights) {
+	float x, y, w[32], sum = 0.0f;
+	int k;
+	for (k = 0; k < count; k++)
+	{
+		float r = (float)sqrt((k + 0.5f) / count), a = k * 2.39996323f;
+		x = r * (float)cos(a); y = r * (float)sin(a);
+		offs[k] = CV2(P->tVec2, P->tFloat, x, y);
+		w[k] = (float)exp(-2.0f * r * r); sum += w[k];
+	}
+	for (k = 0; k < count; k++) weights[k] = CF(P->tFloat, w[k] / sum);
+}
+
+/* Bloom: the bright parts of the image (above a.z), blurred over a disc of 16 points */
+/* Equivalent GLSL:
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(push_constant) uniform Constants { vec4 a; vec4 b; }; (a = 1 / output size, threshold; b.xy = disc radius in uv,
+	b.zw = half a texel of src)
+void main() {
+	vec2 uv = gl_FragCoord.xy * a.xy; vec3 sum = vec3(0.0);
+	for (16 points p with weight w) { vec3 c = texture(src, clamp(uv + p * b.xy, b.zw, 1 - b.zw)).rgb;
+		float m = max(c.r, max(c.g, c.b)); sum += c * (max(m - a.z, 0.0) / max(m, 0.0001)) * w; }
+	out_col = vec4(sum, 1.0);
+}
+*/
+static void BloomFragmentShader(const char* name) {
+	struct PostIds P;
+	unsigned int main_, tPush, pPush, pPushVec4, vSrc, vPush, cTiny, offs[16], ws[16];
+	unsigned int fc4, fc, aP, a, bP, b, inv, uv, thr, step, lo, hi, sum, outV;
+	int k;
+
+	PostBegin(&P);
+	main_ = Id(); tPush = Id(); pPush = Id(); pPushVec4 = Id(); vSrc = Id(); vPush = Id();
+	PostHeader(&P, main_);
+	Op(OP_DECORATE, 3, vSrc, DECORATION_DESCRIPTOR_SET, 0);
+	Op(OP_DECORATE, 3, vSrc, DECORATION_BINDING, 0);
+	Op(OP_DECORATE, 2, tPush, DECORATION_BLOCK);
+	Op(OP_MEMBER_DECORATE, 4, tPush, 0, DECORATION_OFFSET, 0);
+	Op(OP_MEMBER_DECORATE, 4, tPush, 1, DECORATION_OFFSET, 16);
+	PostTypes(&P);
+	Op(OP_TYPE_STRUCT,  3, tPush, P.tVec4, P.tVec4);
+	Op(OP_TYPE_POINTER, 3, pPush, STORAGE_PUSH_CONSTANT, tPush);
+	Op(OP_TYPE_POINTER, 3, pPushVec4, STORAGE_PUSH_CONSTANT, P.tVec4);
+	PostConstants(&P);
+	cTiny = CF(P.tFloat, 0.0001f);
+	PostSpiral(&P, 16, offs, ws);
+	Op(OP_VARIABLE, 3, P.pInVec4,  P.vFragCoord, STORAGE_INPUT);
+	Op(OP_VARIABLE, 3, P.pOutVec4, P.vOut,       STORAGE_OUTPUT);
+	Op(OP_VARIABLE, 3, P.pSampled, vSrc,         STORAGE_UNIFORM_CONSTANT);
+	Op(OP_VARIABLE, 3, pPush,      vPush,        STORAGE_PUSH_CONSTANT);
+
+	Op(OP_FUNCTION, 4, P.tVoid, main_, 0, P.tFunc);
+	Op(OP_LABEL,    1, P.label);
+	fc4 = Id(); Op(OP_LOAD, 3, P.tVec4, fc4, P.vFragCoord);
+	fc  = Id(); Op(OP_VECTOR_SHUFFLE, 6, P.tVec2, fc, fc4, fc4, 0, 1);
+	aP = Id(); Op(OP_ACCESS_CHAIN, 4, pPushVec4, aP, vPush, P.cInt0); a = Id(); Op(OP_LOAD, 3, P.tVec4, a, aP);
+	bP = Id(); Op(OP_ACCESS_CHAIN, 4, pPushVec4, bP, vPush, P.cInt1); b = Id(); Op(OP_LOAD, 3, P.tVec4, b, bP);
+	inv  = Id(); Op(OP_VECTOR_SHUFFLE, 6, P.tVec2, inv,  a, a, 0, 1);
+	step = Id(); Op(OP_VECTOR_SHUFFLE, 6, P.tVec2, step, b, b, 0, 1);
+	lo   = Id(); Op(OP_VECTOR_SHUFFLE, 6, P.tVec2, lo,   b, b, 2, 3);
+	hi   = E2(OP_FSUB, P.tVec2, P.cVec2One, lo);
+	uv   = E2(OP_FMUL, P.tVec2, fc, inv);
+	thr  = EX(P.tFloat, a, 2);
+	sum  = P.cVec3Zero;
+	for (k = 0; k < 16; k++)
+	{
+		unsigned int o = E2(OP_FMUL, P.tVec2, offs[k], step), uvK = E2(OP_FADD, P.tVec2, uv, o);
+		unsigned int c = PostSample(&P, vSrc, uvK, lo, hi), cr = EX(P.tFloat, c, 0), cg = EX(P.tFloat, c, 1), cb = EX(P.tFloat, c, 2);
+		unsigned int m0 = EG2(P.ext, GLSL_FMAX, P.tFloat, cg, cb), m = EG2(P.ext, GLSL_FMAX, P.tFloat, cr, m0);
+		unsigned int d0 = E2(OP_FSUB, P.tFloat, m, thr), d = EG2(P.ext, GLSL_FMAX, P.tFloat, d0, P.cZero);
+		unsigned int mS = EG2(P.ext, GLSL_FMAX, P.tFloat, m, cTiny), f0 = E2(OP_FDIV, P.tFloat, d, mS), f = E2(OP_FMUL, P.tFloat, f0, ws[k]);
+		unsigned int cf = E2(OP_VECTOR_TIMES_SCALAR, P.tVec3, c, f);
+		sum = E2(OP_FADD, P.tVec3, sum, cf);
+	}
+	outV = Id(); Op(OP_COMPOSITE_CONSTRUCT, 4, P.tVec4, outV, sum, P.cOne);
+	Op(OP_STORE, 2, P.vOut, outV);
+	Op(OP_RETURN, 0);
+	Op(OP_FUNCTION_END, 0);
+	End(name);
+}
+
+/* Final post processing, drawn over the scene: camera motion blur, depth of field, sharpening, then bloom added */
+/* Equivalent GLSL:
+layout(set = 0, binding = 0) uniform sampler2D scene, bloom; layout(set = 0, binding = 2) uniform sampler2D depth;
+layout(set = 1, binding = 1) uniform Params { layout(offset = 96) mat4 prevMVP; };
+layout(push_constant) uniform Constants { mat4 invMVP; vec4 a; vec4 b; }; (a = size, bloom, sharpen; b = motion, dof)
+void main() {
+	vec2 uv = gl_FragCoord.xy / a.xy, ndc = vec2(uv.x * 2 - 1, 1 - uv.y * 2); float d = texelFetch(depth, ...).r;
+	vec3 near = unproject(ndc, 1), p = unproject(ndc, d > 0 ? d : 0.0001); float dist = d > 0 ? length(p - near) : 1e6;
+	(motion blur: where the point was on screen last frame, 8 samples along the way there)
+	vec4 c = prevMVP * vec4(p, 1); vec2 vel = clamp((uv - prevUV(c)) * b.x, -0.04, 0.04);
+	vec3 col = average of texture(scene, uv + vel * (i / 7 - 0.5)) for i = 0..7;
+	(depth of field: focused on what's at the centre of the screen)
+	float coc = clamp(abs(1 - focus / dist) * b.y, 0, 1); vec3 blur = 12 points on a disc of coc * 10 pixels;
+	col = mix(col, blur, clamp(coc * 2, 0, 1));
+	(sharpening, where nothing's blurred)
+	col += (scene(uv) - average of the 4 neighbours) * a.w * (1 - clamp(coc * 4, 0, 1));
+	out_col = vec4(col + texture(bloom, uv).rgb * a.z, 1.0);
+}
+*/
+static void PostFragmentShader(const char* name) {
+	struct PostIds P;
+	unsigned int main_, tPush, pPush, pPushVec4, pPushMat4, tParams, pParams, pParamsMat4, vScene, vBloom, vDepth, vParams, vPush;
+	unsigned int cIdx2, cTiny, cFar, cVelMax, cVelMin, cDofPx, cCocK, cSharpK, cEighth, offs[12], ws[12], cT[8];
+	unsigned int fc4, fc, mP, invM, aP, a, bP, b, size, inv, uv, lo, hi, ux, uy, ndcX0, ndcX, ndcY0, ndcY, ip, sD, iD, d4, d;
+	unsigned int hasD, dU, cN, n4, nw, n3, cP, p4, pw, p3, rel, dist0, dist, pmP, pm, w4, pc, pcw, pcwS, px, py, prU, prV, prev, vel0;
+	unsigned int motK, vel1, vel, col, center, cC, cd4, cdD, cdU, fcN, f4, fw, f3, fRel, focus0, focus, ratio, ar0, ar, dofK, coc0, coc;
+	unsigned int rad, radUv, blur, mixK, mixV, c0, nb, sharpK, sh0, sh1, sh2, shV, bl, blK, outC, outV, cHalf2;
+	int k;
+
+	PostBegin(&P);
+	main_ = Id(); tPush = Id(); pPush = Id(); pPushVec4 = Id(); pPushMat4 = Id(); tParams = Id(); pParams = Id(); pParamsMat4 = Id();
+	vScene = Id(); vBloom = Id(); vDepth = Id(); vParams = Id(); vPush = Id(); cIdx2 = Id();
+	PostHeader(&P, main_);
+	Op(OP_DECORATE, 3, vScene, DECORATION_DESCRIPTOR_SET, 0); Op(OP_DECORATE, 3, vScene, DECORATION_BINDING, 0);
+	Op(OP_DECORATE, 3, vBloom, DECORATION_DESCRIPTOR_SET, 0); Op(OP_DECORATE, 3, vBloom, DECORATION_BINDING, 1);
+	Op(OP_DECORATE, 3, vDepth, DECORATION_DESCRIPTOR_SET, 0); Op(OP_DECORATE, 3, vDepth, DECORATION_BINDING, 2);
+	Op(OP_DECORATE, 3, vParams, DECORATION_DESCRIPTOR_SET, 1); Op(OP_DECORATE, 3, vParams, DECORATION_BINDING, 1);
+	Op(OP_DECORATE, 2, tParams, DECORATION_BLOCK);
+	Op(OP_MEMBER_DECORATE, 3, tParams, 0, DECORATION_COL_MAJOR);
+	Op(OP_MEMBER_DECORATE, 4, tParams, 0, DECORATION_OFFSET, 96); /* prevMVP (see RTParams) */
+	Op(OP_MEMBER_DECORATE, 4, tParams, 0, DECORATION_MATRIX_STRIDE, 16);
+	Op(OP_DECORATE, 2, tPush, DECORATION_BLOCK);
+	Op(OP_MEMBER_DECORATE, 3, tPush, 0, DECORATION_COL_MAJOR);
+	Op(OP_MEMBER_DECORATE, 4, tPush, 0, DECORATION_OFFSET, 0);
+	Op(OP_MEMBER_DECORATE, 4, tPush, 0, DECORATION_MATRIX_STRIDE, 16);
+	Op(OP_MEMBER_DECORATE, 4, tPush, 1, DECORATION_OFFSET, 64);
+	Op(OP_MEMBER_DECORATE, 4, tPush, 2, DECORATION_OFFSET, 80);
+	PostTypes(&P);
+	Op(OP_TYPE_STRUCT,  4, tPush, P.tMat4, P.tVec4, P.tVec4);
+	Op(OP_TYPE_POINTER, 3, pPush, STORAGE_PUSH_CONSTANT, tPush);
+	Op(OP_TYPE_POINTER, 3, pPushVec4, STORAGE_PUSH_CONSTANT, P.tVec4);
+	Op(OP_TYPE_POINTER, 3, pPushMat4, STORAGE_PUSH_CONSTANT, P.tMat4);
+	Op(OP_TYPE_STRUCT,  2, tParams, P.tMat4);
+	Op(OP_TYPE_POINTER, 3, pParams, STORAGE_UNIFORM, tParams);
+	Op(OP_TYPE_POINTER, 3, pParamsMat4, STORAGE_UNIFORM, P.tMat4);
+	PostConstants(&P);
+	Op(OP_CONSTANT, 3, P.tInt, cIdx2, 2);
+	cTiny = CF(P.tFloat, 1e-7f); cFar = CF(P.tFloat, 1000000.0f); cDofPx = CF(P.tFloat, 10.0f);
+	cVelMax = CF(P.tFloat, 0.04f); cVelMin = CF(P.tFloat, -0.04f); cCocK = CF(P.tFloat, 4.0f); cSharpK = CF(P.tFloat, 0.25f);
+	cEighth = CF(P.tFloat, 0.125f); cHalf2 = CF(P.tFloat, 0.0001f);
+	for (k = 0; k < 8; k++) cT[k] = CF(P.tFloat, k / 7.0f - 0.5f);
+	PostSpiral(&P, 12, offs, ws);
+	Op(OP_VARIABLE, 3, P.pInVec4,  P.vFragCoord, STORAGE_INPUT);
+	Op(OP_VARIABLE, 3, P.pOutVec4, P.vOut,       STORAGE_OUTPUT);
+	Op(OP_VARIABLE, 3, P.pSampled, vScene,       STORAGE_UNIFORM_CONSTANT);
+	Op(OP_VARIABLE, 3, P.pSampled, vBloom,       STORAGE_UNIFORM_CONSTANT);
+	Op(OP_VARIABLE, 3, P.pSampled, vDepth,       STORAGE_UNIFORM_CONSTANT);
+	Op(OP_VARIABLE, 3, pParams,    vParams,      STORAGE_UNIFORM);
+	Op(OP_VARIABLE, 3, pPush,      vPush,        STORAGE_PUSH_CONSTANT);
+
+	Op(OP_FUNCTION, 4, P.tVoid, main_, 0, P.tFunc);
+	Op(OP_LABEL,    1, P.label);
+	fc4 = Id(); Op(OP_LOAD, 3, P.tVec4, fc4, P.vFragCoord);
+	fc  = Id(); Op(OP_VECTOR_SHUFFLE, 6, P.tVec2, fc, fc4, fc4, 0, 1);
+	mP = Id(); Op(OP_ACCESS_CHAIN, 4, pPushMat4, mP, vPush, P.cInt0); invM = Id(); Op(OP_LOAD, 3, P.tMat4, invM, mP);
+	aP = Id(); Op(OP_ACCESS_CHAIN, 4, pPushVec4, aP, vPush, P.cInt1); a = Id(); Op(OP_LOAD, 3, P.tVec4, a, aP);
+	bP = Id(); Op(OP_ACCESS_CHAIN, 4, pPushVec4, bP, vPush, cIdx2);   b = Id(); Op(OP_LOAD, 3, P.tVec4, b, bP);
+	size = Id(); Op(OP_VECTOR_SHUFFLE, 6, P.tVec2, size, a, a, 0, 1);
+	inv  = E2(OP_FDIV, P.tVec2, P.cVec2One, size);
+	uv   = E2(OP_FMUL, P.tVec2, fc, inv);
+	lo   = E2(OP_VECTOR_TIMES_SCALAR, P.tVec2, inv, P.cHalf); hi = E2(OP_FSUB, P.tVec2, P.cVec2One, lo);
+	ux = EX(P.tFloat, uv, 0); uy = EX(P.tFloat, uv, 1);
+	ndcX0 = E2(OP_FMUL, P.tFloat, ux, P.cTwo); ndcX = E2(OP_FSUB, P.tFloat, ndcX0, P.cOne);
+	ndcY0 = E2(OP_FMUL, P.tFloat, uy, P.cTwo); ndcY = E2(OP_FSUB, P.tFloat, P.cOne, ndcY0); /* (Y is flipped, see Gfx_SetViewport) */
+	ip = E1(OP_CONVERT_F_TO_S, P.tIVec2, fc);
+	sD = Id(); Op(OP_LOAD, 3, P.tSampled, sD, vDepth); iD = Id(); Op(OP_IMAGE, 3, P.tImage, iD, sD);
+	d4 = Id(); Op(OP_IMAGE_FETCH, 6, P.tVec4, d4, iD, ip, IMAGE_OPERAND_LOD, P.cInt0); d = EX(P.tFloat, d4, 0);
+
+	/* Where the point is in the world (or a point far away in the sky), relative to the near plane */
+	hasD = E2(OP_FORD_GREATER_THAN, P.tBool, d, P.cZero); dU = ES(P.tFloat, hasD, d, cHalf2);
+	cN = Id(); Op(OP_COMPOSITE_CONSTRUCT, 6, P.tVec4, cN, ndcX, ndcY, P.cOne, P.cOne);
+	n4 = E2(OP_MATRIX_TIMES_VECTOR, P.tVec4, invM, cN); nw = EX(P.tFloat, n4, 3);
+	{ unsigned int x = Id(), iw = E2(OP_FDIV, P.tFloat, P.cOne, nw); Op(OP_VECTOR_SHUFFLE, 7, P.tVec3, x, n4, n4, 0, 1, 2); n3 = E2(OP_VECTOR_TIMES_SCALAR, P.tVec3, x, iw); }
+	cP = Id(); Op(OP_COMPOSITE_CONSTRUCT, 6, P.tVec4, cP, ndcX, ndcY, dU, P.cOne);
+	p4 = E2(OP_MATRIX_TIMES_VECTOR, P.tVec4, invM, cP); pw = EX(P.tFloat, p4, 3);
+	{ unsigned int x = Id(), pwS = EG2(P.ext, GLSL_FMAX, P.tFloat, pw, cTiny), iw = E2(OP_FDIV, P.tFloat, P.cOne, pwS);
+	  Op(OP_VECTOR_SHUFFLE, 7, P.tVec3, x, p4, p4, 0, 1, 2); p3 = E2(OP_VECTOR_TIMES_SCALAR, P.tVec3, x, iw); }
+	rel = E2(OP_FSUB, P.tVec3, p3, n3); dist0 = EG1(P.ext, GLSL_LENGTH, P.tFloat, rel); dist = ES(P.tFloat, hasD, dist0, cFar);
+
+	/* Motion blur: along the way from where the point was on screen in the previous frame */
+	pmP = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsMat4, pmP, vParams, P.cInt0); pm = Id(); Op(OP_LOAD, 3, P.tMat4, pm, pmP);
+	w4 = Id(); Op(OP_COMPOSITE_CONSTRUCT, 4, P.tVec4, w4, p3, P.cOne);
+	pc = E2(OP_MATRIX_TIMES_VECTOR, P.tVec4, pm, w4); pcw = EX(P.tFloat, pc, 3);
+	pcwS = EG2(P.ext, GLSL_FMAX, P.tFloat, pcw, cTiny);
+	px = EX(P.tFloat, pc, 0); py = EX(P.tFloat, pc, 1);
+	prU = E2(OP_FDIV, P.tFloat, px, pcwS); prU = E2(OP_FMUL, P.tFloat, prU, P.cHalf); prU = E2(OP_FADD, P.tFloat, prU, P.cHalf);
+	prV = E2(OP_FDIV, P.tFloat, py, pcwS); prV = E2(OP_FMUL, P.tFloat, prV, P.cHalf); prV = E2(OP_FSUB, P.tFloat, P.cHalf, prV);
+	prev = EC2(P.tVec2, prU, prV);
+	vel0 = E2(OP_FSUB, P.tVec2, uv, prev);
+	motK = EX(P.tFloat, b, 0); vel1 = E2(OP_VECTOR_TIMES_SCALAR, P.tVec2, vel0, motK);
+	{ unsigned int vMin = EC2(P.tVec2, cVelMin, cVelMin), vMax = EC2(P.tVec2, cVelMax, cVelMax);
+	  vel = EG3(P.ext, GLSL_FCLAMP, P.tVec2, vel1, vMin, vMax); }
+	{ /* (no motion blur where the previous position isn't known, i.e. behind the camera) */
+	  unsigned int ok = E2(OP_FORD_GREATER_THAN, P.tBool, pcw, cTiny), okF = ES(P.tFloat, ok, P.cOne, P.cZero);
+	  vel = E2(OP_VECTOR_TIMES_SCALAR, P.tVec2, vel, okF); }
+	col = P.cVec3Zero;
+	for (k = 0; k < 8; k++)
+	{
+		unsigned int o = E2(OP_VECTOR_TIMES_SCALAR, P.tVec2, vel, cT[k]), uvK = E2(OP_FADD, P.tVec2, uv, o);
+		unsigned int c = PostSample(&P, vScene, uvK, lo, hi);
+		col = E2(OP_FADD, P.tVec3, col, c);
+	}
+	col = E2(OP_VECTOR_TIMES_SCALAR, P.tVec3, col, cEighth);
+
+	/* Depth of field: focused on what's at the centre of the screen */
+	center = E2(OP_VECTOR_TIMES_SCALAR, P.tVec2, size, P.cHalf); cC = E1(OP_CONVERT_F_TO_S, P.tIVec2, center);
+	cd4 = Id(); Op(OP_IMAGE_FETCH, 6, P.tVec4, cd4, iD, cC, IMAGE_OPERAND_LOD, P.cInt0); cdD = EX(P.tFloat, cd4, 0);
+	{ unsigned int has = E2(OP_FORD_GREATER_THAN, P.tBool, cdD, P.cZero); cdU = ES(P.tFloat, has, cdD, cHalf2);
+	  fcN = Id(); Op(OP_COMPOSITE_CONSTRUCT, 6, P.tVec4, fcN, P.cZero, P.cZero, cdU, P.cOne);
+	  f4 = E2(OP_MATRIX_TIMES_VECTOR, P.tVec4, invM, fcN); fw = EX(P.tFloat, f4, 3);
+	  { unsigned int x = Id(), fwS = EG2(P.ext, GLSL_FMAX, P.tFloat, fw, cTiny), iw = E2(OP_FDIV, P.tFloat, P.cOne, fwS);
+	    Op(OP_VECTOR_SHUFFLE, 7, P.tVec3, x, f4, f4, 0, 1, 2); f3 = E2(OP_VECTOR_TIMES_SCALAR, P.tVec3, x, iw); }
+	  fRel = E2(OP_FSUB, P.tVec3, f3, n3); focus0 = EG1(P.ext, GLSL_LENGTH, P.tFloat, fRel); focus = ES(P.tFloat, has, focus0, cFar); }
+	ratio = E2(OP_FDIV, P.tFloat, focus, dist); ar0 = E2(OP_FSUB, P.tFloat, P.cOne, ratio); ar = EG1(P.ext, GLSL_FABS, P.tFloat, ar0);
+	dofK  = EX(P.tFloat, b, 1); coc0 = E2(OP_FMUL, P.tFloat, ar, dofK); coc = EG3(P.ext, GLSL_FCLAMP, P.tFloat, coc0, P.cZero, P.cOne);
+	rad   = E2(OP_FMUL, P.tFloat, coc, cDofPx); radUv = E2(OP_VECTOR_TIMES_SCALAR, P.tVec2, inv, rad);
+	blur  = P.cVec3Zero;
+	for (k = 0; k < 12; k++)
+	{
+		unsigned int o = E2(OP_FMUL, P.tVec2, offs[k], radUv), uvK = E2(OP_FADD, P.tVec2, uv, o);
+		unsigned int c = PostSample(&P, vScene, uvK, lo, hi), cw = E2(OP_VECTOR_TIMES_SCALAR, P.tVec3, c, ws[k]);
+		blur = E2(OP_FADD, P.tVec3, blur, cw);
+	}
+	mixK = E2(OP_FMUL, P.tFloat, coc, P.cTwo); mixK = EG3(P.ext, GLSL_FCLAMP, P.tFloat, mixK, P.cZero, P.cOne);
+	mixV = EC3(P.tVec3, mixK, mixK, mixK);
+	col  = EG3(P.ext, GLSL_FMIX, P.tVec3, col, blur, mixV);
+
+	/* Sharpening (where nothing's blurred): the difference from the 4 neighbouring pixels added again */
+	c0 = PostSample(&P, vScene, uv, lo, hi);
+	nb = P.cVec3Zero;
+	for (k = 0; k < 4; k++)
+	{
+		unsigned int ix = EX(P.tFloat, inv, 0), iy = EX(P.tFloat, inv, 1), nx, o, uvK, c;
+		nx = (k & 1) ? E1(OP_FNEGATE, P.tFloat, (k < 2 ? ix : iy)) : (k < 2 ? ix : iy);
+		o  = k < 2 ? EC2(P.tVec2, nx, P.cZero) : EC2(P.tVec2, P.cZero, nx);
+		uvK = E2(OP_FADD, P.tVec2, uv, o);
+		c  = PostSample(&P, vScene, uvK, lo, hi);
+		nb = E2(OP_FADD, P.tVec3, nb, c);
+	}
+	nb = E2(OP_VECTOR_TIMES_SCALAR, P.tVec3, nb, cSharpK);
+	sharpK = EX(P.tFloat, a, 3);
+	sh0 = E2(OP_FMUL, P.tFloat, coc, cCocK); sh0 = EG3(P.ext, GLSL_FCLAMP, P.tFloat, sh0, P.cZero, P.cOne);
+	sh1 = E2(OP_FSUB, P.tFloat, P.cOne, sh0); sh1 = E2(OP_FMUL, P.tFloat, sh1, sharpK);
+	sh2 = E2(OP_FSUB, P.tVec3, c0, nb); shV = E2(OP_VECTOR_TIMES_SCALAR, P.tVec3, sh2, sh1);
+	col = E2(OP_FADD, P.tVec3, col, shV);
+
+	/* Bloom */
+	bl  = PostSample(&P, vBloom, uv, lo, hi);
+	blK = E2(OP_VECTOR_TIMES_SCALAR, P.tVec3, bl, EX(P.tFloat, a, 2));
+	outC = E2(OP_FADD, P.tVec3, col, blK);
+	outC = EG3(P.ext, GLSL_FCLAMP, P.tVec3, outC, P.cVec3Zero, EC3(P.tVec3, P.cOne, P.cOne, P.cOne));
+	outV = Id(); Op(OP_COMPOSITE_CONSTRUCT, 4, P.tVec4, outV, outC, P.cOne);
+	Op(OP_STORE, 2, P.vOut, outV);
+	Op(OP_RETURN, 0);
+	Op(OP_FUNCTION_END, 0);
+	End(name);
+}
+
 int main(void) {
 	printf("// Generated using misc/vulkan/VulkanShaderGen.c\n\n");
 	VertexShader("vs_colored",    0, 0);
@@ -5945,5 +6268,7 @@ int main(void) {
 	CompositeFragmentShader("fs_composite");
 	CloudsFragmentShader("fs_clouds");
 	CloudCompositeFragmentShader("fs_cloud_composite");
+	BloomFragmentShader("fs_bloom");
+	PostFragmentShader("fs_post");
 	return 0;
 }

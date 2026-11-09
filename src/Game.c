@@ -529,6 +529,11 @@ static void Render3DFrame(float delta, float t) {
 		MapRenderer_RenderTranslucent(delta);
 	}
 
+#if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
+	/* (post processing applies to the world, but not the selection outline, held block etc drawn afterwards) */
+	Gfx_RenderPostEffects();
+#endif
+
 	/* Need to render again over top of translucent block, as the selection outline */
 	/* is drawn without writing to the depth buffer */
 	if (Game_SelectedPos.valid && !Game_HideGui && Blocks.Draw[Game_SelectedPos.block] == DRAW_TRANSLUCENT) {

@@ -233,6 +233,19 @@ static VkPipelineLayout cloudLayout, cloudCompLayout;
 static VkShaderModule cloudModule, cloudCompModule;
 static VkPipeline cloudPipeline, cloudCompPipelines[16];
 static cc_uint32 cloudsLastFrame = (cc_uint32)-2;
+
+/* Post processing (see Gfx_RenderPostEffects): a copy of the scene, and bloom at quarter resolution */
+static VkImage postImages[3];
+static VkImageView postViews[3];
+static struct MemAlloc postAllocs[3];
+static VkFramebuffer bloomFramebuffers[2];
+static VkExtent2D bloomExtent;
+static VkDescriptorSetLayout bloomSetLayout, postSetLayout;
+static VkDescriptorPool postPool;
+static VkDescriptorSet bloomSets[2], postSet;
+static VkPipelineLayout bloomLayout, postLayout;
+static VkShaderModule bloomModule, postModule;
+static VkPipeline bloomPipeline, postPipelines[16];
 /* Ray traced shadows/sky light (0), bounced light/god rays (1) and picked block light (2, ReSTIR) of each pixel, */
 /*  which are blended over multiple frames to give smooth results (frame slot i writes to history images [x][i], */
 /*  and reads the previous frame's history images). These are colour attachments 2, 3 and 4 of the render pass */
@@ -326,6 +339,7 @@ static cc_bool rtDrawn, rtPrevDrawn;
 static cc_bool rtResetHistory;
 static struct Matrix rtFrameMVP, rtPrevMVP;
 static int rtSunAngle, rtSunDir, rtShadowDist, rtSoftness, rtAO, rtGI, rtGodRays, rtBlockLights, rtWater, rtClouds;
+static int rtBloom, rtMotionBlur, rtDof, rtSharpen;
 /* Noise for the shape of realistic clouds (see RT_CreateCloudNoise) */
 static GfxResourceID rtCloudNoise, rtCloudShape, rtCloudDetail;
 static VkDeviceSize rtScratchAlign;
@@ -1380,6 +1394,17 @@ static void DestroySwapchainResources(void) {
 		cloudImages[j] = 0;
 	}
 
+	for (j = 0; j < 3; j++)
+	{
+		if (j && bloomFramebuffers[j - 1]) vkDestroyFramebuffer(device, bloomFramebuffers[j - 1], NULL);
+		if (j) bloomFramebuffers[j - 1] = 0;
+		if (postViews[j])  vkDestroyImageView(device, postViews[j], NULL);
+		if (postImages[j]) vkDestroyImage(device, postImages[j], NULL);
+		MemAlloc_Free(&imagePool, &postAllocs[j]);
+		postViews[j]  = 0;
+		postImages[j] = 0;
+	}
+
 	/* Depth buffer doesn't exist when the window was minimised */
 	if (depthSampleView) vkDestroyImageView(device, depthSampleView, NULL);
 	depthSampleView = 0;
@@ -1627,6 +1652,54 @@ static void CreateDenoiseImages(void) {
 	images[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	images[2].sampler     = samplers[0];
 	cloudsLastFrame = frameCounter - 2;
+
+	/* Post processing: [0] = copy of the scene (copied from the swapchain image), [1]/[2] = bloom */
+	if (!postPipelines[1] || !(swapUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) return;
+	bloomExtent.width  = (swapExtent.width  + 3) / 4;
+	bloomExtent.height = (swapExtent.height + 3) / 4;
+	for (j = 0; j < 3; j++)
+	{
+		info.extent.width  = j ? bloomExtent.width  : swapExtent.width;
+		info.extent.height = j ? bloomExtent.height : swapExtent.height;
+		info.usage         = j ? (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
+							   : (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+		res = vkCreateImage(device, &info, NULL, &postImages[j]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan post processing image");
+
+		vkGetImageMemoryRequirements(device, postImages[j], &reqs);
+		if (!AllocMemory(&imagePool, &reqs, &postAllocs[j])) Process_Abort("Out of video memory! (allocating post processing images)");
+		vkBindImageMemory(device, postImages[j], postAllocs[j].block->memory, postAllocs[j].offset);
+
+		viewInfo.image = postImages[j];
+		res = vkCreateImageView(device, &viewInfo, NULL, &postViews[j]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan post processing view");
+		if (!j) continue;
+
+		fbInfo.width        = bloomExtent.width;
+		fbInfo.height       = bloomExtent.height;
+		fbInfo.pAttachments = &postViews[j];
+		res = vkCreateFramebuffer(device, &fbInfo, NULL, &bloomFramebuffers[j - 1]);
+		if (res) Process_Abort2(res, "Failed to create Vulkan bloom framebuffer");
+	}
+
+	/* Bloom reads the scene, then the first bloom image. The final pass reads the scene, bloom and depth */
+	images[0].sampler   = samplers[2];
+	images[0].imageView = postViews[0];
+	writes[0].dstSet    = bloomSets[0];
+	vkUpdateDescriptorSets(device, 1, writes, 0, NULL);
+	images[0].imageView = postViews[1];
+	writes[0].dstSet    = bloomSets[1];
+	vkUpdateDescriptorSets(device, 1, writes, 0, NULL);
+
+	images[0].imageView   = postViews[0];
+	images[1].sampler     = samplers[2];
+	images[1].imageView   = postViews[2];
+	images[2].sampler     = samplers[0];
+	images[2].imageView   = depthSampleView;
+	images[2].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+	for (k = 0; k < 3; k++) writes[k].dstSet = postSet;
+	vkUpdateDescriptorSets(device, 3, writes, 0, NULL);
+	images[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
 /* Each frame slot's ray tracing descriptor set reads the previous frame's history images */
@@ -1900,6 +1973,8 @@ static const struct ShaderDesc denoise_descs[] = {
 static const struct ShaderDesc composite_desc = { fs_composite, sizeof(fs_composite) };
 static const struct ShaderDesc clouds_desc    = { fs_clouds, sizeof(fs_clouds) };
 static const struct ShaderDesc cloudComp_desc = { fs_cloud_composite, sizeof(fs_cloud_composite) };
+static const struct ShaderDesc bloom_desc     = { fs_bloom, sizeof(fs_bloom) };
+static const struct ShaderDesc post_desc      = { fs_post,  sizeof(fs_post)  };
 
 static VkShaderModule CreateShader(const struct ShaderDesc* desc) {
 	VkShaderModuleCreateInfo info = { 0 };
@@ -2222,6 +2297,71 @@ static void CreateDenoiseObjects(void) {
 			if (res) Process_Abort2(res, "Failed to create Vulkan clouds pipeline");
 		}
 	}
+
+	/* ---- Post processing: bloom at quarter resolution, then a final pass over the scene ---- */
+	{
+		VkDescriptorSetLayout postLayouts[2];
+		VkDescriptorSet postSets[3];
+		VkPushConstantRange postRange;
+
+		setInfo.bindingCount = 1;
+		res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &bloomSetLayout);
+		if (res) Process_Abort2(res, "Failed to create Vulkan post processing descriptor set layout");
+		setInfo.bindingCount = 3;
+		res = vkCreateDescriptorSetLayout(device, &setInfo, NULL, &postSetLayout);
+		if (res) Process_Abort2(res, "Failed to create Vulkan post processing descriptor set layout");
+
+		size.descriptorCount = 5;
+		poolInfo.maxSets     = 3;
+		res = vkCreateDescriptorPool(device, &poolInfo, NULL, &postPool);
+		if (res) Process_Abort2(res, "Failed to create Vulkan post processing descriptor pool");
+		layouts[0] = bloomSetLayout; layouts[1] = bloomSetLayout; layouts[2] = postSetLayout;
+		allocInfo.descriptorPool     = postPool;
+		allocInfo.descriptorSetCount = 3;
+		res = vkAllocateDescriptorSets(device, &allocInfo, postSets);
+		if (res) Process_Abort2(res, "Failed to allocate Vulkan post processing descriptor sets");
+		bloomSets[0] = postSets[0]; bloomSets[1] = postSets[1]; postSet = postSets[2];
+
+		/* (bloom: 1 / output size, threshold, disc radius, half a texel of the input) */
+		postRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+		postRange.offset     = 0;
+		postRange.size       = 8 * sizeof(float);
+		layoutInfo.setLayoutCount         = 1;
+		layoutInfo.pSetLayouts            = &bloomSetLayout;
+		layoutInfo.pushConstantRangeCount = 1;
+		layoutInfo.pPushConstantRanges    = &postRange;
+		res = vkCreatePipelineLayout(device, &layoutInfo, NULL, &bloomLayout);
+		if (res) Process_Abort2(res, "Failed to create Vulkan bloom pipeline layout");
+
+		/* (final pass: inverse view * projection, then size/bloom/sharpening, then motion blur/depth of field) */
+		postRange.size  = sizeof(struct Matrix) + 8 * sizeof(float);
+		postLayouts[0]  = postSetLayout;
+		postLayouts[1]  = rtSetLayout;
+		layoutInfo.setLayoutCount = 2;
+		layoutInfo.pSetLayouts    = postLayouts;
+		res = vkCreatePipelineLayout(device, &layoutInfo, NULL, &postLayout);
+		if (res) Process_Abort2(res, "Failed to create Vulkan post processing pipeline layout");
+
+		bloomModule      = CreateShader(&bloom_desc);
+		stages[1].module = bloomModule;
+		blendAttachment.blendEnable    = false;
+		blendAttachment.colorWriteMask = 0x0F;
+		info.layout     = bloomLayout;
+		info.renderPass = denoisePass;
+		res = vkCreateGraphicsPipelines(device, 0, 1, &info, NULL, &bloomPipeline);
+		if (res) Process_Abort2(res, "Failed to create Vulkan bloom pipeline");
+
+		postModule       = CreateShader(&post_desc);
+		stages[1].module = postModule;
+		info.layout      = postLayout;
+		info.renderPass  = compositePass;
+		for (i = 1; i < 16; i++)
+		{
+			blendAttachment.colorWriteMask = i;
+			res = vkCreateGraphicsPipelines(device, 0, 1, &info, NULL, &postPipelines[i]);
+			if (res) Process_Abort2(res, "Failed to create Vulkan post processing pipeline");
+		}
+	}
 }
 
 static void DestroyDenoiseObjects(void) {
@@ -2241,6 +2381,16 @@ static void DestroyDenoiseObjects(void) {
 	vkDestroyRenderPass(device, compositePass, NULL);
 
 	if (!cloudPipeline) return;
+	vkDestroyPipeline(device, bloomPipeline, NULL);
+	for (i = 1; i < 16; i++) vkDestroyPipeline(device, postPipelines[i], NULL);
+	vkDestroyPipelineLayout(device, bloomLayout, NULL);
+	vkDestroyPipelineLayout(device, postLayout, NULL);
+	vkDestroyShaderModule(device, bloomModule, NULL);
+	vkDestroyShaderModule(device, postModule, NULL);
+	vkDestroyDescriptorPool(device, postPool, NULL);
+	vkDestroyDescriptorSetLayout(device, bloomSetLayout, NULL);
+	vkDestroyDescriptorSetLayout(device, postSetLayout, NULL);
+	postPipelines[1] = 0;
 	vkDestroyPipeline(device, cloudPipeline, NULL);
 	for (i = 1; i < 16; i++) vkDestroyPipeline(device, cloudCompPipelines[i], NULL);
 	vkDestroyPipelineLayout(device, cloudLayout, NULL);
@@ -3206,6 +3356,12 @@ static void BeginRenderPass(VkRenderPass pass) {
 			ImageBarrier(frame->drawCmd, cloudImages[j], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 						VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 		}
+		for (j = 0; j < 3; j++)
+		{
+			if (!postImages[j]) continue;
+			ImageBarrier(frame->drawCmd, postImages[j], 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+						VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		}
 		historyFresh = false;
 	}
 
@@ -3581,6 +3737,10 @@ void Gfx_ClearBuffers(GfxBuffers buffers) {
 #define RT_OPT_BLOCK_LIGHTS "gfx-rt-blocklights"
 #define RT_OPT_WATER       "gfx-rt-water"
 #define RT_OPT_CLOUDS      "gfx-rt-clouds"
+#define RT_OPT_BLOOM       "gfx-rt-bloom"
+#define RT_OPT_MOTION_BLUR "gfx-rt-motionblur"
+#define RT_OPT_DOF         "gfx-rt-dof"
+#define RT_OPT_SHARPEN     "gfx-rt-sharpen"
 /* How much sunlight the air scatters per block, how much it scatters forwards (Henyey-Greenstein g), */
 /*  and how far along the view ray it's calculated for */
 #define RT_GOD_DENSITY 0.02f
@@ -3607,6 +3767,11 @@ static const float rtGodRays_Strength[]       = { 0.0f, 0.06f, 0.12f, 0.2f };
 static const char* const rtBlockLights_Names[] = { "Off", "Low", "Medium", "High" };
 static const char* const rtWater_Names[]      = { "Off", "On" };
 static const char* const rtClouds_Names[]     = { "Normal", "Realistic" };
+static const char* const rtPost_Names[]       = { "Off", "Low", "Medium", "High" };
+static const float rtBloom_Strength[]  = { 0.0f, 0.25f, 0.5f, 0.9f };
+static const float rtMotion_Strength[] = { 0.0f, 0.35f, 0.7f, 1.0f };  /* (how much of the frame's movement is blurred) */
+static const float rtDof_Strength[]    = { 0.0f, 0.35f, 0.7f, 1.2f };
+static const float rtSharpen_Strength[] = { 0.0f, 0.3f, 0.6f, 1.0f };
 static const float rtBlockLights_Strength[]    = { 0.0f, 3.0f, 6.0f, 12.0f };
 static const float rtSunAngle_Degrees[]  = { 20.0f, 40.0f, 60.0f, 90.0f };
 static const float rtShadowDist_Blocks[] = { 64.0f, 128.0f, 256.0f, 4096.0f };
@@ -3640,6 +3805,10 @@ static void RT_Init(void) {
 	rtBlockLights = Options_GetEnum(RT_OPT_BLOCK_LIGHTS, 2, rtBlockLights_Names, Array_Elems(rtBlockLights_Names));
 	rtWater      = Options_GetEnum(RT_OPT_WATER,       1, rtWater_Names,      Array_Elems(rtWater_Names));
 	rtClouds     = Options_GetEnum(RT_OPT_CLOUDS,      1, rtClouds_Names,     Array_Elems(rtClouds_Names));
+	rtBloom      = Options_GetEnum(RT_OPT_BLOOM,       1, rtPost_Names,       Array_Elems(rtPost_Names));
+	rtMotionBlur = Options_GetEnum(RT_OPT_MOTION_BLUR, 0, rtPost_Names,       Array_Elems(rtPost_Names));
+	rtDof        = Options_GetEnum(RT_OPT_DOF,         0, rtPost_Names,       Array_Elems(rtPost_Names));
+	rtSharpen    = Options_GetEnum(RT_OPT_SHARPEN,     1, rtPost_Names,       Array_Elems(rtPost_Names));
 }
 
 static void RT_ListAdd(struct ChunkRT*** list, int* count, int* max, struct ChunkRT* rt) {
@@ -5561,6 +5730,138 @@ void Gfx_RenderClouds(void) {
 	dirtyRtSet     = true;
 }
 
+/* Post processing: the scene is copied from the swapchain image, bloom is blurred at quarter resolution, then the */
+/*  final pass (see PostFragmentShader in misc/vulkan/VulkanShaderGen.c) draws the scene back with motion blur, depth */
+/*  of field, sharpening and bloom. The main render pass is paused while this happens */
+void Gfx_RenderPostEffects(void) {
+	VkCommandBuffer cmd;
+	VkRenderPassBeginInfo info = { 0 };
+	VkClearValue clears[7]     = { { { { 0 } } } };
+	VkViewport viewport = { 0 };
+	VkRect2D scissor    = { { 0 } };
+	VkImageBlit blit    = { 0 };
+	VkDescriptorSet sets[2];
+	VkFlags depthAspect;
+	struct Matrix mvp;
+	struct { struct Matrix invMVP; float a[4], b[4]; } push;
+	float bloomPush[8];
+	VkImage swap;
+
+	if (!rtActive || !frame || !frame->tlas || !renderPassActive || !drawBegun || !postImages[0] || !colorMask) return;
+	if (!rtBloom && !rtMotionBlur && !rtDof && !rtSharpen) return;
+	Matrix_Mul(&mvp, &Gfx.View, &Gfx.Projection);
+	if (!RT_Invert4x4(&mvp, &push.invMVP)) return;
+
+	FlushDeferredDraws();
+	cmd  = frame->drawCmd;
+	swap = swapImages[imageIndex];
+	vkCmdEndRenderPass(cmd);
+
+	/* Copy of the scene */
+	ImageBarrier(cmd, swap, 1, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+	ImageBarrier(cmd, postImages[0], 1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+	blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	blit.srcSubresource.layerCount = 1;
+	blit.dstSubresource   = blit.srcSubresource;
+	blit.srcOffsets[1].x  = swapExtent.width;
+	blit.srcOffsets[1].y  = swapExtent.height;
+	blit.srcOffsets[1].z  = 1;
+	blit.dstOffsets[1]    = blit.srcOffsets[1];
+	vkCmdBlitImage(cmd, swap, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, postImages[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+	ImageBarrier(cmd, swap, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+	ImageBarrier(cmd, postImages[0], 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+	depthAspect = VK_IMAGE_ASPECT_DEPTH_BIT | (depthFormat == VK_FORMAT_D24_UNORM_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+	RT_DepthBarrier(cmd, depthAspect, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+	/* Bloom: the bright parts, then blurred more widely (both at quarter resolution) */
+	viewport.width    = (float)bloomExtent.width;
+	viewport.height   = (float)bloomExtent.height;
+	viewport.maxDepth = 1.0f;
+	scissor.extent    = bloomExtent;
+	info.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	info.renderPass        = denoisePass;
+	info.renderArea.extent = bloomExtent;
+	bloomPush[0] = 1.0f / bloomExtent.width; bloomPush[1] = 1.0f / bloomExtent.height;
+	bloomPush[3] = 0.0f;
+	{
+		int i;
+		for (i = 0; i < 2; i++)
+		{
+			/* (first from the scene, 4 pixels across, then over 6 bloom pixels) */
+			bloomPush[2] = i ? 0.0f : 0.8f;
+			bloomPush[4] = i ? 6.0f / bloomExtent.width  : 4.0f / swapExtent.width;
+			bloomPush[5] = i ? 6.0f / bloomExtent.height : 4.0f / swapExtent.height;
+			bloomPush[6] = i ? 0.5f / bloomExtent.width  : 0.5f / swapExtent.width;
+			bloomPush[7] = i ? 0.5f / bloomExtent.height : 0.5f / swapExtent.height;
+			info.framebuffer = bloomFramebuffers[i];
+			vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bloomPipeline);
+			vkCmdSetViewport(cmd, 0, 1, &viewport);
+			vkCmdSetScissor(cmd,  0, 1, &scissor);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bloomLayout, 0, 1, &bloomSets[i], 0, NULL);
+			vkCmdPushConstants(cmd, bloomLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(bloomPush), bloomPush);
+			vkCmdDraw(cmd, 3, 1, 0, 0);
+			vkCmdEndRenderPass(cmd);
+		}
+	}
+
+	/* Final pass over the scene */
+	viewport.width    = (float)swapExtent.width;
+	viewport.height   = (float)swapExtent.height;
+	scissor.extent    = swapExtent;
+	info.renderPass        = compositePass;
+	info.framebuffer       = compositeFramebuffers[imageIndex];
+	info.renderArea.extent = swapExtent;
+	vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, postPipelines[colorMask]);
+	vkCmdSetViewport(cmd, 0, 1, &viewport);
+	vkCmdSetScissor(cmd,  0, 1, &scissor);
+	sets[0] = postSet;
+	sets[1] = frame->rtSet;
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, postLayout, 0, 2, sets, 0, NULL);
+	push.a[0] = (float)swapExtent.width;
+	push.a[1] = (float)swapExtent.height;
+	push.a[2] = rtBloom_Strength[rtBloom];
+	push.a[3] = rtSharpen_Strength[rtSharpen];
+	/* (no motion blur when there's no previous frame to compare with) */
+	push.b[0] = rtPrevDrawn ? rtMotion_Strength[rtMotionBlur] : 0.0f;
+	push.b[1] = rtDof_Strength[rtDof];
+	push.b[2] = 0.0f;
+	push.b[3] = 0.0f;
+	vkCmdPushConstants(cmd, postLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+	vkCmdDraw(cmd, 3, 1, 0, 0);
+	vkCmdEndRenderPass(cmd);
+
+	RT_DepthBarrier(cmd, depthAspect, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+				VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+	/* The main render pass continues (keeping everything) */
+	info.renderPass      = resumePass;
+	info.framebuffer     = framebuffers[imageIndex][frameIndex];
+	info.clearValueCount = 7;
+	info.pClearValues    = clears;
+	vkCmdBeginRenderPass(cmd, &info, VK_SUBPASS_CONTENTS_INLINE);
+
+	boundPipeline  = -1;
+	dirtyViewport  = true;
+	dirtyScissor   = true;
+	dirtyConstants = true;
+	dirtyTexture   = true;
+	dirtyVb        = true;
+	dirtyIb        = true;
+	dirtyCull      = true;
+	dirtyRtSet     = true;
+}
+
 /* The shadow history written this frame is only usable next frame if chunks were drawn this frame */
 static void RT_EndFrame(void) {
 	rtPrevDrawn = rtDrawn;
@@ -5664,6 +5965,15 @@ static void RT_SetClouds(int v) {
 	RT_SaveEnum(RT_OPT_CLOUDS, rtClouds_Names[v]);
 }
 
+static int  RT_GetBloom(void)      { return rtBloom; }
+static void RT_SetBloom(int v)      { rtBloom = v;      RT_SaveEnum(RT_OPT_BLOOM,       rtPost_Names[v]); }
+static int  RT_GetMotionBlur(void) { return rtMotionBlur; }
+static void RT_SetMotionBlur(int v) { rtMotionBlur = v; RT_SaveEnum(RT_OPT_MOTION_BLUR, rtPost_Names[v]); }
+static int  RT_GetDof(void)        { return rtDof; }
+static void RT_SetDof(int v)        { rtDof = v;        RT_SaveEnum(RT_OPT_DOF,         rtPost_Names[v]); }
+static int  RT_GetSharpen(void)    { return rtSharpen; }
+static void RT_SetSharpen(int v)    { rtSharpen = v;    RT_SaveEnum(RT_OPT_SHARPEN,     rtPost_Names[v]); }
+
 static int  RT_GetGI(void) { return rtGI; }
 static void RT_SetGI(int v) {
 	rtResetHistory = true;
@@ -5715,6 +6025,23 @@ static void RTXOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
 		RT_GetClouds,     RT_SetClouds,
 		"&eRealistic draws soft clouds with depth, lit by the sun,\n" \
 		"&ein the server's cloud colour. Normal draws flat clouds.");
+}
+
+/* (a separate screen, since an options screen only has room for MENUOPTS_MAX_OPTS options) */
+static void PostOptionsScreen_InitWidgets(struct MenuOptionsScreen* s) {
+	MenuOptionsScreen_AddEnum(s, "Bloom", rtPost_Names, Array_Elems(rtPost_Names),
+		RT_GetBloom,      RT_SetBloom,
+		"&eBright parts of the screen (e.g. the sky, lava) glow.");
+	MenuOptionsScreen_AddEnum(s, "Motion blur", rtPost_Names, Array_Elems(rtPost_Names),
+		RT_GetMotionBlur, RT_SetMotionBlur,
+		"&eThe screen is blurred when the camera moves or turns.");
+	MenuOptionsScreen_AddEnum(s, "Depth of field", rtPost_Names, Array_Elems(rtPost_Names),
+		RT_GetDof,        RT_SetDof,
+		"&eFocuses on what's in the middle of the screen,\n" \
+		"&eand blurs things nearer or further away.");
+	MenuOptionsScreen_AddEnum(s, "Sharpening", rtPost_Names, Array_Elems(rtPost_Names),
+		RT_GetSharpen,    RT_SetSharpen,
+		"&eMakes the edges of things look crisper.");
 }
 
 
@@ -5940,6 +6267,9 @@ cc_bool Gfx_GetUIOptions(struct MenuOptionsScreen* s) {
 		MenuOptionsScreen_AddSubmenu(s, "Ray tracing options...", RTXOptionsScreen_InitWidgets,
 			"&eOptions for ray tracing effects.\n" \
 			"&eRequires a GPU with ray tracing support.");
+		MenuOptionsScreen_AddSubmenu(s, "Post processing...", PostOptionsScreen_InitWidgets,
+			"&eBloom, motion blur, depth of field and sharpening.\n" \
+			"&eOnly when ray tracing is on.");
 	}
 	return false;
 }

@@ -94,11 +94,13 @@ struct Frame {
 	struct MemAlloc tlasAlloc, tlasScratch;
 	cc_uint32 tlasCapacity;
 	VkDescriptorSet rtSet;
-	/* BLAS of the entities drawn in this frame, and the atlas of their textures (see RT_CaptureEntity) */
-	VkAccelerationStructureKHR entBlas;
-	struct MemAlloc entBlasAlloc;
-	VkDeviceAddress entAddress, entFirst[3]; /* (see RT_BuildEntities) */
-	int entGeoms;
+	/* BLASes of the entities drawn in this frame, and the atlas of their textures (see RT_CaptureEntity) */
+	struct EntityBLAS {
+		VkAccelerationStructureKHR blas;
+		struct MemAlloc alloc;
+		VkDeviceAddress address, first[3]; /* (see RT_BuildEntityBLAS) */
+		int geoms;
+	} ents[2];
 	VkImage entAtlas;
 	VkImageView entAtlasView;
 	struct MemAlloc entAtlasAlloc;
@@ -181,6 +183,8 @@ struct RTParams {
 	float cloudsOffset, cloudsDist, cloudsOn, tableValid;
 	float waterTime, waterOn, _pad9[2]; /* Time for the waves of water (wrapped every 1200 seconds), and whether water */
 	                                    /*  is drawn like Radiance's (see EmitWater) */
+	float selfMinX, selfMinY, selfMinZ, _pad10; /* Box around yourself in first person (empty when not), so that */
+	float selfMaxX, selfMaxY, selfMaxZ, _pad11; /*  reflections starting inside it don't see your insides */
 };
 
 static VkInstance instance;
@@ -319,6 +323,10 @@ static cc_bool rtSkyDraw;
 /* Whether entities are currently being drawn (see Gfx_SetEntityRendering), and whether the entity being drawn */
 /*  is only ray traced (see Gfx_SetEntityHidden) */
 static cc_bool rtEntityDraw, rtEntityHidden;
+/* Which group the entity being drawn is in: 0 = most entities, 1 = yourself in first person (see RT_CaptureEntity) */
+static int rtEntityGroup;
+/* Box around the vertices of yourself in first person (see RTParams) */
+static Vec3 rtSelfMin, rtSelfMax;
 /* Chunks waiting for their BLAS to be built, and chunks which have a BLAS */
 static struct ChunkRT** rtPending;
 static struct ChunkRT** rtChunks;
@@ -3565,10 +3573,15 @@ static VkAccelerationStructureKHR RT_CreateAS(struct MemAlloc* alloc, VkDeviceSi
 
 /* Frees the BLAS of the entities drawn the last time this frame was used */
 static void RT_FreeEntities(struct Frame* f) {
-	if (f->entBlas) vkDestroyAccelerationStructureKHR(device, f->entBlas, NULL);
-	if (f->entBlasAlloc.block) MemAlloc_Free(&asPool, &f->entBlasAlloc);
-	f->entBlas  = 0;
-	f->entGeoms = 0;
+	int g;
+	for (g = 0; g < 2; g++)
+	{
+		struct EntityBLAS* e = &f->ents[g];
+		if (e->blas) vkDestroyAccelerationStructureKHR(device, e->blas, NULL);
+		if (e->alloc.block) MemAlloc_Free(&asPool, &e->alloc);
+		e->blas  = 0;
+		e->geoms = 0;
+	}
 }
 
 static void RT_FreeTLAS(struct Frame* f) {
@@ -3797,10 +3810,12 @@ static void RT_BuildChunks(VkCommandBuffer cmd) {
 #define RT_ENT_ATLAS_SIZE (RT_ENT_CELL * RT_ENT_CELLS)
 /* (of both lists together, so at most 3 geometries, see RT_BuildEntities) */
 #define RT_MAX_ENT_VERTICES (RT_MAX_GEOMETRY_VERTICES * 2)
-/* [0] = faces drawn without alpha testing (e.g. the base layer of skins, so players can't be invisible), */
-/*  [1] = alpha tested faces. They're separate geometries of the BLAS (see RT_BuildEntities) */
-static struct VertexTextured* rtEntVertices[2];
-static int rtNumEntVertices[2], rtMaxEntVertices[2];
+/* [group][0] = faces drawn without alpha testing (e.g. the base layer of skins, so players can't be invisible), */
+/*  [group][1] = alpha tested faces. They're separate geometries of the group's BLAS (see RT_BuildEntityBLAS) */
+/* Yourself in first person is a separate group, which only reflections see (mask 8), since the camera is inside */
+/*  the model, so refractions through water would show your body under the camera (see RT_BuildTLAS) */
+static struct VertexTextured* rtEntVertices[2][2];
+static int rtNumEntVertices[2][2], rtMaxEntVertices[2][2];
 static struct VulkanTexture* rtEntTextures[RT_ENT_CELLS * RT_ENT_CELLS];
 static int rtNumEntTextures;
 /* (inverse of the camera's view matrix, see RT_CaptureEntity) */
@@ -3832,12 +3847,14 @@ static void RT_InvertAffine(const struct Matrix* m, struct Matrix* r) {
 void Gfx_SetEntityRendering(cc_bool enabled) {
 	rtEntityDraw   = enabled;
 	rtEntityHidden = false;
+	rtEntityGroup  = 0;
 	if (enabled) RT_InvertAffine(&Gfx.View, &rtInvView);
 }
 
-cc_bool Gfx_SetEntityHidden(cc_bool hidden) {
+cc_bool Gfx_SetEntityHidden(int mode) {
 	/* (hidden entities are only needed when entities are ray traced) */
-	rtEntityHidden = hidden && rtEntityDraw && rtActive && frame && frame->tlas;
+	rtEntityHidden = mode && rtEntityDraw && rtActive && frame && frame->tlas;
+	rtEntityGroup  = mode == ENTITY_HIDDEN_SELF;
 	return rtEntityHidden;
 }
 
@@ -3878,16 +3895,16 @@ static void RT_CaptureEntity(int first, int count) {
 	struct VertexTextured* dst;
 	struct Matrix world;
 	float cx, cy, u, v, x, y, z;
-	int i, cell, k = gfx_alphaTest ? 1 : 0;
+	int i, cell, k = gfx_alphaTest ? 1 : 0, g = rtEntityGroup;
 
 	if (!rtActive || !frame->tlas || !vb || gfx_format != VERTEX_FORMAT_TEXTURED || !curTex) return;
 	count &= ~3; /* (quads) */
 	if (count <= 0 || (cc_uint32)(first + count) * SIZEOF_VERTEX_TEXTURED > vb->used) return;
-	if (rtNumEntVertices[0] + rtNumEntVertices[1] + count > RT_MAX_ENT_VERTICES) return;
+	if (rtNumEntVertices[g][0] + rtNumEntVertices[g][1] + count > RT_MAX_ENT_VERTICES) return;
 	/* (e.g. falling blocks are drawn with the terrain's textures, which are too big for a cell) */
 	if (RT_IsTerrainTexture(curTex)) return;
 	if ((cell = RT_EntityCell(curTex)) < 0) return;
-	if (!RT_EnsureTemp((void**)&rtEntVertices[k], &rtMaxEntVertices[k], rtNumEntVertices[k] + count, sizeof(struct VertexTextured))) return;
+	if (!RT_EnsureTemp((void**)&rtEntVertices[g][k], &rtMaxEntVertices[g][k], rtNumEntVertices[g][k] + count, sizeof(struct VertexTextured))) return;
 
 	/* The view matrix is the entity's transform followed by the camera's, so the entity's transform is the */
 	/*  view matrix followed by the inverse of the camera's */
@@ -3896,7 +3913,7 @@ static void RT_CaptureEntity(int first, int count) {
 	cx  = (float)(cell % RT_ENT_CELLS);
 	cy  = (float)(cell / RT_ENT_CELLS);
 	src = (struct VertexTextured*)vb->data + first;
-	dst = rtEntVertices[k] + rtNumEntVertices[k];
+	dst = rtEntVertices[g][k] + rtNumEntVertices[g][k];
 
 	for (i = 0; i < count; i++, src++, dst++)
 	{
@@ -3904,6 +3921,11 @@ static void RT_CaptureEntity(int first, int count) {
 		dst->x = x * world.row1.x + y * world.row2.x + z * world.row3.x + world.row4.x;
 		dst->y = x * world.row1.y + y * world.row2.y + z * world.row3.y + world.row4.y;
 		dst->z = x * world.row1.z + y * world.row2.z + z * world.row3.z + world.row4.z;
+		if (g) {
+			rtSelfMin.x = min(rtSelfMin.x, dst->x); rtSelfMax.x = max(rtSelfMax.x, dst->x);
+			rtSelfMin.y = min(rtSelfMin.y, dst->y); rtSelfMax.y = max(rtSelfMax.y, dst->y);
+			rtSelfMin.z = min(rtSelfMin.z, dst->z); rtSelfMax.z = max(rtSelfMax.z, dst->z);
+		}
 		/* The colour already has the entity's light (including the heightmap's shadow), so it's fully bright */
 		/*  (see Builder_TagCol), i.e. not shaded again, so it looks the same as the entity that's drawn */
 		dst->Col = (src->Col & PACKEDCOL_RGB_MASK) | PackedCol_A_Bits(254);
@@ -3915,7 +3937,7 @@ static void RT_CaptureEntity(int first, int count) {
 		dst->U = (cx + 0.002f + u * 0.996f) / RT_ENT_CELLS;
 		dst->V = (cy + 0.002f + v * 0.996f) / RT_ENT_CELLS;
 	}
-	rtNumEntVertices[k] += count;
+	rtNumEntVertices[g][k] += count;
 }
 
 static void RT_CreateEntityAtlases(void) {
@@ -4029,40 +4051,31 @@ static void RT_CopyEntityTextures(VkCommandBuffer cmd, struct Frame* f) {
 				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 }
 
-/* Builds the BLAS of the entities drawn this frame (which the TLAS then has an instance of, see RT_BuildTLAS) */
-static void RT_BuildEntities(VkCommandBuffer cmd) {
-	VkAccelerationStructureGeometryKHR geoms[Array_Elems(frame->entFirst)];
-	VkAccelerationStructureBuildRangeInfoKHR ranges[Array_Elems(frame->entFirst)];
-	cc_uint32 primCounts[Array_Elems(frame->entFirst)];
+/* Builds the BLAS of a group of entities drawn this frame (which the TLAS then has an instance of, see RT_BuildTLAS) */
+static void RT_BuildEntityBLAS(VkCommandBuffer cmd, int g) {
+	VkAccelerationStructureGeometryKHR geoms[Array_Elems(frame->ents[0].first)];
+	VkAccelerationStructureBuildRangeInfoKHR ranges[Array_Elems(frame->ents[0].first)];
+	cc_uint32 primCounts[Array_Elems(frame->ents[0].first)];
 	const VkAccelerationStructureBuildRangeInfoKHR* pRanges = ranges;
 	VkAccelerationStructureBuildGeometryInfoKHR build = { 0 };
 	VkAccelerationStructureGeometryTrianglesDataKHR* tris;
 	struct MemAlloc* ib = (struct MemAlloc*)Gfx.DefaultIb;
-	struct Frame* f = frame;
+	struct EntityBLAS* e = &frame->ents[g];
 	VkDeviceAddress address;
-	int i, k, n = 0, first = 0, vertices, total = rtNumEntVertices[0] + rtNumEntVertices[1];
+	int i, k, n = 0, first = 0, vertices, total = rtNumEntVertices[g][0] + rtNumEntVertices[g][1];
 	cc_uint8* data;
 
-	/* (the GPU has finished with the BLAS from the last time this frame was used) */
-	RT_FreeEntities(f);
-	if (rtEntAtlasFresh[frameIndex] && f->entAtlas) {
-		ImageBarrier(cmd, f->entAtlas, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-					VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-		rtEntAtlasFresh[frameIndex] = false;
-	}
-	if (!total || !f->entAtlas) return;
-
+	if (!total) return;
 	data = (cc_uint8*)Ring_AllocAddress((VkDeviceSize)total * SIZEOF_VERTEX_TEXTURED, &address);
 	if (!data) return;
-	RT_CopyEntityTextures(cmd, f);
 
 	/* (each list is split into geometries of up to RT_MAX_GEOMETRY_VERTICES, since indices are 16 bit) */
 	for (k = 0; k < 2; k++)
 	{
-		Mem_Copy(data + first * SIZEOF_VERTEX_TEXTURED, rtEntVertices[k], rtNumEntVertices[k] * SIZEOF_VERTEX_TEXTURED);
-		for (i = 0; i < rtNumEntVertices[k]; i += vertices, first += vertices, n++)
+		Mem_Copy(data + first * SIZEOF_VERTEX_TEXTURED, rtEntVertices[g][k], rtNumEntVertices[g][k] * SIZEOF_VERTEX_TEXTURED);
+		for (i = 0; i < rtNumEntVertices[g][k]; i += vertices, first += vertices, n++)
 		{
-			vertices = min(rtNumEntVertices[k] - i, RT_MAX_GEOMETRY_VERTICES);
+			vertices = min(rtNumEntVertices[g][k] - i, RT_MAX_GEOMETRY_VERTICES);
 			Mem_Set(&geoms[n], 0, sizeof(geoms[n]));
 
 			geoms[n].sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
@@ -4085,7 +4098,7 @@ static void RT_BuildEntities(VkCommandBuffer cmd) {
 			ranges[n].transformOffset = 0;
 			primCounts[n] = ranges[n].primitiveCount;
 
-			f->entFirst[n] = address + (VkDeviceAddress)first * SIZEOF_VERTEX_TEXTURED;
+			e->first[n] = address + (VkDeviceAddress)first * SIZEOF_VERTEX_TEXTURED;
 		}
 	}
 
@@ -4096,10 +4109,27 @@ static void RT_BuildEntities(VkCommandBuffer cmd) {
 	build.mode          = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
 	build.geometryCount = n;
 	build.pGeometries   = geoms;
-	if (!RT_PrepareBLAS(&f->entBlas, &f->entBlasAlloc, &f->entAddress, &build, primCounts)) { RT_FreeEntities(f); return; }
+	if (!RT_PrepareBLAS(&e->blas, &e->alloc, &e->address, &build, primCounts)) return;
 
 	vkCmdBuildAccelerationStructuresKHR(cmd, 1, &build, &pRanges);
-	f->entGeoms = n;
+	e->geoms = n;
+}
+
+/* Builds the BLASes of the entities drawn this frame, and copies their textures into the frame's atlas */
+static void RT_BuildEntities(VkCommandBuffer cmd) {
+	struct Frame* f = frame;
+	/* (the GPU has finished with the BLASes from the last time this frame was used) */
+	RT_FreeEntities(f);
+	if (rtEntAtlasFresh[frameIndex] && f->entAtlas) {
+		ImageBarrier(cmd, f->entAtlas, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+					VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		rtEntAtlasFresh[frameIndex] = false;
+	}
+	if (!rtNumEntTextures || !f->entAtlas) return;
+
+	RT_CopyEntityTextures(cmd, f);
+	RT_BuildEntityBLAS(cmd, 0);
+	RT_BuildEntityBLAS(cmd, 1);
 }
 
 /* Each geometry's entry in the table is the address of the geometry's first vertex */
@@ -4584,10 +4614,10 @@ static void RT_BuildTLAS(VkCommandBuffer cmd) {
 	struct ChunkRT* rt;
 	cc_uint32 i, flags, mask, base = 0, numGeoms = 0, count = 0, capacity = frame->tlasCapacity;
 	cc_bool inTable, overflow = false;
-	int water;
+	int water, g;
 
 	for (i = 0; i < (cc_uint32)numRtChunks; i++) { numGeoms += rtChunks[i]->numGeoms + rtChunks[i]->numWaterGeoms; }
-	numGeoms += frame->entGeoms;
+	numGeoms += frame->ents[0].geoms + frame->ents[1].geoms;
 	table = (VkDeviceAddress*)Ring_AllocAddress(max(numGeoms, 1) * sizeof(VkDeviceAddress), &tableAddress);
 
 	instances = (VkAccelerationStructureInstanceKHR*)Ring_AllocAddress(
@@ -4627,23 +4657,31 @@ static void RT_BuildTLAS(VkCommandBuffer cmd) {
 			count++;
 		}
 	}
-	/* Entities (see RT_BuildEntities), whose custom index has RT_ENT_INDEX_FLAG set (see EmitTraceBegin) */
-	if (frame->entGeoms && table && count < capacity && base + frame->entGeoms <= RT_ENT_INDEX_FLAG) {
+	/* Entities (see RT_BuildEntities), whose custom index has RT_ENT_INDEX_FLAG set (see EmitTraceBegin). Most */
+	/*  entities have mask 4, and yourself in first person mask 8, which only reflections see */
+	for (g = 0; g < 2; g++)
+	{
+		struct EntityBLAS* e = &frame->ents[g];
+		if (!e->geoms || !table || count >= capacity || base + e->geoms > RT_ENT_INDEX_FLAG) continue;
+
 		Mem_Set(&instances[count], 0, sizeof(instances[count]));
 		instances[count].matrix[0][0] = 1.0f;
 		instances[count].matrix[1][1] = 1.0f;
 		instances[count].matrix[2][2] = 1.0f;
-		instances[count].customIndexAndMask = (base | RT_ENT_INDEX_FLAG) | (0x04u << 24);
+		instances[count].customIndexAndMask = (base | RT_ENT_INDEX_FLAG) | ((g ? 0x08u : 0x04u) << 24);
 		instances[count].sbtOffsetAndFlags  = (cc_uint32)VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR << 24;
-		instances[count].accelerationStructureReference = frame->entAddress;
-		for (i = 0; i < (cc_uint32)frame->entGeoms; i++)
+		instances[count].accelerationStructureReference = e->address;
+		for (i = 0; i < (cc_uint32)e->geoms; i++)
 		{
-			table[base + i] = frame->entFirst[i];
+			table[base + i] = e->first[i];
 		}
-		base += frame->entGeoms;
+		base += e->geoms;
 		count++;
 	}
 	RT_FrameParams()->table = table ? tableAddress : 0;
+	RT_FrameParams()->selfMinX = rtSelfMin.x; RT_FrameParams()->selfMaxX = rtSelfMax.x;
+	RT_FrameParams()->selfMinY = rtSelfMin.y; RT_FrameParams()->selfMaxY = rtSelfMax.y;
+	RT_FrameParams()->selfMinZ = rtSelfMin.z; RT_FrameParams()->selfMaxZ = rtSelfMax.z;
 	/* Bounced light needs the table to find what was hit */
 	if (!table || overflow) RT_FrameParams()->giStrength = 0.0f;
 	/* As do reflections */
@@ -4956,9 +4994,10 @@ static void RT_BeginFrame(void) {
 	/* (water at the map's edges is drawn as ray traced water too, see EnvRenderer_RenderMapEdges) */
 	Lighting_GfxWater = rtActive && rtWater;
 
-	rtNumEntVertices[0] = 0;
-	rtNumEntVertices[1] = 0;
-	rtNumEntTextures    = 0;
+	Mem_Set(rtNumEntVertices, 0, sizeof(rtNumEntVertices));
+	rtNumEntTextures = 0;
+	/* (empty, so nothing is inside it) */
+	rtSelfMin = Vec3_BigPos(); rtSelfMax = Vec3_Create3(-1e30f, -1e30f, -1e30f);
 	if (!rtActive) { if (frame->tlas) RT_FreeTLAS(frame); return; }
 	RT_UpdateConstants();
 	RT_EnsureTLAS(frame);

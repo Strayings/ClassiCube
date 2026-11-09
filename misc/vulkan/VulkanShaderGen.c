@@ -461,6 +461,17 @@ struct TraceIds {
 	unsigned int vEntTex, cEntIdx;
 };
 
+/* Returns whether p is inside the box from lo to hi */
+static unsigned int EmitInBox(unsigned int tBool, unsigned int tBVec3, unsigned int p, unsigned int lo, unsigned int hi) {
+	unsigned int a = Id(), b = Id(), aAll = Id(), bAll = Id(), in = Id();
+	Op(OP_FORD_GREATER_THAN, 4, tBVec3, a, p, lo);
+	Op(OP_FORD_LESS_THAN,    4, tBVec3, b, p, hi);
+	Op(OP_ALL, 3, tBool, aAll, a);
+	Op(OP_ALL, 3, tBool, bAll, b);
+	Op(OP_LOGICAL_AND, 4, tBool, in, aAll, bAll);
+	return in;
+}
+
 /* Entities' instance has bit 23 of its custom index set (see RT_BuildTLAS in src/Graphics_Vulkan.c), and their */
 /*  textures are in a separate atlas. Returns where the instance's geometries start in the table, and sets isEnt */
 static unsigned int EmitEntityIndex(unsigned int tBool, unsigned int tInt, unsigned int vEntTex, unsigned int cEntIdx,
@@ -2254,13 +2265,13 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 	unsigned int cMirror = 0, cGlintCos = 0, cGlintScale = 0, cReflection = 0, vRefl = 0, vReflK = 0, vClouds = 0, cInv2048 = 0, cMinRayY = 0;
 	unsigned int vWaterCol = 0, vWaterRefr = 0, vWaterDist = 0, vWaterExit = 0, cTagWater = 0, cTagEdge = 0, vRWaterN = 0, vRWaterF = 0;
 	struct WaterIds water;
-	unsigned int vEntTex = 0, cEntIdx = 0, cMaskRefr = 0;
+	unsigned int vEntTex = 0, cEntIdx = 0, cMaskRefr = 0, cMaskNoSelf = 0;
 	unsigned int vHitLj = 0, vHitSum = 0, vOutMod = 0, vOutLight = 0, vRThru = 0, vRFrom = 0, vRDir = 0, vRDone = 0, vRBounces = 0;
 	unsigned int cTaps[4] = { 0, 0, 0, 0 };
 	unsigned int vWorld = 0, vScene = 0, vParams = 0, vHistory = 0, vOutHistory = 0;
 	unsigned int rayQuery = 0, vVisible = 0, vIndex = 0, vHits = 0, vSkyHits = 0;
 	unsigned int vHistVis = 0, vHistLen = 0, vHistSky = 0, vLen = 0, vSky = 0;
-	unsigned int cIdx[38];
+	unsigned int cIdx[40];
 	unsigned int iface[24];
 	int i, count = 0, push = fog || rt, fogBase = rt ? 1 : 0, fragPos = fog || rt;
 
@@ -2302,12 +2313,12 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		cMirror = Id(); cGlintCos = Id(); cGlintScale = Id(); cReflection = Id(); vRefl = Id(); vReflK = Id(); vClouds = Id(); cInv2048 = Id(); cMinRayY = Id();
 		vWaterCol = Id(); vWaterRefr = Id(); vWaterDist = Id(); vWaterExit = Id(); cTagWater = Id(); cTagEdge = Id(); vRWaterN = Id(); vRWaterF = Id();
 		vHitLj = Id(); vHitSum = Id(); vOutMod = Id(); vOutLight = Id(); vRThru = Id(); vRFrom = Id(); vRDir = Id(); vRDone = Id(); vRBounces = Id();
-		vEntTex = Id(); cEntIdx = Id(); cMaskRefr = Id();
+		vEntTex = Id(); cEntIdx = Id(); cMaskRefr = Id(); cMaskNoSelf = Id();
 		for (i = 0; i < 4; i++) cTaps[i] = Id();
 		vWorld = Id(); vScene = Id(); vParams = Id(); vHistory = Id(); vOutHistory = Id();
 		rayQuery = Id(); vVisible = Id(); vIndex = Id(); vHits = Id(); vSkyHits = Id();
 		vHistVis = Id(); vHistLen = Id(); vHistSky = Id(); vLen = Id(); vSky = Id();
-		for (i = 3; i < 38; i++) cIdx[i] = Id();
+		for (i = 3; i < 40; i++) cIdx[i] = Id();
 	}
 
 	if (rt) {
@@ -2435,6 +2446,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_MEMBER_DECORATE, 4, tParams, 35, DECORATION_OFFSET, 320);
 		Op(OP_MEMBER_DECORATE, 4, tParams, 36, DECORATION_OFFSET, 336);
 		Op(OP_MEMBER_DECORATE, 4, tParams, 37, DECORATION_OFFSET, 352);
+		Op(OP_MEMBER_DECORATE, 4, tParams, 38, DECORATION_OFFSET, 368);
+		Op(OP_MEMBER_DECORATE, 4, tParams, 39, DECORATION_OFFSET, 384);
 		Op(OP_DECORATE, 3, vParams, DECORATION_DESCRIPTOR_SET, 1);
 		Op(OP_DECORATE, 3, vParams, DECORATION_BINDING, 1);
 	}
@@ -2478,10 +2491,10 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		Op(OP_TYPE_VECTOR,  3, tIVec3,     tInt, 3);
 		Op(OP_TYPE_POINTER, 3, tIntPtr,    STORAGE_PHYSICAL_BUFFER, tInt);
 		Op(OP_TYPE_POINTER, 3, tVec4Ptr,   STORAGE_PHYSICAL_BUFFER, tVec4);
-		Op(OP_TYPE_STRUCT, 39, tParams,    tTablePtr, tVec3, tFloat, tVec3, tFloat, tVec3, tInt, tVec3, tVec3,
+		Op(OP_TYPE_STRUCT, 41, tParams,    tTablePtr, tVec3, tFloat, tVec3, tFloat, tVec3, tInt, tVec3, tVec3,
 											tMat4, tVec2, tInt, tInt, tFloat, tFloat, tFloat, tVec3, tFloat,
 											tFloat, tFloat, tFloat, tFloat, tVec3, tFloat, tFloat, tInt, tFloat,
-											tVec4Ptr, tIntPtr, tVec3, tFloat, tInt, tInt, tFloat, tVec3, tVec4, tVec4, tVec2);
+											tVec4Ptr, tIntPtr, tVec3, tFloat, tInt, tInt, tFloat, tVec3, tVec4, tVec4, tVec2, tVec3, tVec3);
 		Op(OP_TYPE_POINTER, 3, pScene,     STORAGE_UNIFORM_CONSTANT, tScene);
 		Op(OP_TYPE_POINTER, 3, pRayQuery,  STORAGE_FUNCTION, tRayQuery);
 		Op(OP_TYPE_POINTER, 3, pInVec3,    STORAGE_INPUT,    tVec3);
@@ -2507,12 +2520,15 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 	Op(OP_CONSTANT, 3, tInt,   cInt1, 1);
 	Op(OP_CONSTANT, 3, tInt,   cInt2, 2);
 	if (rt) {
-		for (i = 3; i < 38; i++) Op(OP_CONSTANT, 3, tInt, cIdx[i], i);
+		for (i = 3; i < 40; i++) Op(OP_CONSTANT, 3, tInt, cIdx[i], i);
 		Op(OP_CONSTANT, 3, tUint,  cFlags,     RAY_FLAGS_SHADOW);
 		/* Every ray sees shadow casting faces (mask 1), but only reflections see translucent faces, e.g. water (mask 2) */
-		/*  Reflections and refractions through water also see entities (mask 4), but other rays don't */
+		/*  Reflections and refractions through water also see entities (mask 4), but other rays don't. Yourself in */
+		/*  first person (mask 8) is only seen in reflections (that don't start inside you), since the camera is */
+		/*  inside the model, so refractions would show your body under the camera */
 		Op(OP_CONSTANT, 3, tUint,  cMask,      0x01);
-		Op(OP_CONSTANT, 3, tUint,  cMaskRefl,  0x07);
+		Op(OP_CONSTANT, 3, tUint,  cMaskRefl,  0x0F);
+		Op(OP_CONSTANT, 3, tUint,  cMaskNoSelf, 0x07);
 		Op(OP_CONSTANT, 3, tUint,  cMaskRefr,  0x05);
 		Op(OP_CONSTANT, 3, tInt,   cEntIdx,    0x7FFFFF);
 		Op(OP_CONSTANT, 3, tUint,  cCommitted, RAY_INTERSECTION_COMMITTED);
@@ -2734,6 +2750,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		unsigned int scatterCol, caustics, skyDY, skyboxFlag, timeV, wpos;
 		unsigned int gridCells, invCell, numLights, lightStrength, lightCond, hasLights, anyB, isTemporalEarly, lightsGen, planeOff, notHelper;
 		unsigned int isMetal, isWater, isEdgeWater, waterTime, waterParams, skyCol, cloudsA, cloudsB, reflOnB = 0, waterOn = 0;
+		unsigned int selfMin, selfMax;
 		unsigned int toCam, crossed, normal, toCamDot, flip, negated, flipped;
 		unsigned int absN, ax, ay, az, bigYZ, big, bigs, isBig, mask, masked, snapped, axisAligned, n;
 		unsigned int ny, nyAbs, nxAbs, isY, isTop, isX, faceY, faceXZ, faceAxis, face, faceDot, faceAxisID, faceID, faceKey;
@@ -2781,6 +2798,8 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsVec4,  paramPtr, vParams, cIdx[35]); cloudsA      = Id(); Op(OP_LOAD, 3, tVec4,  cloudsA,      paramPtr);
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsVec4,  paramPtr, vParams, cIdx[36]); cloudsB      = Id(); Op(OP_LOAD, 3, tVec4,  cloudsB,      paramPtr);
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsVec2,  paramPtr, vParams, cIdx[37]); waterParams  = Id(); Op(OP_LOAD, 3, tVec2,  waterParams,  paramPtr);
+		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsVec3,  paramPtr, vParams, cIdx[38]); selfMin      = Id(); Op(OP_LOAD, 3, tVec3,  selfMin,      paramPtr);
+		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pParamsVec3,  paramPtr, vParams, cIdx[39]); selfMax      = Id(); Op(OP_LOAD, 3, tVec3,  selfMax,      paramPtr);
 		waterTime = Id(); Op(OP_COMPOSITE_EXTRACT, 4, tFloat, waterTime, waterParams, 0);
 		paramPtr = Id(); Op(OP_ACCESS_CHAIN, 4, pPushFloat,   paramPtr, vPush,   cIdx[0]);  temporal     = Id(); Op(OP_LOAD, 3, tFloat, temporal,     paramPtr);
 
@@ -4181,7 +4200,12 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 			Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, nScaled, n, vn2);
 			Op(OP_FSUB, 4, tVec3, rDir, viewDir, nScaled);
 
-			traceR.scene = scene2; traceR.cMask = cMaskRefl; traceR.vEntTex = vEntTex;
+			/* (reflections starting inside yourself in first person don't see you, e.g. from a block under your feet) */
+			{
+				unsigned int inSelf = EmitInBox(tBool, tBVec3, origin2, selfMin, selfMax), maskR = Id();
+				Op(OP_SELECT, 5, tUint, maskR, inSelf, cMaskNoSelf, cMaskRefl);
+				traceR.scene = scene2; traceR.cMask = maskR; traceR.vEntTex = vEntTex;
+			}
 			hitIds.trace = &trace2; hitIds.vEntTex = vEntTex;
 			memset(&hitL, 0, sizeof(hitL));
 			hitL.ext = ext; hitL.tInt = tInt; hitL.tFloat = tFloat; hitL.tVec3 = tVec3; hitL.tVec4 = tVec4; hitL.tVec4Ptr = tVec4Ptr;
@@ -4222,7 +4246,7 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 
 			/* Water, like Radiance's (see EmitWater) */
 			{
-				unsigned int wCond = Id(), wLabel = Id(), wMerge = Id(), sceneW = Id(), camIn = Id(), wCol;
+				unsigned int wCond = Id(), wLabel = Id(), wMerge = Id(), sceneW = Id(), camIn = Id(), maskW = Id(), wCol;
 				Op(OP_STORE, 2, vWaterCol, cVec3Zero);
 				Op(OP_LOGICAL_AND, 4, tBool, wCond, waterOn, notHelper);
 				Op(OP_SELECTION_MERGE,    2, wMerge, 0);
@@ -4232,6 +4256,16 @@ static void FragmentShader(const char* name, int textured, int alphaTest, int fo
 				traceR.scene = sceneW; trace2.scene = sceneW;
 				/* (caustics is 1 when the camera is in water, see RT_UpdateWater) */
 				Op(OP_FORD_GREATER_THAN, 4, tBool, camIn, caustics, cHalf);
+				/* Water's reflections see yourself in first person too, but not when they start inside you (e.g. when */
+				/*  standing in water), since they'd show the inside of your body */
+				{
+					unsigned int offW = Id(), oW = Id(), inSelf;
+					Op(OP_VECTOR_TIMES_SCALAR, 4, tVec3, offW, n, cOffset);
+					Op(OP_FADD, 4, tVec3, oW, wpos, offW);
+					inSelf = EmitInBox(tBool, tBVec3, oW, selfMin, selfMax);
+					Op(OP_SELECT, 5, tUint, maskW, inSelf, cMaskNoSelf, cMaskRefl);
+					traceR.cMask = maskW;
+				}
 				water.ext = ext; water.tBool = tBool; water.cZero = cZero; water.cOne = cOne; water.cTwo = cTwo;
 				water.cHalf = cHalf; water.cNone = cNone; water.cVec3One = cVec3One; water.cVec3Zero = cVec3Zero;
 				water.cOffset = cOffset; water.vRefr = vWaterRefr; water.vDist = vWaterDist; water.vExit = vWaterExit;

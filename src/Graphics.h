@@ -390,8 +390,10 @@ void Gfx_SetSkyRendering(cc_bool enabled);
 /* Sets whether entities are being drawn (they're seen in ray traced reflections and refractions) */
 void Gfx_SetEntityRendering(cc_bool enabled);
 /* Sets whether the entity being drawn is hidden (e.g. outside the view), so is only seen in ray traced */
-/*  reflections and refractions. Returns false (and nothing should be drawn) when entities aren't ray traced */
-cc_bool Gfx_SetEntityHidden(cc_bool hidden);
+/*  reflections and refractions. Yourself in first person is only seen in reflections, since the camera is */
+/*  inside the model. Returns false (and nothing should be drawn) when entities aren't ray traced */
+enum EntityHidden { ENTITY_HIDDEN_NONE, ENTITY_HIDDEN, ENTITY_HIDDEN_SELF };
+cc_bool Gfx_SetEntityHidden(int mode);
 #endif
 /* Updates the data of a scratch vertex buffer */
 void Gfx_SetScratchVbData(GfxResourceID vb, void* vertices, int vCount);

@@ -514,9 +514,12 @@ static cc_bool Entities_Tick(struct ScheduledTask2* task) {
 /*  are still seen when there are too many entities to ray trace */
 static struct Entity* hiddenEntities[ENTITIES_MAX_COUNT];
 static int numHiddenEntities;
+static struct Entity* hiddenSelf;
 #define Entity_AddHidden(e) hiddenEntities[numHiddenEntities++] = (e)
+#define Entity_SetHiddenSelf(e) hiddenSelf = (e)
 #else
 #define Entity_AddHidden(e)
+#define Entity_SetHiddenSelf(e)
 #endif
 
 void Entities_RenderModels(float delta, float t) {
@@ -525,6 +528,7 @@ void Entities_RenderModels(float delta, float t) {
 #if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
 	Gfx_SetEntityRendering(true);
 	numHiddenEntities = 0;
+	hiddenSelf        = NULL;
 #endif
 
 	for (i = 0; i < ENTITIES_MAX_COUNT; i++)
@@ -533,10 +537,13 @@ void Entities_RenderModels(float delta, float t) {
 		Entities.List[i]->VTABLE->RenderModel(Entities.List[i], delta, t);
 	}
 #if CC_GFX_BACKEND == CC_GFX_BACKEND_VULKAN
-	if (numHiddenEntities && Gfx_SetEntityHidden(true)) {
+	if (numHiddenEntities && Gfx_SetEntityHidden(ENTITY_HIDDEN)) {
 		for (i = 0; i < numHiddenEntities; i++) Model_Render(hiddenEntities[i]->Model, hiddenEntities[i]);
-		Gfx_SetEntityHidden(false);
 	}
+	if (hiddenSelf && Gfx_SetEntityHidden(ENTITY_HIDDEN_SELF)) {
+		Model_Render(hiddenSelf->Model, hiddenSelf);
+	}
+	Gfx_SetEntityHidden(ENTITY_HIDDEN_NONE);
 	Gfx_SetEntityRendering(false);
 #endif
 	Gfx_SetAlphaTest(false);
@@ -783,7 +790,7 @@ static void LocalPlayer_RenderModel(struct Entity* e, float delta, float t) {
 	struct LocalPlayer* p = (struct LocalPlayer*)e;
 	AnimatedComp_GetCurrent(e, t);
 
-	if (!Camera.Active->isThirdPerson && p == Entities.CurPlayer) { Entity_AddHidden(e); return; }
+	if (!Camera.Active->isThirdPerson && p == Entities.CurPlayer) { Entity_SetHiddenSelf(e); return; }
 	Model_Render(e->Model, e);
 }
 
